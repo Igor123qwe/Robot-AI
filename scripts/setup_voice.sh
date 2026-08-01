@@ -23,8 +23,19 @@ sudo apt-get install -y python3-venv python3-dev ffmpeg portaudio19-dev
 
 echo "==> venv"
 python3 -m venv "$VOICE/.venv"
-"$VOICE/.venv/bin/pip" install --upgrade pip
-"$VOICE/.venv/bin/pip" install -r "$VOICE/requirements.txt"
+PIP="$VOICE/.venv/bin/pip"
+"$PIP" install --upgrade pip
+"$PIP" install -r "$VOICE/requirements.txt"
+
+# Piper — отдельно и необязательно: колесо под aarch64 собирается не всегда,
+# а без синтеза робот всё равно работает, просто молча (реплики видно
+# субтитрами в пульте). Ронять из-за этого установку незачем.
+echo "==> синтез речи (Piper)"
+PIPER_OK=1
+if ! "$PIP" install "piper-tts>=1.2"; then
+  echo "!! piper-tts не собрался"
+  PIPER_OK=0
+fi
 
 echo "==> голос Piper"
 mkdir -p "$VOICE/models"
@@ -52,4 +63,12 @@ echo "==> включаю сервис"
 sudo systemctl enable robot-voice
 sudo systemctl restart robot-voice
 
-echo "==> готово. Лог: journalctl -u robot-voice -f"
+echo
+if [ "$PIPER_OK" = 0 ]; then
+  echo "!! Piper не встал — робот будет работать молча."
+  echo "   Реплики видно субтитрами в пульте, всё остальное работает."
+  echo "   Поставить позже: $VOICE/.venv/bin/pip install piper-tts"
+  echo "   Или бинарником: github.com/rhasspy/piper/releases (нужен aarch64)"
+  echo
+fi
+echo "==> готово. Лог: sudo journalctl -u robot-voice -f"
