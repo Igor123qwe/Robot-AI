@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +30,11 @@ import wave
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# Запас на дорогу до браузера и запуск воспроизведения. Реплика уходит по
+# сети, вкладка её скачивает и только потом начинает играть — без запаса
+# микрофон включится под конец фразы и робот расслышит сам себя.
+BROWSER_LAG = 0.8
 
 # Конец предложения: точка/вопрос/восклицание, за которыми пробел или конец строки.
 _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
@@ -95,7 +101,17 @@ class WebSpeech:
         except (OSError, subprocess.SubprocessError):
             log.exception("piper не смог синтезировать реплику")
             return
-        self._post(wav, text)
+
+        listeners = self._post(wav, text)
+        if not listeners:
+            return
+
+        # Ждём, пока реплика действительно отзвучит. Иначе микрофон включится
+        # раньше динамика, и робот услышит сам себя: на живом роботе это дало
+        # «Водои и триданцы, точка муфе» вместо «Батарея двенадцать вольт».
+        # Аппаратного эхоподавления нет, так что полагаемся на длительность.
+        seconds = max(0.0, (len(wav) - 44) / 2 / self.sample_rate)
+        time.sleep(seconds + BROWSER_LAG)
 
     def _synthesize(self, text: str) -> bytes:
         raw = subprocess.run(
@@ -110,7 +126,8 @@ class WebSpeech:
             w.writeframes(raw)
         return buf.getvalue()
 
-    def _post(self, wav: bytes, text: str) -> None:
+    def _post(self, wav: bytes, text: str) -> int:
+        """Отдаёт реплику пульту. Возвращает число слушающих вкладок."""
         req = urllib.request.Request(
             self.endpoint, data=wav, method="POST",
             headers={
@@ -124,9 +141,12 @@ class WebSpeech:
                 info = json.loads(resp.read() or b"{}")
         except (urllib.error.URLError, OSError, ValueError) as e:
             log.warning("не смог отдать реплику пульту: %s", e)
-            return
-        if not info.get("listeners"):
+            return 0
+
+        listeners = int(info.get("listeners") or 0)
+        if not listeners:
             log.info("реплика отправлена, но пульт никто не смотрит — её не услышат")
+        return listeners
 
 
 class Speaker:
