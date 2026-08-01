@@ -1,0 +1,14 @@
+[Unit]
+Description=Robot-AI: узел шасси WHEELTEC
+After=network.target
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/home/wheeltec
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /opt/tros/humble/setup.bash && source /home/wheeltec/wheeltec_ros2/install/setup.bash && exec ros2 launch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch.py'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

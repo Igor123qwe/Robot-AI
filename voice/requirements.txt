@@ -1,0 +1,12 @@
+anthropic>=0.69
+faster-whisper>=1.0
+webrtcvad>=2.0.10
+numpy>=1.24
+sounddevice>=0.4.6
+requests>=2.31
+websocket-client>=1.7
+
+# Синтез речи. Если колёсико под aarch64 не соберётся — поставить piper
+# системным пакетом или бинарником с github.com/rhasspy/piper/releases,
+# остальной пайплайн от этого не зависит.
+piper-tts>=1.2

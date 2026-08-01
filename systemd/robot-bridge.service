@@ -1,0 +1,14 @@
+[Unit]
+Description=Robot-AI: rosbridge websocket (порт 9090)
+After=network.target robot-base.service
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/home/wheeltec
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /opt/tros/humble/setup.bash && source /home/wheeltec/wheeltec_ros2/install/setup.bash && exec ros2 launch rosbridge_server rosbridge_websocket_launch.xml'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

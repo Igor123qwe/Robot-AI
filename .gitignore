@@ -1,0 +1,24 @@
+# Секреты — НИКОГДА не коммитить
+.env
+secrets/
+*.key
+wpa_supplicant*.conf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Модели и аудио (большие файлы)
+models/
+*.onnx
+*.bin
+*.wav
+*.mp3
+
+# Мусор
+.DS_Store
+*.swp
+*.log

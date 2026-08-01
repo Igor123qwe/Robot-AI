@@ -1,0 +1,15 @@
+[Unit]
+Description=Robot-AI: голосовой ассистент
+After=network.target robot-bridge.service
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/home/wheeltec/Robot-AI/voice
+EnvironmentFile=/home/wheeltec/.robot-ai.env
+ExecStart=/home/wheeltec/Robot-AI/voice/.venv/bin/python -m robot_voice
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

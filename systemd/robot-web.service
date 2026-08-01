@@ -1,0 +1,14 @@
+[Unit]
+Description=Robot-AI: веб-пульт (порт 8000)
+After=network.target
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/home/wheeltec/Robot-AI/web
+ExecStart=/usr/bin/python3 -m http.server 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
