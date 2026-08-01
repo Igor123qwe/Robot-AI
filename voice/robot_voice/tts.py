@@ -317,7 +317,9 @@ class Speaker:
         self.last_said = text
         speech = self.stream(loud=loud)
         if speech is None:
-            return 0
+            # Синтеза нет вовсе (не встал piper): повторять нечего и незачем,
+            # поэтому не притворяемся, что реплику потеряли по дороге.
+            return 1
         for sentence in split_sentences(text):
             speech.feed(sentence)
         return speech.close()
