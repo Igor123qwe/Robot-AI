@@ -19,17 +19,47 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ru
+from . import ru, when
+from . import weather as weather_api
 
 log = logging.getLogger(__name__)
 
 # Как зовётся таймер, которому названия не дали.
 NO_NAME = "без названия"
+ALARM = "будильник"
+
+# Сколько раз повторять объявление, если его никто не слышал, и с каким шагом.
+RING_TRIES = 3
+RING_RETRY = 45.0
 
 
 def _ring(label: str) -> str:
     name = "Таймер" if label == NO_NAME else f"Таймер {label}"
     return f"{name} — время вышло."
+
+
+def _wake_up(target) -> str:
+    """Чем робот будит. Днём это странно звучало бы как «доброе утро»."""
+    greeting = "Доброе утро" if 4 <= target.hour < 11 else "Подъём"
+    return f"{greeting}, {ru.clock(target)}."
+
+
+def _free_label(base: str, taken: dict) -> str:
+    label = base
+    while label in taken:
+        label += " ещё"
+    return label
+
+
+# Ответ на «что ты умеешь». Текст заранее известен, поэтому спрашивать о нём
+# модель — платить за то, что и так написано. Держать в синхроне с набором
+# инструментов ниже: человек проверит первым делом именно это.
+ABILITIES = (
+    "Я умею ездить по квартире и разворачиваться, могу остановиться по слову "
+    "стоп. Скажу, сколько заряда в батарее, который час и какое сегодня число. "
+    "Ставлю таймеры и будильники, напоминаю о делах, веду список покупок. "
+    "Умею говорить тише и громче. Всё остальное — просто спроси, я отвечу."
+)
 
 # Скорости для голосовых команд — заведомо ниже предела пульта.
 DRIVE_SPEED = 0.20   # м/с
@@ -129,21 +159,28 @@ class Timers:
     monotonic — оно не переживает перезапуск.
     """
 
-    def __init__(self, announce: Callable[[str], None],
+    def __init__(self, announce: Callable[..., None],
                  store: Path | None = None) -> None:
         self._announce = announce
         self._items: dict[str, tuple[threading.Timer, float]] = {}
         # Снятые с паузы: имя → сколько секунд оставалось.
         self._paused: dict[str, float] = {}
+        # Что сказать, когда сработает. Пусто — обычное «время вышло»;
+        # у будильника и напоминания фраза своя.
+        self._messages: dict[str, str] = {}
+        # Сколько раз таймер уже звонил в пустоту.
+        self._tries: dict[str, int] = {}
         self._lock = threading.Lock()
         self.store = store
 
-    def add(self, label: str, seconds: float) -> None:
+    def add(self, label: str, seconds: float, message: str = "") -> None:
         with self._lock:
             self.cancel(label, _locked=True)
             timer = threading.Timer(seconds, self._fire, args=(label,))
             timer.daemon = True
             self._items[label] = (timer, time.monotonic() + seconds)
+            if message:
+                self._messages[label] = message
             timer.start()
             self._save()
 
@@ -156,6 +193,7 @@ class Timers:
             if item is not None:
                 item[0].cancel()
             if item is not None or paused is not None:
+                self._messages.pop(label, None)
                 self._save()
             return item is not None or paused is not None
         finally:
@@ -177,9 +215,11 @@ class Timers:
     def resume(self, label: str) -> bool:
         with self._lock:
             left = self._paused.pop(label, None)
+            message = self._messages.get(label, "")
         if left is None:
             return False
-        self.add(label, left)   # add берёт тот же замок, поэтому уже снаружи
+        # add берёт тот же замок, поэтому зовём его уже снаружи.
+        self.add(label, left, message)
         return True
 
     def remaining(self) -> dict[str, float]:
@@ -197,13 +237,36 @@ class Timers:
                 timer.cancel()
             self._items.clear()
             self._paused.clear()
+            self._messages.clear()
+            self._tries.clear()
             self._save()
 
     def _fire(self, label: str) -> None:
         with self._lock:
             self._items.pop(label, None)
+            message = self._messages.get(label, "")
+            tries = self._tries.get(label, 1)
             self._save()
-        self._announce(_ring(label))
+
+        # Будильник и напоминание человек ставил сам — они звучат в полную
+        # громкость даже в тихие часы.
+        heard = self._announce(message or _ring(label), loud=bool(message))
+
+        # Своего динамика нет: реплику играет вкладка пульта, а она бывает
+        # закрыта или с выключенным звуком. Прозвонить в пустоту и забыть —
+        # это потерянный таймер на духовке, поэтому повторяем.
+        if heard is not None and heard <= 0 and tries < RING_TRIES:
+            log.info("таймер %r никто не услышал, повторю через %.0f с",
+                     label, RING_RETRY)
+            with self._lock:
+                self._tries[label] = tries + 1
+            self.add(label, RING_RETRY, message)
+            return
+
+        with self._lock:
+            self._tries.pop(label, None)
+            self._messages.pop(label, None)
+            self._save()
 
     # --- переживание перезапуска ----------------------------------------
     def _save(self) -> None:
@@ -214,6 +277,7 @@ class Timers:
         data = {
             "items": {label: due + shift for label, (_, due) in self._items.items()},
             "paused": dict(self._paused),
+            "messages": dict(self._messages),
         }
         try:
             self.store.parent.mkdir(parents=True, exist_ok=True)
@@ -234,11 +298,12 @@ class Timers:
             return
 
         now = time.time()
+        messages = data.get("messages") or {}
         late = []
         for label, due in (data.get("items") or {}).items():
             left = due - now
             if left > 1:
-                self.add(label, left)
+                self.add(label, left, messages.get(label, ""))
                 log.info("восстановил таймер %r, осталось %.0f с", label, left)
             else:
                 late.append(label)
@@ -247,11 +312,18 @@ class Timers:
             self._save()
         for label in late:
             # Сработал, пока сервиса не было. Молчать нельзя: человек ждал.
-            self._announce(f"Пока меня не было, {_ring(label).lower()}")
+            said = messages.get(label) or _ring(label)
+            self._announce(f"Пока меня не было: {said[0].lower()}{said[1:]}")
 
 
-def build_tools(ros, timers: Timers) -> list[Tool]:
-    """Собирает набор инструментов, привязанный к конкретному роботу."""
+def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
+                place: tuple[float, float] | None = None) -> list[Tool]:
+    """Собирает набор инструментов, привязанный к конкретному роботу.
+
+    speaker нужен для громкости и «повтори», notes — для списка покупок,
+    place — координаты дома для погоды. Всё необязательно: без этого
+    соответствующие инструменты не появятся, и модель о них не узнает.
+    """
 
     def battery_guard() -> str | None:
         # Без связи с шасси команда просто утонет: rosbridge молча выбрасывает
@@ -356,6 +428,39 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
             return f"Поставил ещё один таймер, на {how_long}."
         return f"Поставил {_named(label)} на {how_long}."
 
+    def set_alarm(at: str, label: str = "") -> str:
+        """Будильник на конкретное время: «в семь утра», «на 7:30»."""
+        target = when.at_time(f"в {at.strip()}")
+        if target is None:
+            return f"Не понял время {at!r}. Скажи, например, в семь утра."
+        minutes = when.minutes_until(target)
+        label = label.strip() or ALARM
+        timers.add(label, minutes * 60, message=_wake_up(target))
+        log.info("будильник %r на %s (через %.0f мин)", label, target, minutes)
+        return f"Разбужу {ru.when_phrase(target)}."
+
+    def set_reminder(text: str, at: str = "", minutes: float = 0) -> str:
+        """Напоминание: текст плюс когда — время суток или через сколько."""
+        text = text.strip(" ,.!?")
+        if not text:
+            return "О чём напомнить?"
+        if at.strip():
+            target = when.at_time(f"в {at.strip()}")
+            if target is None:
+                return f"Не понял время {at!r}."
+            minutes = when.minutes_until(target)
+            said_when = ru.when_phrase(target)
+        elif minutes:
+            minutes = max(0.1, min(1440.0, float(minutes)))
+            said_when = f"через {ru.duration(minutes * 60, accusative=True)}"
+        else:
+            return "Когда напомнить?"
+
+        label = _free_label(text[:30], {**timers.remaining(), **timers.paused()})
+        timers.add(label, minutes * 60, message=f"Напоминаю: {text}.")
+        log.info("напоминание %r через %.1f мин", text, minutes)
+        return f"Напомню {said_when}."
+
     def list_timers() -> str:
         left = timers.remaining()
         held = timers.paused()
@@ -409,10 +514,15 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         timers.resume(target)
         return f"Продолжаю {_named(target)}, осталось {ru.duration(held[target])}."
 
-    def cancel_all_timers() -> str:
+    def cancel_all_timers(confirmed: bool = False) -> str:
         count = len(timers.remaining()) + len(timers.paused())
         if not count:
             return "Активных таймеров и так нет."
+        if count > 1 and not confirmed:
+            # Снести чужой таймер на духовку из-за неточно понятой фразы —
+            # это то, что человек уже не восстановит. Один вопрос дешевле.
+            how_many = ru.count(count, "таймер", "таймера", "таймеров")
+            return f"{how_many.capitalize()}. Отменить все?"
         timers.cancel_all()
         word = ru.plural(count, "он был", "их было", "их было")
         return f"Отменил все таймеры, {word} {ru.cardinal(count)}."
@@ -423,7 +533,87 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
     def date_now() -> str:
         return f"Сегодня {ru.date()}."
 
-    return [
+    def abilities() -> str:
+        """Ответ на «что ты умеешь» — заранее известный, платить за него незачем."""
+        return ABILITIES
+
+    def volume(change: str = "тише") -> str:
+        if speaker is None:
+            return "Громкостью я пока не управляю."
+        change = change.strip().lower()
+        was = speaker.volume
+        if change in ("тише", "потише", "тихо", "меньше"):
+            level = max(0.2, round(was - 0.2, 2))
+        elif change in ("громче", "погромче", "громко", "больше"):
+            level = min(1.0, round(was + 0.2, 2))
+        elif change in ("обычная", "нормально", "как обычно", "средне"):
+            level = 1.0
+        else:
+            return "Могу говорить тише или громче."
+        speaker.set_volume(level)
+        if level == was:
+            return "Громче уже некуда." if level >= 1.0 else "Тише уже некуда."
+        return "Хорошо, буду тише." if level < was else "Хорошо, погромче."
+
+    def hush() -> str:
+        if speaker is None:
+            return ""
+        speaker.hush()
+        log.info("замолчал по просьбе")
+        return ""     # молча замолчать — и есть выполнение просьбы
+
+    def repeat() -> str:
+        if speaker is None or not speaker.last_said:
+            return "Я пока ничего не говорил."
+        return speaker.last_said
+
+    def notes_add(item: str) -> str:
+        if notes is None:
+            return "Список у меня не заведён."
+        item = item.strip(" ,.!?")
+        if not item:
+            return "Что добавить?"
+        if not notes.add(item):
+            return f"{item.capitalize()} уже в списке."
+        return f"Записал: {item}."
+
+    def notes_list() -> str:
+        if notes is None:
+            return "Список у меня не заведён."
+        items = notes.items()
+        if not items:
+            return "Список пуст."
+        return (f"В списке {ru.count(len(items), 'пункт', 'пункта', 'пунктов')}: "
+                + ", ".join(items) + ".")
+
+    def notes_remove(item: str) -> str:
+        if notes is None:
+            return "Список у меня не заведён."
+        gone = notes.remove(item)
+        if gone is None:
+            return f"{item.strip().capitalize()} в списке не нашёл."
+        return f"Убрал {gone}."
+
+    def weather(day: str = "сейчас") -> str:
+        if not place or not any(place):
+            return ("Я не знаю, где мы находимся. Впиши координаты дома "
+                    "в настройки, и буду говорить погоду.")
+        data = weather_api.fetch(*place)
+        if data is None:
+            return "Не смог узнать погоду — интернета нет или сервис молчит."
+        if day.strip().lower().startswith("завтра"):
+            return weather_api.describe_tomorrow(data)
+        return weather_api.describe_now(data)
+
+    def notes_clear() -> str:
+        if notes is None:
+            return "Список у меня не заведён."
+        count = notes.clear()
+        if not count:
+            return "Список и так пуст."
+        return f"Стёр весь список, {ru.count(count, 'пункт', 'пункта', 'пунктов')}."
+
+    tools = [
         Tool(
             name="drive",
             description="Проехать в заданную сторону. Колёса меканум, поэтому "
@@ -531,6 +721,51 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
             run=cancel_timer,
         ),
         Tool(
+            name="set_alarm",
+            description="Поставить будильник на конкретное время суток. "
+                        "Для «через сколько-то минут» есть set_timer.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "at": {
+                        "type": "string",
+                        "description": "Время: «7:30», «семь утра», «восемь вечера».",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Название, если будильников несколько.",
+                    },
+                },
+                "required": ["at"],
+            },
+            run=set_alarm,
+        ),
+        Tool(
+            name="set_reminder",
+            description="Напомнить о деле: робот произнесёт текст вслух в "
+                        "назначенное время. Нужно указать либо at, либо minutes.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "О чём напомнить, как это скажет человек: "
+                                       "«выключить плиту», «позвонить маме».",
+                    },
+                    "at": {
+                        "type": "string",
+                        "description": "Время суток: «8:00», «восемь вечера».",
+                    },
+                    "minutes": {
+                        "type": "number",
+                        "description": "Через сколько минут, если время не названо.",
+                    },
+                },
+                "required": ["text"],
+            },
+            run=set_reminder,
+        ),
+        Tool(
             name="pause_timer",
             description="Приостановить таймер, не сбрасывая его. Без названия — "
                         "если таймер всего один.",
@@ -561,8 +796,119 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         ),
         Tool(
             name="cancel_all_timers",
-            description="Отменить сразу все идущие таймеры.",
-            input_schema=EMPTY_SCHEMA,
+            description="Отменить сразу все идущие таймеры. Если их несколько, "
+                        "инструмент сначала переспросит — тогда повтори вызов "
+                        "с confirmed, но только после согласия человека.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Человек подтвердил, что снести можно все.",
+                    },
+                },
+            },
             run=cancel_all_timers,
         ),
+        Tool(
+            name="weather",
+            description="Узнать погоду на улице там, где стоит робот. Своих "
+                        "датчиков у него нет, данные берутся из интернета — не "
+                        "отвечай по памяти. Про другой город этот инструмент "
+                        "ничего не знает: так и скажи, а его не вызывай.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "day": {
+                        "type": "string",
+                        "enum": ["сейчас", "завтра"],
+                        "description": "На когда нужна погода.",
+                    },
+                },
+            },
+            run=weather,
+        ),
+        Tool(
+            name="abilities",
+            description="Рассказать, что робот умеет. Отвечай этим, а не своими "
+                        "словами: список умений тут точный.",
+            input_schema=EMPTY_SCHEMA,
+            run=abilities,
+        ),
     ]
+
+    if speaker is not None:
+        tools += [
+            Tool(
+                name="volume",
+                description="Сделать голос тише или громче.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "change": {
+                            "type": "string",
+                            "enum": ["тише", "громче", "обычная"],
+                            "description": "Куда менять громкость.",
+                        },
+                    },
+                    "required": ["change"],
+                },
+                run=volume,
+            ),
+            Tool(
+                name="hush",
+                description="Замолчать немедленно: перестать проговаривать то, "
+                            "что уже отправлено, и ничего не отвечать.",
+                input_schema=EMPTY_SCHEMA,
+                run=hush,
+            ),
+            Tool(
+                name="repeat",
+                description="Повторить последнюю сказанную фразу.",
+                input_schema=EMPTY_SCHEMA,
+                run=repeat,
+            ),
+        ]
+
+    if notes is not None:
+        tools += [
+            Tool(
+                name="notes_add",
+                description="Добавить пункт в список покупок и дел.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "item": {"type": "string",
+                                 "description": "Что записать: «молоко», «оплатить садик»."},
+                    },
+                    "required": ["item"],
+                },
+                run=notes_add,
+            ),
+            Tool(
+                name="notes_list",
+                description="Прочитать вслух список покупок и дел.",
+                input_schema=EMPTY_SCHEMA,
+                run=notes_list,
+            ),
+            Tool(
+                name="notes_remove",
+                description="Убрать один пункт из списка.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "item": {"type": "string", "description": "Какой пункт убрать."},
+                    },
+                    "required": ["item"],
+                },
+                run=notes_remove,
+            ),
+            Tool(
+                name="notes_clear",
+                description="Стереть весь список целиком.",
+                input_schema=EMPTY_SCHEMA,
+                run=notes_clear,
+            ),
+        ]
+
+    return tools

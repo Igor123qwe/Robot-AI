@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 VOICE_DIR = Path(__file__).resolve().parent.parent
@@ -68,8 +69,35 @@ class Config:
     web_endpoint: str = field(
         default_factory=lambda: _env("ROBOT_WEB_URL", "http://127.0.0.1:8000") + "/speak")
 
+    # Громкость по умолчанию, 0.1–1.0. Меняется голосом («говори тише») и
+    # переживает перезапуск: настройка ночью не должна откатываться сама.
+    volume: float = field(
+        default_factory=lambda: float(_env("ROBOT_VOLUME", "1.0")))
+    # Тихие часы: в это время робот говорит вполголоса и не здоровается при
+    # перезапуске. Будильник и таймер звучат в полную громкость — их для того
+    # и ставили. Пусто — режим выключен.
+    quiet_hours: str = field(default_factory=lambda: _env("ROBOT_QUIET_HOURS", "23-8"))
+    quiet_volume: float = field(
+        default_factory=lambda: float(_env("ROBOT_QUIET_VOLUME", "0.45")))
+
     # --- ROS ---
     rosbridge_url: str = field(default_factory=lambda: _env("ROBOT_ROSBRIDGE_URL", "ws://127.0.0.1:9090"))
+
+    # Команду движения выполняем только по имени. В разговоре без имени робот
+    # ездить не будет: пока окно открыто, любая фраза из комнаты — телевизор,
+    # разговор с другим человеком — выглядит как команда, а «поехал» отменить
+    # уже нельзя. Остановка, таймеры и вопросы имя не требуют.
+    motion_needs_name: bool = field(
+        default_factory=lambda: _env("ROBOT_MOTION_NEEDS_NAME", "1") not in ("0", "нет", "no"))
+
+    # Где хранится то, что должно пережить перезапуск сервиса.
+    data_dir: Path = field(default_factory=lambda: Path(
+        _env("ROBOT_DATA_DIR", str(Path.home() / ".robot-ai"))))
+
+    # Координаты дома для погоды. Пусто — робот честно скажет, что не знает,
+    # где находится: врать про погоду в чужом городе хуже, чем молчать.
+    lat: float = field(default_factory=lambda: float(_env("ROBOT_LAT", "0") or 0))
+    lon: float = field(default_factory=lambda: float(_env("ROBOT_LON", "0") or 0))
 
     # --- имя и режим разговора ---
     # Робот слушает всегда, но реагирует только на своё имя. После обращения
@@ -101,6 +129,19 @@ class Config:
     def piper_model_path(self) -> Path:
         return VOICE_DIR / "models" / f"{self.piper_voice}.onnx"
 
+    def is_quiet_now(self, hour: int | None = None) -> bool:
+        """Ночь ли сейчас по настройке ROBOT_QUIET_HOURS («23-8»)."""
+        if not self.quiet_hours:
+            return False
+        try:
+            start, end = (int(x) for x in self.quiet_hours.split("-", 1))
+        except ValueError:
+            return False
+        if hour is None:
+            hour = datetime.now().hour
+        # Окно почти всегда переходит через полночь, поэтому две ветки.
+        return start <= hour or hour < end if start > end else start <= hour < end
+
     def check(self) -> None:
         if not self.api_key:
             raise SystemExit(
@@ -124,12 +165,17 @@ SYSTEM_PROMPT = """\
 - Числа пиши словами, когда так естественнее звучит.
 
 Как действовать:
-- Ты умеешь ездить, разворачиваться, останавливаться, проверять заряд батареи и \
-ставить таймеры. Для этого у тебя есть инструменты — вызывай их, а не описывай \
-словами, что ты якобы сделал.
+- Ты умеешь ездить, разворачиваться, останавливаться, проверять заряд батареи, \
+ставить таймеры и будильники, напоминать о делах, вести список покупок, \
+называть время и дату, говорить тише и громче. Для этого у тебя есть \
+инструменты — вызывай их, а не описывай словами, что ты якобы сделал.
+- Часов и календаря у тебя своих нет: время и дату спрашивай инструментом, \
+а не отвечай по памяти. Ошибиться тут стыдно.
 - Если команда двусмысленная и разные толкования приведут к разным действиям — \
 переспроси одной фразой.
 - Перед движением коротко скажи, что делаешь.
 - Если тебя просят ехать, а заряд ниже пятнадцати процентов — предупреди об этом.
 - Не выдумывай, что видишь вокруг: камеры у тебя пока нет.
+- Умного дома, музыки, почты и календаря у тебя нет. Просят их — скажи об \
+этом прямо и коротко, без извинений на три предложения.
 """

@@ -12,16 +12,21 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Callable
 
 from . import intents
 from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
 from .config import Config
+from .notes import Notes
 from .ros import Ros
+from .state import State
 from .stt import Recognizer
-from .tools import Timers, build_tools
+from .tools import CUTOFF_VOLT, Timers, build_tools
 from .tts import SentenceBuffer, Speaker
 
 log = logging.getLogger("robot_voice")
@@ -43,6 +48,17 @@ _FILLERS = {"эй", "ей", "хэй", "слушай", "слушайте", "ок�
 # продолжает утреннюю тему, да и весь этот контекст оплачивается заново.
 FORGET_SECONDS = 600.0
 
+# Сколько слов допустимо в реплике без имени, пока открыто окно разговора.
+# Живое продолжение разговора короткое; длинная фраза из комнаты — это почти
+# всегда телевизор или разговор не с роботом.
+IN_SESSION_WORDS = 10
+
+# Сколько молчать с приветствием после недавнего перезапуска.
+GREET_SILENCE = 1800.0
+
+# Сколько времени «отмена» отменяет последнее действие, а не усыпляет робота.
+UNDO_SECONDS = 90.0
+
 
 class Voice:
     """Речь робота: одна реплика за раз, и микрофон молчит, пока она звучит.
@@ -58,6 +74,9 @@ class Voice:
         self.speaker = speaker
         self.listener = listener
         self._lock = threading.RLock()
+        # Куда показать услышанное. Пульт рисует это субтитрами: без экрана и
+        # без SSH иначе не понять, расслышал робот или нет.
+        self.on_heard: Callable[[str], None] | None = None
 
     @contextlib.contextmanager
     def quiet(self):
@@ -78,9 +97,19 @@ class Voice:
         with self._lock:
             yield
 
-    def say(self, text: str) -> None:
+    def say(self, text: str, *, loud: bool = False) -> int:
+        """Говорит и возвращает, сколько слушателей реально услышали."""
+        if not text:
+            return 0
         with self._lock, self.quiet():
-            self.speaker.say(text)
+            return self.speaker.say(text, loud=loud)
+
+    def heard(self, text: str) -> None:
+        if self.on_heard is not None and text:
+            try:
+                self.on_heard(text)
+            except Exception:
+                log.debug("не смог показать услышанное в пульте", exc_info=True)
 
 
 def _setup_logging() -> None:
@@ -161,6 +190,58 @@ def _is_junk(text: str) -> bool:
     return bool(_HALLUCINATION.search(stripped)) and len(stripped) < 120
 
 
+class BatteryWatch:
+    """Сам говорит, что садится.
+
+    Полоску заряда в пульте видно, только если пульт открыт и на него смотрят.
+    Робот ездит по квартире, а садится всегда не вовремя, поэтому о разряде он
+    сообщает голосом — но ровно по одному разу на каждый порог, иначе это
+    превращается в нытьё.
+    """
+
+    LEVELS = ((11.1, "Батарея меньше половины."),
+              (10.8, "Батарея садится, пора на зарядку."),
+              (CUTOFF_VOLT, "Батарея почти пустая, ехать я больше не буду."))
+
+    def __init__(self, ros, voice: Voice, period: float = 60.0) -> None:
+        self.ros = ros
+        self.voice = voice
+        self.period = period
+        self._said: set[float] = set()
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.period):
+            volt = self.ros.voltage
+            if volt is None:
+                continue
+            # Зарядили — снова можно предупреждать.
+            self._said = {v for v in self._said if volt <= v}
+            for level, phrase in self.LEVELS:
+                if volt <= level and level not in self._said:
+                    self._said.add(level)
+                    log.info("батарея %.1f В — предупреждаю", volt)
+                    self.voice.say(phrase)
+                    break
+
+
+def _post_heard(speak_endpoint: str, text: str) -> None:
+    """Показать в пульте, что робот расслышал. Ошибку глушим: это подсказка."""
+    req = urllib.request.Request(
+        speak_endpoint + "/heard", data=text.encode(), method="POST",
+        headers={"Content-Type": "text/plain; charset=utf-8"})
+    try:
+        urllib.request.urlopen(req, timeout=3).close()
+    except (urllib.error.URLError, OSError):
+        pass
+
+
 def main() -> None:
     _setup_logging()
 
@@ -170,8 +251,16 @@ def main() -> None:
              cfg.model, cfg.api_base or "api.anthropic.com",
              cfg.effort or "не задан", cfg.audio_source, cfg.audio_out)
 
+    # Настроенное голосом переживает перезапуск: автообновление случается
+    # каждые две минуты, и громкость не должна возвращаться сама.
+    state = State(cfg.data_dir / "settings.json")
     speaker = Speaker(cfg.piper_model_path,
-                      audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint)
+                      audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint,
+                      volume=float(state.get("volume", cfg.volume)))
+    speaker.on_volume = lambda level: state.set("volume", level)
+    speaker.quiet_now = cfg.is_quiet_now
+    speaker.quiet_volume = cfg.quiet_volume
+
     ros = Ros(cfg.rosbridge_url)
     ros.start()
     if not ros.wait_connected(timeout=15):
@@ -193,12 +282,19 @@ def main() -> None:
         max_speech_ms=cfg.max_speech_ms,
     )
     voice = Voice(speaker, listener)
+    voice.on_heard = lambda text: _post_heard(cfg.web_endpoint, text)
 
-    # Таймеры переживают перезапуск: автообновление может случиться в любой
-    # момент, а таймер на духовку от этого пропадать не должен.
-    timers = Timers(announce=voice.say, store=Path.home() / ".robot-ai" / "timers.json")
-    tools = build_tools(ros, timers)
+    # Таймеры и список переживают перезапуск: автообновление может случиться в
+    # любой момент, а таймер на духовку от этого пропадать не должен.
+    timers = Timers(announce=voice.say, store=cfg.data_dir / "timers.json")
+    notes = Notes(cfg.data_dir / "notes.json")
+    tools = build_tools(ros, timers, speaker=speaker, notes=notes,
+                        place=(cfg.lat, cfg.lon))
     brain = Brain(cfg, tools)
+
+    # Робот сам скажет, что садится: смотреть на полоску в пульте некому.
+    watch = BatteryWatch(ros, voice)
+    watch.start()
 
     stopping = False
 
@@ -216,7 +312,19 @@ def main() -> None:
     signal.signal(signal.SIGINT, shutdown)
 
     greeting = cfg.wake_words[0].capitalize() if cfg.wake_words else "Робот"
-    voice.say(f"{greeting} на связи.")
+    since_greet = time.time() - float(state.get("greeted_at", 0) or 0)
+    if cfg.is_quiet_now():
+        # Ночью автообновление перезапускает сервис так же, как днём, и
+        # «Кузя на связи» в три часа — ровно то, за что робота выключают.
+        log.info("тихие часы — здороваться не буду")
+    elif since_greet < GREET_SILENCE:
+        # Автообновление перезапускает сервис каждые две минуты, если в
+        # репозитории что-то поменялось. Здороваться на каждый перезапуск —
+        # это здороваться весь день.
+        log.info("недавно уже здоровался (%.0f мин назад) — молчу", since_greet / 60)
+    else:
+        voice.say(f"{greeting} на связи.")
+        state.set("greeted_at", time.time())
     timers.restore()
 
     while not stopping:
@@ -273,12 +381,19 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         log.info("записи услышанного складываю в /tmp/robot-audio")
 
     last_talk = 0.0
+    pending = Pending()
+    undo = Undo()
 
     for wav in listener.utterances():
         text = recognizer.transcribe(wav)
         if debug_audio:
             _dump_audio(wav, text)
         if _is_junk(text):
+            if time.monotonic() < awake_until:
+                # В разговоре молчать нельзя: человек не понимает, услышали
+                # его или нет, и начинает повторять всё громче.
+                voice.say("Не расслышал.")
+                awake_until = time.monotonic() + cfg.session_seconds
             continue
 
         # Долгая тишина — значит это уже другой разговор, а не продолжение.
@@ -288,15 +403,24 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
 
         awake = time.monotonic() < awake_until
         command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
+        by_name_called = command is not None
 
         if command is None:
             if not awake:
                 log.info("не мне (%r)", text)
                 continue
-            # В разговоре имя не нужно.
+            # В разговоре имя не нужно. Но окно открыто двадцать секунд, и в
+            # него попадает всё, что звучит в комнате: телевизор, разговор с
+            # другим человеком. Длинную фразу без имени считаем не своей —
+            # иначе робот платит модели за чужие реплики.
             command = text.strip()
+            if len(command.split()) > IN_SESSION_WORDS and intents.parse(command) is None:
+                log.info("в окне, но длинно и не команда — не моё (%r)", command)
+                continue
         elif not awake:
             log.info("проснулся по имени")
+
+        voice.heard(command or text)
 
         if not command:
             # Позвали и замолчали — откликаемся и ждём продолжения.
@@ -306,8 +430,17 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             continue
 
         if awake and _is_sleep_word(command, cfg.sleep_words):
+            # «Отмена» сразу после ошибочно поставленного таймера — это просьба
+            # его снять, а не попрощаться. Так это понимают все ассистенты, и
+            # так это понимает человек: он только что услышал «Поставил таймер».
+            undone = undo.take(command, by_name, voice)
+            if undone:
+                awake_until = time.monotonic() + cfg.session_seconds
+                last_talk = awake_until
+                continue
             log.info("отпустили, засыпаю")
             awake_until = 0.0
+            pending.clear()
             brain.reset()   # разговор закончен, тянуть его в следующий незачем
             voice.say("Ага, зови.")
             continue
@@ -317,8 +450,21 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         # Простые команды разбираем правилами: мгновенно, бесплатно и без
         # риска, что модель поймёт «влево» как «вправо». Всё остальное — модели.
         match = intents.parse(command)
-        if match is not None and match.tool in by_name:
-            _run_direct(by_name[match.tool], match.args, voice)
+
+        answered = pending.consume(command, match, voice)
+        if answered:
+            pass                    # это был ответ на вопрос робота
+        elif match is not None and match.tool in by_name:
+            if (match.tool in ("drive", "turn") and cfg.motion_needs_name
+                    and not by_name_called):
+                # Пока окно разговора открыто, командой выглядит любая фраза из
+                # комнаты — телевизор, разговор с другим человеком. Поехать по
+                # ошибке нельзя отменить, поэтому на движение нужно имя.
+                log.info("движение без имени — не поеду")
+                voice.say(f"Для поездки позови по имени: {name}, вперёд.")
+            else:
+                _run_direct(by_name[match.tool], match.args, voice, pending)
+                undo.remember(match.tool, match.args)
         else:
             # Помечаем явно: по этим строкам в логе видно, каких формулировок
             # не хватает правилам. Это лучший источник для их пополнения —
@@ -332,12 +478,146 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         last_talk = awake_until
 
 
-def _run_direct(tool, args: dict, voice: Voice) -> None:
+class Undo:
+    """Последнее сделанное — чтобы «отмена» отменяла его, а не усыпляла робота.
+
+    Whisper иногда слышит «поставь таймер на двадцать минут» там, где было
+    «на двенадцать». Человек говорит «отмена» — и раньше робот просто прощался,
+    а неверный таймер оставался идти.
+    """
+
+    # Что можно отменить и чем.
+    UNDOABLE = {
+        "set_timer": ("cancel_timer", "label"),
+        "set_alarm": ("cancel_timer", "label"),
+        "set_reminder": ("cancel_timer", "label"),
+        "notes_add": ("notes_remove", "item"),
+    }
+
+    def __init__(self) -> None:
+        self.tool = ""
+        self.args: dict = {}
+        self.at = 0.0
+
+    def remember(self, tool: str, args: dict) -> None:
+        if tool in self.UNDOABLE:
+            self.tool, self.args, self.at = tool, dict(args), time.monotonic()
+        else:
+            self.tool = ""
+
+    def take(self, command: str, by_name: dict, voice: Voice) -> bool:
+        """Отменяет последнее, если просьба похожа на отмену и она свежая."""
+        if not self.tool or time.monotonic() - self.at > UNDO_SECONDS:
+            return False
+        plain = re.sub(r"[^\w\s]", "", command.lower().replace("ё", "е")).strip()
+        if plain not in ("отмена", "отмени", "отменить", "забудь", "не надо",
+                         "неважно", "не важно"):
+            return False
+
+        name, field = self.UNDOABLE[self.tool]
+        tool = by_name.get(name)
+        self.tool = ""
+        if tool is None:
+            return False
+        # Название таймера робот знает своё; будильник зовётся «будильник».
+        value = self.args.get(field) or self.args.get("label") or (
+            "будильник" if name == "cancel_timer" else "")
+        log.info("отменяю последнее: %s", value or "без названия")
+        voice.say(tool({field: value} if value else {}))
+        return True
+
+
+class Pending:
+    """Вопрос, который робот задал сам, и ответ на него.
+
+    Инструменты умеют переспрашивать: «Таймера чай нет. Есть безымянный и
+    лапша. Какой снять?» Без этой памяти следующая фраза человека уходила
+    модели, которая про заданный вопрос ничего не знает, — и разговор
+    обрывался на полуслове.
+    """
+
+    LIFETIME = 20.0
+    YES = {"да", "давай", "ага", "конечно", "верно", "точно", "отменяй",
+           "снимай", "угу", "да давай", "именно"}
+    NO = {"нет", "не надо", "не нужно", "отставить", "погоди", "стой"}
+
+    def __init__(self) -> None:
+        self.tool = None
+        self.field = ""
+        self.confirm = False
+        self.args: dict = {}
+        self.until = 0.0
+
+    def ask(self, tool, field: str = "label", *, confirm: bool = False,
+            args: dict | None = None) -> None:
+        self.tool, self.field, self.confirm = tool, field, confirm
+        self.args = dict(args or {})
+        self.until = time.monotonic() + self.LIFETIME
+
+    def clear(self) -> None:
+        self.tool = None
+        self.until = 0.0
+
+    def consume(self, command: str, match, voice: Voice) -> bool:
+        """Ответ ли это на заданный вопрос. True — обработали сами."""
+        if self.tool is None or time.monotonic() > self.until:
+            self.clear()
+            return False
+
+        plain = re.sub(r"[^\w\s]", "", command.lower().replace("ё", "е")).strip()
+        tool, field, confirm, args = self.tool, self.field, self.confirm, self.args
+        self.clear()
+
+        if confirm:
+            if plain in self.YES:
+                voice.say(tool(args))
+                return True
+            if plain in self.NO or match is None:
+                voice.say("Хорошо, не буду.")
+                return True
+            return False
+
+        # Ответ на «какой именно?» — это короткое название, а не новая команда.
+        if match is not None or len(plain.split()) > 3:
+            return False
+        voice.say(tool({**args, field: plain}))
+        return True
+
+
+# Вопрос робота слышно по последнему знаку: инструменты заканчивают переспрос
+# вопросительным знаком, а обычный ответ — точкой.
+_ASKS_LABEL = ("Какой снять?", "Какой поставить на паузу?", "Какой продолжить?")
+
+
+def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None) -> None:
     """Выполняет команду, разобранную правилом, минуя модель."""
     # Инструмент вызываем до заглушения микрофона: движение стартует сразу, и
     # эти доли секунды робот ещё слышит комнату.
     answer = tool(args)
+    if pending is not None and answer.endswith(_ASKS_LABEL):
+        pending.ask(tool, "label", args=args)
+    elif (pending is not None and answer.endswith("?")
+            and "confirmed" in tool.input_schema.get("properties", {})):
+        pending.ask(tool, confirm=True, args={**args, "confirmed": True})
     voice.say(answer)   # say сам пишет реплику в лог
+
+
+def _failure_phrase(error: Exception) -> str:
+    """Почему не вышло ответить — так, чтобы человек понял, что делать.
+
+    Раньше на всё было одно «Что-то пошло не так, повтори»: человек повторял
+    и получал то же самое. При телефоне-микрофоне и двойном NAT отвалившийся
+    интернет — обычное дело, и сказать об этом честно полезнее.
+    """
+    name = type(error).__name__
+    if "Connection" in name or "Timeout" in name:
+        return ("Сейчас я без интернета. Таймеры, время, список и езда "
+                "работают, а поговорить не выйдет.")
+    if "Authentication" in name or "PermissionDenied" in name:
+        return "Модель меня не пускает — похоже, ключ. Проверь настройки."
+    if "RateLimit" in name:
+        return "Модель занята, попробуй через минуту."
+    return "Что-то пошло не так, повтори."
 
 
 def _respond(command: str, brain: Brain, voice: Voice) -> None:
@@ -372,11 +652,11 @@ def _respond(command: str, brain: Brain, voice: Voice) -> None:
                 start_speaking()
                 if speech:
                     speech.feed(tail)
-        except Exception:
+        except Exception as e:
             log.exception("не смог ответить")
             start_speaking()
             if speech:
-                speech.feed("Что-то пошло не так, повтори.")
+                speech.feed(_failure_phrase(e))
         finally:
             if speech:
                 try:

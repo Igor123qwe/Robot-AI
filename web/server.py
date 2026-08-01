@@ -75,14 +75,24 @@ class SpeechQueue:
                 self._clips.pop(self._order.pop(0), None)
             listeners = list(self._listeners)
 
-        event = {"id": clip_id, "url": f"/speak/{clip_id}.wav", "text": text}
+        self._send({"id": clip_id, "url": f"/speak/{clip_id}.wav", "text": text},
+                   listeners)
+        return clip_id
+
+    def broadcast(self, event: dict) -> None:
+        """Событие без звука: «замолчи», «вот что я расслышал»."""
+        with self._lock:
+            listeners = list(self._listeners)
+        self._send(event, listeners)
+
+    @staticmethod
+    def _send(event: dict, listeners: list) -> None:
         for q in listeners:
             # Заснувшая вкладка не должна тормозить робота — просто пропускаем.
             try:
                 q.put_nowait(event)
             except queue.Full:
                 pass
-        return clip_id
 
     def get(self, clip_id: str) -> bytes | None:
         with self._lock:
@@ -176,7 +186,8 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
-        if self.path.partition("?")[0] != "/speak":
+        path = self.path.partition("?")[0]
+        if path not in ("/speak", "/speak/stop", "/speak/heard"):
             self.fail(404, "нет такой ручки")
             return
         # Говорить роботом может только сам робот, не любое устройство в сети.
@@ -185,6 +196,22 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         length = int(self.headers.get("Content-Length") or 0)
+
+        if path == "/speak/stop":
+            # «Замолчи»: реплики уже в очереди вкладки, сам робот их оттуда
+            # не достанет — просит пульт бросить очередь.
+            SPEECH.broadcast({"stop": True})
+            self.send_json({"ok": True})
+            return
+
+        if path == "/speak/heard":
+            # Что робот расслышал. Экрана у него нет, а «он меня не слышит»
+            # иначе проверяется только через SSH и journalctl.
+            heard = self.rfile.read(min(length, 4096)).decode("utf-8", "replace")
+            SPEECH.broadcast({"heard": heard})
+            self.send_json({"ok": True})
+            return
+
         if not 0 < length <= MAX_CLIP_BYTES:
             self.fail(400, "пустая или слишком большая реплика")
             return

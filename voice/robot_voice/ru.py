@@ -119,9 +119,16 @@ def duration(seconds: float, *, accusative: bool = False) -> str:
 def clock(when: datetime | None = None) -> str:
     """Время словами: «четырнадцать часов тридцать пять минут»."""
     when = when or datetime.now()
+    if not when.minute:
+        return f"{_bare_clock(when)} ровно"
+    return _bare_clock(when)
+
+
+def _bare_clock(when: datetime) -> str:
+    """То же без «ровно»: «в семь часов ровно» звучит по-канцелярски."""
     hours = count(when.hour, "час", "часа", "часов")
     if not when.minute:
-        return f"{hours} ровно"
+        return hours
     return f"{hours} {count(when.minute, 'минута', 'минуты', 'минут', female=True)}"
 
 
@@ -132,6 +139,16 @@ def _ordinal(day: int) -> str:
         return "тридцатое"
     tens, unit = divmod(day, 10)
     return f"{_TENS[tens]} {_ORDINALS[unit]}"
+
+
+def when_phrase(target: datetime, now: datetime | None = None) -> str:
+    """«сегодня в семь часов», «завтра в семь часов тридцать минут»."""
+    now = now or datetime.now()
+    days = (target.date() - now.date()).days
+    day = {0: "сегодня", 1: "завтра", 2: "послезавтра"}.get(days)
+    if day is None:
+        day = f"{_ordinal(target.day)} {_MONTHS[target.month - 1]}"
+    return f"{day} в {_bare_clock(target)}"
 
 
 def date(when: datetime | None = None) -> str:
