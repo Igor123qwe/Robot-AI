@@ -60,8 +60,9 @@ def main() -> None:
 
     cfg = Config()
     cfg.check()
-    log.info("модель %s, effort %s, микрофон %s, динамик %s",
-             cfg.model, cfg.effort, cfg.audio_source, cfg.audio_out)
+    log.info("модель %s через %s, effort %s, микрофон %s, динамик %s",
+             cfg.model, cfg.api_base or "api.anthropic.com",
+             cfg.effort or "не задан", cfg.audio_source, cfg.audio_out)
 
     speaker = Speaker(cfg.piper_model_path,
                       audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint)

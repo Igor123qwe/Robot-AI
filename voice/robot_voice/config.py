@@ -15,12 +15,16 @@ def _env(name: str, default: str = "") -> str:
 
 @dataclass
 class Config:
-    # --- Claude ---
+    # --- модель ---
     api_key: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
+    # Пусто — идём напрямую в api.anthropic.com. Иначе адрес роутера,
+    # понимающего протокол Anthropic (проверяется запросом к /v1/messages).
+    api_base: str = field(default_factory=lambda: _env("ROBOT_API_BASE"))
     model: str = field(default_factory=lambda: _env("ROBOT_MODEL", "claude-opus-5"))
     # low/medium держат ответ быстрым — для разговора это важнее глубины.
+    # Пусто — не отправлять вовсе: сторонний роутер может этот параметр не знать.
     effort: str = field(default_factory=lambda: _env("ROBOT_EFFORT", "low"))
-    max_tokens: int = 2048
+    max_tokens: int = field(default_factory=lambda: int(_env("ROBOT_MAX_TOKENS", "2048")))
 
     # --- аудио ---
     # phone — Android с IP Webcam, local — микрофон в RDK X5

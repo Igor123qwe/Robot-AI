@@ -1,7 +1,12 @@
-"""Claude: диалог с историей, вызовом инструментов и потоковым ответом.
+"""Диалог с моделью: история, вызов инструментов, потоковый ответ.
 
-Ответ отдаётся по кускам, чтобы синтез речи начинался, не дожидаясь конца
-генерации. Цикл «модель → инструмент → модель» ведёт tool_runner из SDK.
+Цикл «модель → инструмент → модель» написан руками, а не отдан tool_runner из
+SDK. Причина в том, что робот может ходить не только к api.anthropic.com, но и
+через сторонний роутер: tool_runner живёт на beta-эндпоинте, а прокси такое
+обычно не пропускает. Обычный /v1/messages поддерживается везде.
+
+Ответ отдаётся кусками, чтобы синтез речи начинался, не дожидаясь конца
+генерации.
 """
 
 from __future__ import annotations
@@ -12,71 +17,91 @@ from typing import Callable
 import anthropic
 
 from .config import SYSTEM_PROMPT, Config
+from .tools import Tool
 
 log = logging.getLogger(__name__)
 
-# Сколько сообщений диалога держим в контексте (пары «вопрос-ответ» плюс
-# результаты инструментов). Дальше — обрезаем самые старые.
+# Сколько сообщений диалога держим в контексте (реплики плюс результаты
+# инструментов). Дальше обрезаем самые старые.
 HISTORY_LIMIT = 24
+
+# Предохранитель от зацикливания: модель не должна дёргать инструменты вечно.
+MAX_TOOL_ROUNDS = 6
 
 
 class Brain:
-    def __init__(self, cfg: Config, tools: list) -> None:
+    def __init__(self, cfg: Config, tools: list[Tool]) -> None:
         self.cfg = cfg
-        self.tools = tools
-        self.client = anthropic.Anthropic(api_key=cfg.api_key)
-        self.history: list[dict] = []
-        # Отказ сервера с подстановкой запасной модели. Если SDK в системе
-        # старый и не знает этих параметров — работаем без них.
-        self._use_fallbacks = True
+        self.tools = {t.name: t for t in tools}
+        self.specs = [t.spec() for t in tools]
 
-    # --- запрос ---------------------------------------------------------
-    def _make_runner(self, messages: list[dict]):
+        client_args = {"api_key": cfg.api_key}
+        if cfg.api_base:
+            client_args["base_url"] = cfg.api_base
+        self.client = anthropic.Anthropic(**client_args)
+
+        self.history: list[dict] = []
+
+    # --- параметры запроса ----------------------------------------------
+    def _params(self, messages: list[dict]) -> dict:
         params = dict(
             model=self.cfg.model,
             max_tokens=self.cfg.max_tokens,
             system=SYSTEM_PROMPT,
-            tools=self.tools,
+            tools=self.specs,
             messages=messages,
-            output_config={"effort": self.cfg.effort},
-            stream=True,
         )
-        if self._use_fallbacks:
-            try:
-                return self.client.beta.messages.tool_runner(
-                    **params,
-                    betas=["server-side-fallback-2026-07-01"],
-                    fallbacks="default",
-                )
-            except TypeError:
-                log.warning("SDK не знает про fallbacks — продолжаю без них")
-                self._use_fallbacks = False
-        return self.client.beta.messages.tool_runner(**params)
+        # effort понимают не все: у роутера или у сторонней модели его может
+        # не быть. Пустое значение — не отправлять.
+        if self.cfg.effort:
+            params["output_config"] = {"effort": self.cfg.effort}
+        return params
 
+    # --- один ход --------------------------------------------------------
     def reply(self, user_text: str, on_text: Callable[[str], None]) -> str:
         """Отвечает на реплику. on_text вызывается на каждый кусок текста."""
         messages = self.history + [{"role": "user", "content": user_text}]
         spoken: list[str] = []
-        final = None
 
-        runner = self._make_runner(messages)
-        for stream in runner:
-            for event in stream:
-                if (event.type == "content_block_delta"
-                        and getattr(event.delta, "type", "") == "text_delta"):
-                    spoken.append(event.delta.text)
-                    on_text(event.delta.text)
+        for round_no in range(MAX_TOOL_ROUNDS):
+            with self.client.messages.stream(**self._params(messages)) as stream:
+                for event in stream:
+                    if (event.type == "content_block_delta"
+                            and getattr(event.delta, "type", "") == "text_delta"):
+                        spoken.append(event.delta.text)
+                        on_text(event.delta.text)
+                message = stream.get_final_message()
 
-            final = stream.get_final_message()
-            # Ведём свою копию истории: свою runner наружу не отдаёт.
-            messages.append({"role": "assistant", "content": final.content})
-            tool_response = runner.generate_tool_call_response()
-            if tool_response is not None:
-                messages.append(tool_response)
+            if message.stop_reason == "refusal":
+                log.warning("модель отказалась отвечать: %s",
+                            getattr(message, "stop_details", None))
+                return "Извини, на это я ответить не могу."
 
-        if final is not None and final.stop_reason == "refusal":
-            log.warning("модель отказалась отвечать: %s", final.stop_details)
-            return "Извини, на это я ответить не могу."
+            messages.append({"role": "assistant", "content": message.content})
+
+            calls = [b for b in message.content if b.type == "tool_use"]
+            if not calls:
+                break
+
+            results = []
+            for call in calls:
+                tool = self.tools.get(call.name)
+                if tool is None:
+                    log.warning("модель зовёт несуществующий инструмент %s", call.name)
+                    output = f"Инструмента {call.name} не существует."
+                else:
+                    log.info("вызываю %s(%s)", call.name, call.input)
+                    output = tool(call.input or {})
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": call.id,
+                    "content": output,
+                })
+            # Все результаты — одним сообщением, иначе модель разучится
+            # вызывать инструменты пачкой.
+            messages.append({"role": "user", "content": results})
+        else:
+            log.warning("исчерпан лимит вызовов инструментов за один ход")
 
         self.history = _trim(messages)
         return "".join(spoken).strip()
