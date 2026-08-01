@@ -418,6 +418,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         log.info("записи услышанного складываю в /tmp/robot-audio")
 
     last_talk = 0.0
+    deaf = False        # прошлая фраза не разобралась — второй раз не ноем
     pending = Pending()
     undo = Undo()
 
@@ -426,12 +427,16 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         if debug_audio:
             _dump_audio(wav, text)
         if _is_junk(text):
-            if time.monotonic() < awake_until:
-                # В разговоре молчать нельзя: человек не понимает, услышали
-                # его или нет, и начинает повторять всё громче.
+            # В разговоре молчать нельзя: человек не понимает, услышали его
+            # или нет, и начинает повторять всё громче. Но говорить это на
+            # каждый шорох тоже нельзя — иначе шум на кухне зациклит робота
+            # на одной фразе. Поэтому только на первый неразобранный подряд.
+            if time.monotonic() < awake_until and not deaf:
                 voice.say("Не расслышал.")
                 awake_until = time.monotonic() + cfg.session_seconds
+            deaf = True
             continue
+        deaf = False
 
         # Долгая тишина — значит это уже другой разговор, а не продолжение.
         if last_talk and time.monotonic() - last_talk > FORGET_SECONDS:
