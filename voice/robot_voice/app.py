@@ -60,10 +60,11 @@ def main() -> None:
 
     cfg = Config()
     cfg.check()
-    log.info("модель %s, effort %s, источник звука %s",
-             cfg.model, cfg.effort, cfg.audio_source)
+    log.info("модель %s, effort %s, микрофон %s, динамик %s",
+             cfg.model, cfg.effort, cfg.audio_source, cfg.audio_out)
 
-    speaker = Speaker(cfg.piper_model_path)
+    speaker = Speaker(cfg.piper_model_path,
+                      audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint)
     ros = Ros(cfg.rosbridge_url)
     ros.start()
     if not ros.wait_connected(timeout=15):

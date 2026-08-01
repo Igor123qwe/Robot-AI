@@ -16,13 +16,24 @@
 
 Адрес телефона берётся из ROBOT_PHONE_URL, можно переопределить на лету:
   /camera?src=http://192.168.3.9:8080
+
+Второе назначение — динамик. Своего громкоговорителя у робота пока нет, а
+IP Webcam умеет только отдавать звук, но не принимать. Поэтому голос играет
+браузер, в котором открыт пульт:
+
+  POST /speak         ← голосовой пайплайн кладёт сюда WAV (только с самого робота)
+  /speak/events       → SSE: пульту сообщается, что появилась новая реплика
+  /speak/<id>.wav     → сама реплика
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +46,62 @@ DEFAULT_PHONE = os.environ.get("ROBOT_PHONE_URL", "http://192.168.3.9:8080").rst
 
 # Сколько ждать телефон, прежде чем признать его недоступным.
 CONNECT_TIMEOUT = 5
+
+# Реплики держим в памяти: они живут секунды, писать их на флешку незачем.
+CLIP_LIMIT = 12
+MAX_CLIP_BYTES = 8 * 1024 * 1024
+
+
+class SpeechQueue:
+    """Свежие реплики робота и подписчики, которым о них сообщать."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._clips: dict[str, bytes] = {}
+        self._order: list[str] = []
+        self._listeners: set[queue.Queue] = set()
+        self._counter = 0
+
+    def add(self, wav: bytes, text: str) -> str:
+        with self._lock:
+            self._counter += 1
+            clip_id = f"{int(time.time())}-{self._counter}"
+            self._clips[clip_id] = wav
+            self._order.append(clip_id)
+            while len(self._order) > CLIP_LIMIT:
+                self._clips.pop(self._order.pop(0), None)
+            listeners = list(self._listeners)
+
+        event = {"id": clip_id, "url": f"/speak/{clip_id}.wav", "text": text}
+        for q in listeners:
+            # Заснувшая вкладка не должна тормозить робота — просто пропускаем.
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                pass
+        return clip_id
+
+    def get(self, clip_id: str) -> bytes | None:
+        with self._lock:
+            return self._clips.get(clip_id)
+
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=16)
+        with self._lock:
+            self._listeners.add(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            self._listeners.discard(q)
+
+    @property
+    def listeners(self) -> int:
+        with self._lock:
+            return len(self._listeners)
+
+
+SPEECH = SpeechQueue()
 
 
 def phone_base(query: str) -> str:
@@ -68,8 +135,67 @@ class Handler(SimpleHTTPRequestHandler):
             self.proxy_once(phone_base(query) + "/shot.jpg")
         elif path == "/camera/status":
             self.camera_status(phone_base(query))
+        elif path == "/speak/events":
+            self.speak_events()
+        elif path.startswith("/speak/") and path.endswith(".wav"):
+            self.speak_clip(path[len("/speak/"):-len(".wav")])
         else:
             super().do_GET()
+
+    def do_POST(self):
+        if self.path.partition("?")[0] != "/speak":
+            self.fail(404, "нет такой ручки")
+            return
+        # Говорить роботом может только сам робот, не любое устройство в сети.
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            self.fail(403, "только с самого робота")
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 < length <= MAX_CLIP_BYTES:
+            self.fail(400, "пустая или слишком большая реплика")
+            return
+
+        wav = self.rfile.read(length)
+        text = urllib.parse.unquote(self.headers.get("X-Robot-Text", ""))
+        clip_id = SPEECH.add(wav, text)
+        self.send_json({"id": clip_id, "listeners": SPEECH.listeners})
+
+    # --- голос ----------------------------------------------------------
+    def speak_events(self) -> None:
+        """SSE: держим соединение и шлём пульту id новых реплик."""
+        q = SPEECH.subscribe()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=15)
+                    payload = f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                except queue.Empty:
+                    payload = ": keepalive\n\n"   # чтобы соединение не уснуло
+                self.wfile.write(payload.encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            SPEECH.unsubscribe(q)
+        self.close_connection = True
+
+    def speak_clip(self, clip_id: str) -> None:
+        wav = SPEECH.get(clip_id)
+        if wav is None:
+            self.fail(404, "реплика уже устарела")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(wav)
 
     # --- камера ---------------------------------------------------------
     def proxy_stream(self, url: str) -> None:

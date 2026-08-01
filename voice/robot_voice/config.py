@@ -41,6 +41,11 @@ class Config:
 
     # --- синтез ---
     piper_voice: str = field(default_factory=lambda: _env("ROBOT_PIPER_VOICE", "ru_RU-irina-medium"))
+    # browser — говорит браузер с открытым пультом (пока нет своего динамика),
+    # local — сразу в aplay (когда приедет SOTAMIA).
+    audio_out: str = field(default_factory=lambda: _env("ROBOT_AUDIO_OUT", "browser"))
+    web_endpoint: str = field(
+        default_factory=lambda: _env("ROBOT_WEB_URL", "http://127.0.0.1:8000") + "/speak")
 
     # --- ROS ---
     rosbridge_url: str = field(default_factory=lambda: _env("ROBOT_ROSBRIDGE_URL", "ws://127.0.0.1:9090"))
@@ -62,6 +67,8 @@ class Config:
             )
         if self.audio_source not in ("phone", "local"):
             raise SystemExit(f"ROBOT_AUDIO_SOURCE должен быть phone или local, а не {self.audio_source!r}")
+        if self.audio_out not in ("browser", "local"):
+            raise SystemExit(f"ROBOT_AUDIO_OUT должен быть browser или local, а не {self.audio_out!r}")
 
 
 SYSTEM_PROMPT = """\
