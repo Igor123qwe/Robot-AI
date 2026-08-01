@@ -6,11 +6,16 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VOICE="$REPO/voice"
 ENVFILE="$HOME/.robot-ai.env"
 
-if ! grep -q '^ANTHROPIC_API_KEY=sk-ant-' "$ENVFILE" 2>/dev/null; then
-  echo "!! в $ENVFILE не задан ANTHROPIC_API_KEY"
-  echo "   заполните и запустите скрипт снова: nano $ENVFILE"
-  exit 1
-fi
+# Ключ может быть и не от Anthropic напрямую — через роутер он выглядит иначе,
+# поэтому проверяем только что строка заполнена и это не заглушка.
+KEY="$(grep -E '^ANTHROPIC_API_KEY=' "$ENVFILE" 2>/dev/null | cut -d= -f2-)"
+case "$KEY" in
+  ""|"sk-ant-..."|*"..."*)
+    echo "!! в $ENVFILE не задан ANTHROPIC_API_KEY"
+    echo "   заполните и запустите скрипт снова: nano $ENVFILE"
+    exit 1
+    ;;
+esac
 
 echo "==> системные пакеты"
 sudo apt-get update -qq
