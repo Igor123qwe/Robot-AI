@@ -17,7 +17,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from . import ru
+
 log = logging.getLogger(__name__)
+
+# Как зовётся таймер, которому названия не дали.
+NO_NAME = "без названия"
 
 # Скорости для голосовых команд — заведомо ниже предела пульта.
 DRIVE_SPEED = 0.20   # м/с
@@ -80,9 +85,20 @@ def _say_distance(metres: float) -> str:
         return "полметра"
     if abs(metres - 1.0) < 0.02:
         return "метр"
+    if abs(metres - 1.5) < 0.02:
+        return "полтора метра"
     if metres < 1.0:
-        return f"на {round(metres * 100)} сантиметров"
-    return f"на {metres:.1f} метра".replace(".0", "")
+        cm = int(round(metres * 100))
+        return "на " + ru.count(cm, "сантиметр", "сантиметра", "сантиметров")
+    whole = int(metres)
+    half = round(metres - whole, 2)
+    if half >= 0.45:
+        return f"на {ru.cardinal(whole)} с половиной метра"
+    return "на " + ru.count(whole, "метр", "метра", "метров")
+
+
+def _say_percent(pct: float) -> str:
+    return ru.count(int(round(pct)), "процент", "процента", "процентов")
 
 
 def volt_to_percent(v: float) -> float:
@@ -103,6 +119,8 @@ class Timers:
     def __init__(self, announce: Callable[[str], None]) -> None:
         self._announce = announce
         self._items: dict[str, tuple[threading.Timer, float]] = {}
+        # Снятые с паузы: имя → сколько секунд оставалось.
+        self._paused: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def add(self, label: str, seconds: float) -> None:
@@ -117,30 +135,56 @@ class Timers:
         if not _locked:
             self._lock.acquire()
         try:
+            paused = self._paused.pop(label, None)
             item = self._items.pop(label, None)
             if item is None:
-                return False
+                return paused is not None
             item[0].cancel()
             return True
         finally:
             if not _locked:
                 self._lock.release()
 
+    def pause(self, label: str) -> bool:
+        """Останавливает отсчёт, запомнив остаток."""
+        with self._lock:
+            item = self._items.pop(label, None)
+            if item is None:
+                return False
+            timer, due = item
+            timer.cancel()
+            self._paused[label] = max(0.0, due - time.monotonic())
+            return True
+
+    def resume(self, label: str) -> bool:
+        with self._lock:
+            left = self._paused.pop(label, None)
+        if left is None:
+            return False
+        self.add(label, left)   # add берёт тот же замок, поэтому уже снаружи
+        return True
+
     def remaining(self) -> dict[str, float]:
         now = time.monotonic()
         with self._lock:
             return {label: max(0.0, due - now) for label, (_, due) in self._items.items()}
+
+    def paused(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._paused)
 
     def cancel_all(self) -> None:
         with self._lock:
             for timer, _ in self._items.values():
                 timer.cancel()
             self._items.clear()
+            self._paused.clear()
 
     def _fire(self, label: str) -> None:
         with self._lock:
             self._items.pop(label, None)
-        self._announce(f"Таймер {label} — время вышло.")
+        name = "Таймер" if label == NO_NAME else f"Таймер {label}"
+        self._announce(f"{name} — время вышло.")
 
 
 def build_tools(ros, timers: Timers) -> list[Tool]:
@@ -151,8 +195,8 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         if volt is None:
             return None  # телеметрия ещё не пришла — не блокируем
         if volt < CUTOFF_VOLT:
-            return (f"Отказ: батарея {volt:.1f} В "
-                    f"({volt_to_percent(volt):.0f} %), ехать нельзя, нужна зарядка.")
+            return (f"Не поеду: батарея {ru.volts(volt)}, "
+                    f"это {_say_percent(volt_to_percent(volt))}. Нужна зарядка.")
         return None
 
     def drive(direction: str, distance: float = 0.5) -> str:
@@ -189,7 +233,8 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         duration = (degrees * 3.14159265 / 180.0) / TURN_SPEED
         log.info("разворачиваюсь %s на %.0f° (%.1f с)", key, degrees, duration)
         ros.drive(0.0, 0.0, sign * TURN_SPEED, duration)
-        return f"Разворачиваюсь {key} на {degrees:.0f} градусов."
+        turn_words = ru.count(int(round(degrees)), "градус", "градуса", "градусов")
+        return f"Разворачиваюсь {key} на {turn_words}."
 
     def stop() -> str:
         was_moving = ros.moving
@@ -201,38 +246,102 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         volt = ros.voltage
         if volt is None:
             return "Телеметрия батареи пока не пришла — шасси не отвечает."
-        pct = volt_to_percent(volt)
         note = ""
         if volt < CUTOFF_VOLT:
             note = " Ехать уже нельзя, нужна зарядка."
         elif volt < 10.8:
             note = " Пора на зарядку."
-        return f"Батарея {volt:.1f} В, это примерно {pct:.0f} процентов.{note}"
+        return (f"Батарея {ru.volts(volt)}, это примерно "
+                f"{_say_percent(volt_to_percent(volt))}.{note}")
 
-    def set_timer(minutes: float, label: str = "без названия") -> str:
+    def _named(label: str) -> str:
+        """«таймер лапша» или просто «таймер», если названия нет."""
+        return "таймер" if label == NO_NAME else f"таймер {label}"
+
+    def _the_only(label: str, pool: dict[str, float]) -> str | None:
+        """Имя единственного таймера — когда названное не нашлось.
+
+        Таймер часто зовут не так, как он записан: «сними таймер на пять минут»
+        вместо названия. Если он всего один, гадать не о чем.
+        """
+        if label in pool:
+            return label
+        return next(iter(pool)) if len(pool) == 1 else None
+
+    def set_timer(minutes: float, label: str = NO_NAME) -> str:
         minutes = max(0.1, min(600.0, float(minutes)))
-        label = label.strip() or "без названия"
+        label = label.strip() or NO_NAME
         timers.add(label, minutes * 60)
         log.info("таймер %r на %.1f мин", label, minutes)
-        return f"Таймер {label} поставлен на {minutes:g} минут."
+        return (f"Поставил {_named(label)} на "
+                f"{ru.duration(minutes * 60, accusative=True)}.")
 
     def list_timers() -> str:
         left = timers.remaining()
-        if not left:
+        held = timers.paused()
+        if not left and not held:
             return "Активных таймеров нет."
-        return "; ".join(f"{label} — осталось {sec / 60:.1f} мин"
-                         for label, sec in left.items())
+        parts = [f"{_named(label)} — осталось {ru.duration(sec)}"
+                 for label, sec in left.items()]
+        parts += [f"{_named(label)} на паузе, на нём {ru.duration(sec)}"
+                  for label, sec in held.items()]
+        listed = "; ".join(parts)
+        return listed[0].upper() + listed[1:]
 
-    def cancel_timer(label: str) -> str:
-        return (f"Таймер {label} отменён." if timers.cancel(label.strip())
-                else f"Таймера {label} нет.")
+    def _which(label: str, pool: dict[str, float], question: str) -> str:
+        """Переспрос, когда непонятно, о каком именно таймере речь."""
+        names = ["безымянный" if n == NO_NAME else n for n in pool]
+        listed = names[0] if len(names) == 1 else \
+            ", ".join(names[:-1]) + " и " + names[-1]
+        head = f"Таймера {label} нет. " if label else ""
+        return f"{head}Есть {listed}. {question}"
+
+    def cancel_timer(label: str = "") -> str:
+        label = label.strip()
+        pool = {**timers.remaining(), **timers.paused()}
+        if not pool:
+            return "Активных таймеров нет."
+        target = _the_only(label, pool)
+        if target is None:
+            return _which(label, pool, "Какой снять?")
+        timers.cancel(target)
+        return f"Отменил {_named(target)}."
+
+    def pause_timer(label: str = "") -> str:
+        label = label.strip()
+        running = timers.remaining()
+        if not running:
+            return "Идущих таймеров нет."
+        target = _the_only(label, running)
+        if target is None:
+            return _which(label, running, "Какой поставить на паузу?")
+        timers.pause(target)
+        return f"Остановил {_named(target)}, на нём {ru.duration(running[target])}."
+
+    def resume_timer(label: str = "") -> str:
+        label = label.strip()
+        held = timers.paused()
+        if not held:
+            return "На паузе ничего нет."
+        target = _the_only(label, held)
+        if target is None:
+            return _which(label, held, "Какой продолжить?")
+        timers.resume(target)
+        return f"Продолжаю {_named(target)}, осталось {ru.duration(held[target])}."
 
     def cancel_all_timers() -> str:
-        count = len(timers.remaining())
+        count = len(timers.remaining()) + len(timers.paused())
         if not count:
             return "Активных таймеров и так нет."
         timers.cancel_all()
-        return f"Отменил все таймеры, их было {count}."
+        word = ru.plural(count, "он был", "их было", "их было")
+        return f"Отменил все таймеры, {word} {ru.cardinal(count)}."
+
+    def time_now() -> str:
+        return f"Сейчас {ru.clock()}."
+
+    def date_now() -> str:
+        return f"Сегодня {ru.date()}."
 
     return [
         Tool(
@@ -308,6 +417,20 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
             run=set_timer,
         ),
         Tool(
+            name="time_now",
+            description="Узнать текущее время. Часов у тебя нет, поэтому "
+                        "спрашивай здесь, а не отвечай по памяти.",
+            input_schema=EMPTY_SCHEMA,
+            run=time_now,
+        ),
+        Tool(
+            name="date_now",
+            description="Узнать сегодняшнюю дату и день недели. Календаря у "
+                        "тебя нет, поэтому спрашивай здесь.",
+            input_schema=EMPTY_SCHEMA,
+            run=date_now,
+        ),
+        Tool(
             name="list_timers",
             description="Показать, какие таймеры сейчас идут и сколько им осталось.",
             input_schema=EMPTY_SCHEMA,
@@ -315,18 +438,46 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         ),
         Tool(
             name="cancel_timer",
-            description="Отменить таймер по названию.",
+            description="Снять таймер. Без названия — если таймер всего один.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "label": {
                         "type": "string",
-                        "description": "Название таймера, который надо снять.",
+                        "description": "Название таймера, если их несколько.",
                     },
                 },
-                "required": ["label"],
             },
             run=cancel_timer,
+        ),
+        Tool(
+            name="pause_timer",
+            description="Приостановить таймер, не сбрасывая его. Без названия — "
+                        "если таймер всего один.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "Название таймера, если их несколько.",
+                    },
+                },
+            },
+            run=pause_timer,
+        ),
+        Tool(
+            name="resume_timer",
+            description="Продолжить таймер, снятый с паузы.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "Название таймера, если на паузе их несколько.",
+                    },
+                },
+            },
+            run=resume_timer,
         ),
         Tool(
             name="cancel_all_timers",
