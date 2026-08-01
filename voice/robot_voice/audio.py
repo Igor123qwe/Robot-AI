@@ -110,12 +110,26 @@ def _read_wav_header(stream) -> tuple[int, int]:
 
 
 def _resample(samples: np.ndarray, src: int, dst: int) -> np.ndarray:
-    """Линейная передискретизация. Для речи 16 кГц её качества достаточно."""
+    """Передискретизация с подавлением зеркал.
+
+    Голая интерполяция при 44.1 → 16 кГц заворачивает всё выше 8 кГц обратно
+    в слышимый диапазон: шипящие превращаются в свист, и распознавание на этом
+    спотыкается. Поэтому перед прореживанием усредняем скользящим окном —
+    грубый, но честный ФНЧ, которого для речи достаточно.
+    """
     if len(samples) == 0:
         return samples
-    n_out = int(len(samples) * dst / src)
-    idx = np.linspace(0, len(samples) - 1, n_out)
-    return np.interp(idx, np.arange(len(samples)), samples).astype(np.int16)
+
+    x = samples.astype(np.float32)
+    if src > dst:
+        window = max(1, int(round(src / dst)))
+        if window > 1:
+            kernel = np.ones(window, dtype=np.float32) / window
+            x = np.convolve(x, kernel, mode="same")
+
+    n_out = int(len(x) * dst / src)
+    idx = np.linspace(0, len(x) - 1, n_out)
+    return np.interp(idx, np.arange(len(x)), x).astype(np.int16)
 
 
 def make_source(audio_source: str, phone_url: str, sample_rate: int):
@@ -125,20 +139,89 @@ def make_source(audio_source: str, phone_url: str, sample_rate: int):
 
 
 # --------------------------------------------------------------------------
+# Развязка чтения и обработки
+# --------------------------------------------------------------------------
+class Pump:
+    """Читает источник в своём потоке, храня только свежий хвост звука.
+
+    Без этого получается растущее отставание: пока Whisper думает пару секунд,
+    телефон продолжает слать, данные копятся в сокете, и робот начинает
+    отвечать на позавчерашние реплики. Здесь старые кадры просто выбрасываются —
+    для диалога свежесть важнее полноты.
+    """
+
+    def __init__(self, source, keep_seconds: float = 3.0) -> None:
+        self.source = source
+        maxlen = max(10, int(keep_seconds * 1000 / FRAME_MS))
+        self._frames: deque[np.ndarray] = deque(maxlen=maxlen)
+        self._ready = threading.Condition()
+        self._error: BaseException | None = None
+        self._dropped = 0
+        self._stop = False
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _run(self) -> None:
+        try:
+            for frame in self.source.frames():
+                if self._stop:
+                    return
+                with self._ready:
+                    if len(self._frames) == self._frames.maxlen:
+                        self._dropped += 1
+                    self._frames.append(frame)
+                    self._ready.notify()
+        except BaseException as e:      # noqa: BLE001 — пробросим в основной поток
+            with self._ready:
+                self._error = e
+                self._ready.notify()
+
+    def frames(self):
+        while not self._stop:
+            with self._ready:
+                while not self._frames and self._error is None and not self._stop:
+                    self._ready.wait(timeout=1.0)
+                if self._error is not None:
+                    raise self._error
+                if not self._frames:
+                    continue
+                frame = self._frames.popleft()
+            yield frame
+
+    def drop_pending(self) -> None:
+        """Выбросить накопленное — например, всё, что робот наговорил сам."""
+        with self._ready:
+            self._frames.clear()
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+
+# --------------------------------------------------------------------------
 # Нарезка на фразы
 # --------------------------------------------------------------------------
 class Listener:
     """Выдаёт по одной законченной фразе (WAV-байты) за раз."""
 
     def __init__(self, source, *, sample_rate: int, vad_level: int,
-                 silence_ms: int, min_speech_ms: int) -> None:
-        self.source = source
+                 silence_ms: int, min_speech_ms: int, max_speech_ms: int = 20000,
+                 start_frames: int = 2) -> None:
+        self.pump = Pump(source)
         self.sample_rate = sample_rate
         self.vad = webrtcvad.Vad(vad_level)
         self.silence_frames = max(1, silence_ms // FRAME_MS)
         self.min_speech_frames = max(1, min_speech_ms // FRAME_MS)
+        self.max_speech_frames = max(1, max_speech_ms // FRAME_MS)
+        # Начинаем запись только после нескольких подряд речевых кадров:
+        # одиночный щелчок или стук посуды VAD принимает за речь.
+        self.start_frames = max(1, start_frames)
         # Небольшой предбуфер, чтобы не отрезать начало слова.
-        self.preroll = deque(maxlen=max(1, 250 // FRAME_MS))
+        self.preroll = deque(maxlen=max(1, 300 // FRAME_MS))
         self._muted = threading.Event()
 
     # Пока робот говорит — не слушаем: иначе он расслышит сам себя.
@@ -148,16 +231,20 @@ class Listener:
     def unmute(self) -> None:
         self._muted.clear()
         self.preroll.clear()
+        # Выбрасываем всё, что накопилось, пока робот говорил и думал.
+        self.pump.drop_pending()
 
     def utterances(self) -> Iterator[bytes]:
+        self.pump.start()
         speech: list[np.ndarray] = []
         silence = 0
+        voiced_run = 0
         talking = False
 
-        for frame in self.source.frames():
+        for frame in self.pump.frames():
             if self._muted.is_set():
                 speech.clear()
-                silence = 0
+                silence = voiced_run = 0
                 talking = False
                 continue
 
@@ -165,7 +252,8 @@ class Listener:
 
             if not talking:
                 self.preroll.append(frame)
-                if is_speech:
+                voiced_run = voiced_run + 1 if is_speech else 0
+                if voiced_run >= self.start_frames:
                     talking = True
                     speech = list(self.preroll)
                     silence = 0
@@ -174,8 +262,13 @@ class Listener:
             speech.append(frame)
             silence = 0 if is_speech else silence + 1
 
-            if silence >= self.silence_frames:
+            # Либо человек замолчал, либо говорит слишком долго — режем.
+            too_long = len(speech) >= self.max_speech_frames
+            if silence >= self.silence_frames or too_long:
+                if too_long:
+                    log.info("аудио: фраза длиннее %d с, режу", self.max_speech_frames * FRAME_MS // 1000)
                 talking = False
+                voiced_run = 0
                 voiced = len(speech) - silence
                 payload, speech = speech, []
                 self.preroll.clear()

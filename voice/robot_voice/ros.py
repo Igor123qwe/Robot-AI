@@ -28,6 +28,10 @@ class Ros:
         self._voltage: float | None = None
         self._lock = threading.Lock()
         self._stop = False
+        # Движение крутится в отдельном потоке, иначе робот не услышит «стоп»,
+        # пока едет: главный цикл стоял бы в sleep, а микрофон был бы заглушён.
+        self._motion_cancel = threading.Event()
+        self._motion: threading.Thread | None = None
 
     # --- жизненный цикл -------------------------------------------------
     def start(self) -> None:
@@ -104,21 +108,46 @@ class Ros:
         })
 
     def stop_motion(self) -> None:
-        self.publish_twist()
+        """Немедленно прекратить движение, чем бы оно ни было вызвано."""
+        self.cancel_motion()
+        for _ in range(3):      # три раза — на случай потери пакета
+            self.publish_twist()
+            time.sleep(0.02)
 
-    def drive(self, x: float, y: float, wz: float, duration: float) -> None:
-        """Едет заданное время, потом гарантированно останавливается.
+    def cancel_motion(self, timeout: float = 2.0) -> None:
+        motion = self._motion
+        self._motion_cancel.set()
+        if motion is not None and motion.is_alive() and motion is not threading.current_thread():
+            motion.join(timeout=timeout)
 
-        Шасси ждёт /cmd_vel непрерывно — при паузе оно само тормозит,
-        поэтому команду повторяем 15 раз в секунду.
+    @property
+    def moving(self) -> bool:
+        return self._motion is not None and self._motion.is_alive()
+
+    def drive(self, x: float, y: float, wz: float, duration: float,
+              block: bool = False) -> None:
+        """Запускает движение на заданное время в отдельном потоке.
+
+        Возврат управления сразу — чтобы робот продолжал слушать и мог
+        принять «стоп» на ходу. block=True нужен только тестам.
         """
+        self.cancel_motion()
+        self._motion_cancel.clear()
+        self._motion = threading.Thread(
+            target=self._motion_loop, args=(x, y, wz, duration), daemon=True)
+        self._motion.start()
+        if block:
+            self._motion.join()
+
+    def _motion_loop(self, x: float, y: float, wz: float, duration: float) -> None:
+        # Шасси ждёт /cmd_vel непрерывно — при паузе оно само тормозит,
+        # поэтому команду повторяем 15 раз в секунду.
         deadline = time.monotonic() + duration
         try:
-            while time.monotonic() < deadline:
+            while time.monotonic() < deadline and not self._motion_cancel.is_set():
                 self.publish_twist(x, y, wz)
-                time.sleep(1 / 15)
+                self._motion_cancel.wait(1 / 15)
         finally:
-            # три раза — на случай потери пакета
             for _ in range(3):
-                self.stop_motion()
-                time.sleep(0.05)
+                self.publish_twist()
+                time.sleep(0.02)

@@ -36,11 +36,15 @@ class Config:
     silence_ms: int = 700
     # Не реагируем на щелчки: фраза короче этого — мусор.
     min_speech_ms: int = 300
+    # Предохранитель от бесконечной записи, если VAD залип на шуме.
+    max_speech_ms: int = 20000
     # Агрессивность webrtcvad: 0 мягко, 3 жёстко (меньше ложных срабатываний).
     vad_level: int = 2
 
     # --- распознавание ---
     whisper_model: str = field(default_factory=lambda: _env("ROBOT_WHISPER_MODEL", "base"))
+    # 1 — жадный поиск, быстро. 5 — точнее, но втрое дольше на A55.
+    whisper_beam: int = field(default_factory=lambda: int(_env("ROBOT_WHISPER_BEAM", "1")))
     language: str = "ru"
 
     # --- синтез ---

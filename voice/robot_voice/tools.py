@@ -74,6 +74,17 @@ class Tool:
             return f"Инструмент {self.name} не сработал: {e}"
 
 
+def _say_distance(metres: float) -> str:
+    """Расстояние словами: «полметра» звучит естественнее, чем «0.50 м»."""
+    if abs(metres - 0.5) < 0.02:
+        return "полметра"
+    if abs(metres - 1.0) < 0.02:
+        return "метр"
+    if metres < 1.0:
+        return f"на {round(metres * 100)} сантиметров"
+    return f"на {metres:.1f} метра".replace(".0", "")
+
+
 def volt_to_percent(v: float) -> float:
     if v >= _CURVE[0][0]:
         return 100.0
@@ -157,8 +168,9 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         fx, fy = _DIRECTIONS[key]
         duration = distance / DRIVE_SPEED
         log.info("еду %s на %.2f м (%.1f с)", key, distance, duration)
+        # Не блокируем: пока едем, робот должен слышать «стоп».
         ros.drive(fx * DRIVE_SPEED, fy * DRIVE_SPEED, 0.0, duration)
-        return f"Проехал {key} примерно {distance:.2f} м."
+        return f"Еду {key} {_say_distance(distance)}."
 
     def turn(direction: str, degrees: float = 90.0) -> str:
         key = direction.strip().lower()
@@ -177,12 +189,13 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         duration = (degrees * 3.14159265 / 180.0) / TURN_SPEED
         log.info("разворачиваюсь %s на %.0f° (%.1f с)", key, degrees, duration)
         ros.drive(0.0, 0.0, sign * TURN_SPEED, duration)
-        return f"Развернулся {key} примерно на {degrees:.0f} градусов."
+        return f"Разворачиваюсь {key} на {degrees:.0f} градусов."
 
     def stop() -> str:
+        was_moving = ros.moving
         ros.stop_motion()
         log.info("стоп")
-        return "Остановился."
+        return "Остановился." if was_moving else "Я и так стою."
 
     def battery() -> str:
         volt = ros.voltage

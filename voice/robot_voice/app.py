@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 import signal
@@ -19,13 +20,18 @@ from .tts import SentenceBuffer, Speaker
 
 log = logging.getLogger("robot_voice")
 
-# Мусор, который whisper любит выдавать на тишине и шуме.
+# Мусор, который whisper любит выдавать на тишине и шуме. Русские модели
+# обучались в том числе на субтитрах, поэтому на пустой записи выдают титры
+# переводчиков — их ловим по характерным словам, а не списком целиком.
 _JUNK = re.compile(r"^[\s.,!?…\-—\"'()]*$")
-_HALLUCINATIONS = {
-    "субтитры сделал dimatorzok",
-    "продолжение следует...",
-    "редактор субтитров а.синецкая корректор а.егорова",
-}
+_HALLUCINATION = re.compile(
+    r"субтитр|продолжение следует|спасибо за просмотр|редактор субтитров|"
+    r"корректор|перевод[аи]? выполн|dimatorzok|amara\.org",
+    re.I,
+)
+
+# Слова, которыми зовут перед именем: «эй, робот», «слушай, робот».
+_FILLERS = {"эй", "ей", "хэй", "слушай", "слушайте", "окей", "ok", "окэй", "привет"}
 
 
 def _setup_logging() -> None:
@@ -39,21 +45,47 @@ def _setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+def _clean_token(token: str) -> str:
+    return token.lower().replace("ё", "е").strip(" ,.!?…—-\"'()")
+
+
+def _sounds_like_wake(token: str, wake_words: tuple[str, ...]) -> bool:
+    """Похоже ли слово на обращение к роботу.
+
+    Whisper пишет имя по-разному — «робот», «Робот,», «роберт», «робут», —
+    поэтому сравниваем нестрого. Порог 0.75 отсекает «работа» и «пробор»,
+    но прощает одну перепутанную букву.
+    """
+    if not token:
+        return False
+    for wake in wake_words:
+        if token == wake or token.startswith(wake):
+            return True
+        if difflib.SequenceMatcher(None, token, wake).ratio() >= 0.75:
+            return True
+    return False
+
+
 def _strip_wake_word(text: str, wake_words: tuple[str, ...]) -> str | None:
     """Возвращает текст без обращения, либо None, если обращения не было."""
     if not wake_words:
         return text
-    low = text.lower().lstrip(" ,.!?—-")
-    for word in wake_words:
-        if low.startswith(word):
-            rest = low[len(word):].lstrip(" ,.!?—-")
-            # Отдаём исходный регистр хвоста, а не приведённый к нижнему.
-            return text[len(text) - len(rest):].strip() if rest else ""
-    return None
+
+    tokens = text.split()
+    i = 0
+    while i < len(tokens) and _clean_token(tokens[i]) in _FILLERS:
+        i += 1
+    if i >= len(tokens) or not _sounds_like_wake(_clean_token(tokens[i]), wake_words):
+        return None
+    return " ".join(tokens[i + 1:]).strip(" ,.!?…—-")
 
 
 def _is_junk(text: str) -> bool:
-    return bool(_JUNK.match(text)) or text.strip().lower() in _HALLUCINATIONS
+    stripped = text.strip()
+    if _JUNK.match(stripped) or not re.search(r"[а-яa-z]", stripped, re.I):
+        return True
+    # Титры переводчиков осмысленны по форме, но появляются только на тишине.
+    return bool(_HALLUCINATION.search(stripped)) and len(stripped) < 120
 
 
 def main() -> None:
@@ -75,7 +107,8 @@ def main() -> None:
     timers = Timers(announce=speaker.say)
     tools = build_tools(ros, timers)
     brain = Brain(cfg, tools)
-    recognizer = Recognizer(cfg.whisper_model, cfg.language)
+    recognizer = Recognizer(cfg.whisper_model, cfg.language,
+                            beam_size=cfg.whisper_beam)
 
     listener = Listener(
         make_source(cfg.audio_source, cfg.phone_url, cfg.sample_rate),
@@ -83,6 +116,7 @@ def main() -> None:
         vad_level=cfg.vad_level,
         silence_ms=cfg.silence_ms,
         min_speech_ms=cfg.min_speech_ms,
+        max_speech_ms=cfg.max_speech_ms,
     )
 
     stopping = False
