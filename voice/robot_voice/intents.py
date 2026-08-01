@@ -82,7 +82,15 @@ def parse(text: str) -> Match | None:
 
 # --- сами правила ----------------------------------------------------------
 def _stop(t: str) -> Match | None:
-    if re.fullmatch(rf"{_PREFIX}(стоп|стой|стоять|остановись|тормози|хватит|замри)", t):
+    # Слова остановки собраны из русских интентов Home Assistant плюс то,
+    # что говорят живому роботу. «Забудь», «неважно», «проехали» сюда
+    # намеренно не попали: это отмена просьбы, а не команда встать.
+    if re.fullmatch(
+        rf"{_PREFIX}(стоп|стоп[- ]стоп|стой|стоять|стой на месте|остановись|"
+        rf"[при]?останови(сь)?|тормози|тормозни|притормози|хватит|прекрати|"
+        rf"замри|отставить|отбой)",
+        t,
+    ):
         return Match("stop", {}, "стоп")
     return None
 
@@ -149,32 +157,77 @@ def _turn(t: str) -> Match | None:
     return Match("turn", args, "разворот")
 
 
+# Глаголы постановки таймера — из русских интентов Home Assistant.
+_TIMER_SET = r"(?:установи\w*|постав(?:ь|ить)|включи\w*|запусти\w*|зада(?:й|ть)|заведи|засеки)"
+_TIMER_CANCEL = r"(?:отмени\w*|удали\w*|сбрось|сбрось\w*|убери|выключи\w*|останови\w*|сними)"
+_UNITS = r"(минут\w*|мин|секунд\w*|сек|час\w*|ч)"
+
+
+def _unit_to_minutes(value: float, unit: str) -> float:
+    if unit.startswith(("сек", "сек")):
+        return value / 60
+    if unit.startswith(("час", "ч")):
+        return value * 60
+    return value
+
+
 def _timer(t: str) -> Match | None:
+    # «поставь таймер лапша на 9 минут», «таймер на 1 час 30 минут»
     m = re.fullmatch(
-        rf"{_PREFIX}(?:постав\w+|заведи|засеки)?\s*таймер\s*(?:на)?\s*"
-        rf"(\d+(?:[.,]\d+)?)\s*(минут\w*|мин|секунд\w*|сек|час\w*)",
+        rf"{_PREFIX}{_TIMER_SET}?\s*таймер\s*"
+        rf"(?:([а-я][а-я -]{{0,20}}?)\s+)?"          # необязательное название
+        rf"(?:на\s*)?"
+        rf"(\d+(?:[.,]\d+)?)\s*{_UNITS}"
+        rf"(?:\s*(\d+(?:[.,]\d+)?)\s*{_UNITS})?",
         t.strip(),
     )
     if not m:
         return None
 
-    value = float(m.group(1).replace(",", "."))
-    unit = m.group(2)
-    if unit.startswith("сек"):
-        minutes = value / 60
-    elif unit.startswith("час"):
-        minutes = value * 60
-    else:
-        minutes = value
-    return Match("set_timer", {"minutes": round(minutes, 3)}, "таймер")
+    minutes = _unit_to_minutes(float(m.group(2).replace(",", ".")), m.group(3))
+    if m.group(4):
+        minutes += _unit_to_minutes(float(m.group(4).replace(",", ".")), m.group(5))
+
+    args: dict = {"minutes": round(minutes, 3)}
+    label = (m.group(1) or "").strip()
+    # «на» и «через» — предлоги, а не названия таймера.
+    if label and label not in ("на", "через"):
+        args["label"] = label
+    return Match("set_timer", args, "таймер")
 
 
 def _list_timers(t: str) -> Match | None:
-    if re.fullmatch(rf"{_PREFIX}(какие\s+)?таймер\w*(\s+(идут|остались|есть))?", t):
+    # Формулировки статуса взяты из HassTimerStatus.
+    if re.fullmatch(
+        rf"{_PREFIX}(?:"
+        rf"(какие\s+)?таймер\w*(\s+(идут|остались|есть|активны))?|"
+        rf"что\s+с\s+таймер\w+|"
+        rf"(какое\s+)?состояние\s+(у\s+)?таймер\w+|"
+        rf"сколько\s+(времени\s+)?осталось\s+(у|на)\s+таймер\w+"
+        rf")",
+        t,
+    ):
         return Match("list_timers", {}, "список таймеров")
     return None
 
 
+def _cancel_timers(t: str) -> Match | None:
+    if re.fullmatch(rf"{_PREFIX}{_TIMER_CANCEL}\s+все\s+таймер\w+", t):
+        return Match("cancel_all_timers", {}, "снять все таймеры")
+
+    m = re.fullmatch(
+        rf"{_PREFIX}{_TIMER_CANCEL}\s+таймер\s*([а-я][а-я -]{{0,20}})?",
+        t.strip(),
+    )
+    if not m:
+        return None
+    label = (m.group(1) or "").strip()
+    # Без названия отменять нечего конкретного — снимаем все, так понятнее.
+    if not label:
+        return Match("cancel_all_timers", {}, "снять все таймеры")
+    return Match("cancel_timer", {"label": label}, "снять таймер")
+
+
 _RULES: list[Callable[[str], Match | None]] = [
-    _stop, _list_timers, _timer, _drive, _turn, _battery,
+    _stop, _list_timers, _cancel_timers, _timer, _drive, _turn, _battery,
 ]

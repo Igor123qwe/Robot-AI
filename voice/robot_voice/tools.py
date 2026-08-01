@@ -214,6 +214,13 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
         return (f"Таймер {label} отменён." if timers.cancel(label.strip())
                 else f"Таймера {label} нет.")
 
+    def cancel_all_timers() -> str:
+        count = len(timers.remaining())
+        if not count:
+            return "Активных таймеров и так нет."
+        timers.cancel_all()
+        return f"Отменил все таймеры, их было {count}."
+
     return [
         Tool(
             name="drive",
@@ -307,5 +314,11 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
                 "required": ["label"],
             },
             run=cancel_timer,
+        ),
+        Tool(
+            name="cancel_all_timers",
+            description="Отменить сразу все идущие таймеры.",
+            input_schema=EMPTY_SCHEMA,
+            run=cancel_all_timers,
         ),
     ]

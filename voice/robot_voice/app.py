@@ -138,6 +138,10 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         if match is not None and match.tool in by_name:
             _run_direct(by_name[match.tool], match.args, speaker, listener)
         else:
+            # Помечаем явно: по этим строкам в логе видно, каких формулировок
+            # не хватает правилам. Это лучший источник для их пополнения —
+            # выборка под конкретного человека, а не общий корпус.
+            log.info("правилами не разобрал, спрашиваю модель")
             _respond(command, brain, speaker, listener)
 
 
