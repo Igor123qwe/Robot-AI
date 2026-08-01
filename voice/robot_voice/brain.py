@@ -41,6 +41,9 @@ class Brain:
         self.client = anthropic.Anthropic(**client_args)
 
         self.history: list[dict] = []
+        # Расход с момента запуска — чтобы видеть цену вопроса, а не гадать.
+        self.total_in = 0
+        self.total_out = 0
 
     # --- параметры запроса ----------------------------------------------
     def _params(self, messages: list[dict]) -> dict:
@@ -62,6 +65,7 @@ class Brain:
         """Отвечает на реплику. on_text вызывается на каждый кусок текста."""
         messages = self.history + [{"role": "user", "content": user_text}]
         spoken: list[str] = []
+        used_in = used_out = 0
 
         for round_no in range(MAX_TOOL_ROUNDS):
             with self.client.messages.stream(**self._params(messages)) as stream:
@@ -71,6 +75,11 @@ class Brain:
                         spoken.append(event.delta.text)
                         on_text(event.delta.text)
                 message = stream.get_final_message()
+
+            usage = getattr(message, "usage", None)
+            if usage is not None:
+                used_in += getattr(usage, "input_tokens", 0) or 0
+                used_out += getattr(usage, "output_tokens", 0) or 0
 
             if message.stop_reason == "refusal":
                 log.warning("модель отказалась отвечать: %s",
@@ -102,6 +111,11 @@ class Brain:
             messages.append({"role": "user", "content": results})
         else:
             log.warning("исчерпан лимит вызовов инструментов за один ход")
+
+        self.total_in += used_in
+        self.total_out += used_out
+        log.info("токены: %d вход + %d выход | всего за сеанс %d + %d",
+                 used_in, used_out, self.total_in, self.total_out)
 
         self.history = _trim(messages)
         return "".join(spoken).strip()
