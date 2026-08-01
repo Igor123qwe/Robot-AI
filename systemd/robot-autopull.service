@@ -1,0 +1,11 @@
+[Unit]
+Description=Robot-AI: подтянуть обновления с GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# От root: перезапускать сервисы иначе не выйдет. Сам git внутри скрипта
+# запускается от владельца репозитория — у root нет ssh-ключа для GitHub.
+WorkingDirectory=/home/wheeltec/Robot-AI
+ExecStart=/bin/bash /home/wheeltec/Robot-AI/scripts/update.sh

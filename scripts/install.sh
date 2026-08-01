@@ -19,21 +19,22 @@ fi
 
 # --- systemd ---------------------------------------------------------------
 echo "==> ставлю юниты systemd"
-for unit in robot-base robot-bridge robot-web; do
-  sudo cp "$REPO/systemd/$unit.service" "/etc/systemd/system/$unit.service"
+for f in "$REPO"/systemd/*.service "$REPO"/systemd/*.timer; do
+  [ -e "$f" ] || continue
+  sudo cp "$f" "/etc/systemd/system/$(basename "$f")"
 done
-
 sudo systemctl daemon-reload
+
 for unit in robot-base robot-bridge robot-web; do
   sudo systemctl enable "$unit"
   sudo systemctl restart "$unit"
 done
 
-# robot-voice ставим, но не включаем — нужен ключ API и python-зависимости
-sudo cp "$REPO/systemd/robot-voice.service" /etc/systemd/system/robot-voice.service
-sudo systemctl daemon-reload
+# robot-voice и robot-autopull установлены, но выключены — включаются отдельно.
 echo "==> robot-voice установлен, но выключен."
 echo "    Включить: bash $REPO/scripts/setup_voice.sh"
+echo "==> robot-autopull установлен, но выключен."
+echo "    Включить: sudo systemctl enable --now robot-autopull.timer"
 
 # --- отключаем вредное наследие WHEELTEC -----------------------------------
 # apstart1 поднимал точку доступа на 192.168.0.100 и ломал домашнюю сеть

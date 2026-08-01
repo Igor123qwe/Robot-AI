@@ -45,6 +45,7 @@
   #battFill { height: 100%; width: 0%; background: var(--ok); border-radius: 1px; transition: width .4s, background .4s; }
 
   main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .side { display: flex; flex-direction: column; min-height: 0; }
 
   /* --- видео --- */
   #videoBox {
@@ -111,6 +112,16 @@
     border-radius: 6px; padding: 7px 12px; font-size: 13px;
   }
   .row button:active { background: var(--line); }
+
+  /* Широкий и низкий экран (ландшафт на телефоне, узкое окно на ПК):
+     видео слева, управление справа — иначе джойстики уезжают за край. */
+  @media (orientation: landscape) and (max-height: 640px) {
+    main { flex-direction: row; }
+    #videoBox { flex: 1 1 50%; border-right: 1px solid var(--line); }
+    .side { flex: 1 1 50%; overflow-y: auto; }
+    .pad { max-height: none; }
+    .wheels { border-top: none; }
+  }
 </style>
 </head>
 <body>
@@ -130,8 +141,9 @@
     <div id="videoHint">видео выключено<br>введите адрес IP Webcam ниже</div>
   </div>
 
+  <div class="side">
   <div class="row">
-    <input type="text" id="camUrl" placeholder="http://192.168.0.77:8080" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <input type="text" id="camUrl" placeholder="192.168.3.9:8080" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="camBtn">Видео</button>
   </div>
 
@@ -151,6 +163,7 @@
   <div class="pads">
     <div class="pad" id="padMove"><span class="cap"></span><span class="tag">ход</span></div>
     <div class="pad turn" id="padTurn"><span class="cap"></span><span class="tag">разворот</span></div>
+  </div>
   </div>
 </main>
 
@@ -348,8 +361,20 @@ function updateBattery(volt) {
 const camUrl = $('camUrl'), camBtn = $('camBtn'), videoBox = $('videoBox'), videoHint = $('videoHint');
 camUrl.value = localStorage.getItem('robot.camUrl') || '';
 
+// «192.168.3.9» → «http://192.168.3.9:8080»: IP Webcam слушает 8080,
+// и вводить схему с портом каждый раз с телефона неудобно.
+function normalizeCamUrl(raw) {
+  let s = raw.trim().replace(/\/+$/, '');
+  if (!s) return '';
+  if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+  const host = s.slice(s.indexOf('//') + 2);
+  if (!/:\d+/.test(host)) s += ':8080';
+  return s;
+}
+
 camBtn.addEventListener('click', () => {
-  const base = camUrl.value.trim().replace(/\/+$/, '');
+  const base = normalizeCamUrl(camUrl.value);
+  camUrl.value = base;
   const old = videoBox.querySelector('img');
   if (old) old.remove();
 
