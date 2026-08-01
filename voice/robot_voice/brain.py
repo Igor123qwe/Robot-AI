@@ -131,7 +131,8 @@ class Brain:
             spoken.append(chunk)
             on_text(chunk)
 
-        for round_no in range(MAX_TOOL_ROUNDS):
+        rounds = 0
+        for rounds in range(1, MAX_TOOL_ROUNDS + 1):
             message = self._round(messages, collect)
 
             usage = getattr(message, "usage", None)
@@ -177,7 +178,7 @@ class Brain:
             # вызывать инструменты пачкой.
             messages.append({"role": "user", "content": results})
         else:
-            log.warning("исчерпан лимит вызовов инструментов за один ход")
+            log.warning("исчерпан лимит вызовов инструментов за один ход (%d)", rounds)
 
         self.total_in += used_in + written
         self.total_out += used_out
@@ -223,5 +224,6 @@ def _trim(messages: list[dict]) -> list[dict]:
     for i in starts:
         if len(messages) - i <= HISTORY_LIMIT:
             return messages[i:]
-    # Все ходы длиннее лимита — берём последний, иначе история не обрежется.
-    return messages[starts[-1]:] if starts else messages
+    # Все ходы длиннее лимита — берём последний. Реплика человека в истории
+    # есть всегда: с неё начинается каждый ход.
+    return messages[starts[-1]:]

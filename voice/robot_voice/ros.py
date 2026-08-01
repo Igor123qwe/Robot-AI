@@ -183,20 +183,17 @@ class Ros:
             last = self._last_move
         return last > 0 and (time.monotonic() - last) < 1.5
 
-    def drive(self, x: float, y: float, wz: float, duration: float,
-              block: bool = False) -> None:
+    def drive(self, x: float, y: float, wz: float, duration: float) -> None:
         """Запускает движение на заданное время в отдельном потоке.
 
         Возврат управления сразу — чтобы робот продолжал слушать и мог
-        принять «стоп» на ходу. block=True нужен только тестам.
+        принять «стоп» на ходу.
         """
         self.cancel_motion()
         self._motion_cancel.clear()
         self._motion = threading.Thread(
             target=self._motion_loop, args=(x, y, wz, duration), daemon=True)
         self._motion.start()
-        if block:
-            self._motion.join()
 
     def _motion_loop(self, x: float, y: float, wz: float, duration: float) -> None:
         # Шасси ждёт /cmd_vel непрерывно — при паузе оно само тормозит,

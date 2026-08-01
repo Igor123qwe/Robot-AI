@@ -318,11 +318,9 @@ def main() -> None:
     watch = Watchdog(ros, voice, listener)
     watch.start()
 
-    stopping = False
-
     def shutdown(_sig, _frm) -> None:
-        nonlocal stopping
-        stopping = True
+        # Выход именно через sys.exit: главный цикл висит в чтении звука и
+        # флаг увидел бы только после следующей фразы, то есть никогда.
         log.info("останавливаюсь")
         timers.cancel_all()
         ros.stop_motion()
@@ -350,7 +348,7 @@ def main() -> None:
         state.set("greeted_at", time.time())
     timers.restore()
 
-    while not stopping:
+    while True:
         try:
             _listen_loop(cfg, listener, recognizer, brain, voice, tools, addressed)
         except KeyboardInterrupt:

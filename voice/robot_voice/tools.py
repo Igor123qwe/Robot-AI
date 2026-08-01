@@ -153,7 +153,7 @@ def volt_to_percent(v: float) -> float:
         if v_lo <= v <= v_hi:
             k = (v - v_lo) / (v_hi - v_lo)
             return p_lo + k * (p_hi - p_lo)
-    return 0.0
+    return 0.0   # страховка: сюда попадём, только если в _CURVE появится дыра
 
 
 class Timers:
