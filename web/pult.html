@@ -97,6 +97,13 @@
   .speed label { font-size: 12px; color: var(--dim); flex: none; }
   .speed input { flex: 1; accent-color: var(--accent); }
   .speed .v { width: 62px; text-align: right; font-size: 13px; font-variant-numeric: tabular-nums; }
+  /* Аварийный стоп. Заметный и крупный: жать будут в спешке, часто с телефона. */
+  #stopBtn {
+    flex: none; padding: 8px 16px; border: 0; border-radius: 8px;
+    background: var(--bad); color: #fff; font-weight: 700; font-size: 14px;
+    letter-spacing: .5px; cursor: pointer;
+  }
+  #stopBtn:active { filter: brightness(.8); }
 
   /* --- джойстики --- */
   .pads { display: flex; gap: 10px; padding: 4px 12px 12px; }
@@ -180,6 +187,7 @@
     <label>предел</label>
     <input type="range" id="lim" min="5" max="80" value="30">
     <span class="v" id="limV">0.30 м/с</span>
+    <button id="stopBtn" title="Немедленно остановить робота">СТОП</button>
   </div>
 
   <div class="pads">
@@ -357,8 +365,22 @@ function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
+// Публикуем, только когда джойстики заняты, плюс несколько нулей после
+// отпускания. Раньше вкладка слала нули 15 раз в секунду круглосуточно, и
+// голосовая команда «вперёд на метр» ехала рывками: две струи в один топик.
+// А закрыть вкладку нельзя — она же динамик робота.
+let idleZeros = 0;
+
 function publishCmdVel() {
   if (!wsReady) return;
+  const moving = cmd.x !== 0 || cmd.y !== 0 || cmd.wz !== 0;
+  if (moving) {
+    idleZeros = 3;            // после отпускания дошлём столько нулей
+  } else if (idleZeros > 0) {
+    idleZeros--;
+  } else {
+    return;                   // стоим — не мешаем голосовому управлению
+  }
   send({
     op: 'publish',
     topic: '/cmd_vel',
@@ -367,6 +389,20 @@ function publishCmdVel() {
       angular: { x: 0, y: 0, z: cmd.wz },
     },
   });
+}
+
+// Аварийный стоп: работает, даже когда робот едет по голосовой команде и
+// физически не слышит «стоп» — пока говорит, микрофон заглушён.
+function emergencyStop() {
+  cmd.x = cmd.y = cmd.wz = 0;
+  idleZeros = 0;
+  for (let i = 0; i < 5; i++) {
+    send({
+      op: 'publish',
+      topic: '/cmd_vel',
+      msg: { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } },
+    });
+  }
 }
 
 // ── Батарея ──────────────────────────────────────────────────────────────
@@ -435,12 +471,14 @@ const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAA
 const player = new Audio();
 const speechQueue = [];
 let soundOn = false, playing = false, captionTimer = null;
+let speech = null;
 
-sndBtn.addEventListener('click', () => {
-  soundOn = !soundOn;
-  sndBtn.textContent = soundOn ? '🔊' : '🔇';
-  sndBtn.classList.toggle('on', soundOn);
-  if (soundOn) {
+function setSound(on) {
+  soundOn = on;
+  sndBtn.textContent = on ? '🔊' : '🔇';
+  sndBtn.classList.toggle('on', on);
+  localStorage.setItem('soundOn', on ? '1' : '0');
+  if (on) {
     // Разблокируем автовоспроизведение прямо в обработчике нажатия.
     player.src = SILENT_WAV;
     player.play().catch(() => {});
@@ -449,7 +487,10 @@ sndBtn.addEventListener('click', () => {
     player.pause();
     playing = false;
   }
-});
+  listen();   // сообщаем роботу, слышит его эта вкладка или нет
+}
+
+sndBtn.addEventListener('click', () => setSound(!soundOn));
 
 function playNext() {
   if (playing || !speechQueue.length) return;
@@ -468,21 +509,47 @@ function showCaption(text) {
   captionTimer = setTimeout(() => caption.classList.remove('on'), 7000);
 }
 
-// EventSource переподключается сам, отдельная логика не нужна.
-const speech = new EventSource('/speak/events');
-speech.onmessage = ev => {
-  let data;
-  try { data = JSON.parse(ev.data); } catch (e) { return; }
-  showCaption(data.text);
-  if (!soundOn) return;         // текст показываем всегда, звук — по кнопке
-  speechQueue.push(data.url);
-  playNext();
-};
+// EventSource переподключается сам, отдельная логика не нужна. Признак sound
+// нужен роботу: он ждёт окончания реплики, только если её кто-то слышит.
+function listen() {
+  if (speech) speech.close();
+  speech = new EventSource('/speak/events?sound=' + (soundOn ? '1' : '0'));
+  speech.onmessage = ev => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch (e) { return; }
+    showCaption(data.text);
+    if (!soundOn) return;       // текст показываем всегда, звук — по кнопке
+    speechQueue.push(data.url);
+    playNext();
+  };
+}
+listen();
+
+// Автовоспроизведение требует жеста, поэтому включить звук за человека нельзя.
+// Но если в прошлый раз он был включён, ждём первого касания страницы —
+// иначе после каждой перезагрузки вкладка немая, а робот думает, что говорит.
+if (localStorage.getItem('soundOn') === '1') {
+  sndBtn.textContent = '🔈';
+  sndBtn.title = 'Звук был включён — коснитесь страницы, чтобы вернуть';
+  const unlock = () => {
+    window.removeEventListener('pointerdown', unlock);
+    window.removeEventListener('keydown', unlock);
+    setSound(true);
+  };
+  window.addEventListener('pointerdown', unlock);
+  window.addEventListener('keydown', unlock);
+}
 
 // ── Главный цикл ─────────────────────────────────────────────────────────
 connect();
 setInterval(publishCmdVel, 1000 / SEND_HZ);
 setInterval(drawWheels, 1000 / 30);
+
+$('stopBtn').addEventListener('pointerdown', emergencyStop);
+// Пробел — тот же стоп с клавиатуры, когда пульт открыт на ноутбуке.
+window.addEventListener('keydown', ev => {
+  if (ev.code === 'Space') { ev.preventDefault(); emergencyStop(); }
+});
 
 // Отпустили всё при уходе со страницы — робот не должен уехать.
 document.addEventListener('visibilitychange', () => {

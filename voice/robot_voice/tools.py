@@ -11,10 +11,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from . import ru
@@ -23,6 +25,11 @@ log = logging.getLogger(__name__)
 
 # Как зовётся таймер, которому названия не дали.
 NO_NAME = "без названия"
+
+
+def _ring(label: str) -> str:
+    name = "Таймер" if label == NO_NAME else f"Таймер {label}"
+    return f"{name} — время вышло."
 
 # Скорости для голосовых команд — заведомо ниже предела пульта.
 DRIVE_SPEED = 0.20   # м/с
@@ -114,14 +121,22 @@ def volt_to_percent(v: float) -> float:
 
 
 class Timers:
-    """Таймеры, которые робот озвучивает вслух, когда они срабатывают."""
+    """Таймеры, которые робот озвучивает вслух, когда они срабатывают.
 
-    def __init__(self, announce: Callable[[str], None]) -> None:
+    Хранятся на диске: автообновление перезапускает сервис каждые две минуты,
+    если в репозитории что-то поменялось, и таймер на духовку не должен от
+    этого пропадать. Сроки записываем в обычном времени (time.time), а не в
+    monotonic — оно не переживает перезапуск.
+    """
+
+    def __init__(self, announce: Callable[[str], None],
+                 store: Path | None = None) -> None:
         self._announce = announce
         self._items: dict[str, tuple[threading.Timer, float]] = {}
         # Снятые с паузы: имя → сколько секунд оставалось.
         self._paused: dict[str, float] = {}
         self._lock = threading.Lock()
+        self.store = store
 
     def add(self, label: str, seconds: float) -> None:
         with self._lock:
@@ -130,6 +145,7 @@ class Timers:
             timer.daemon = True
             self._items[label] = (timer, time.monotonic() + seconds)
             timer.start()
+            self._save()
 
     def cancel(self, label: str, *, _locked: bool = False) -> bool:
         if not _locked:
@@ -137,10 +153,11 @@ class Timers:
         try:
             paused = self._paused.pop(label, None)
             item = self._items.pop(label, None)
-            if item is None:
-                return paused is not None
-            item[0].cancel()
-            return True
+            if item is not None:
+                item[0].cancel()
+            if item is not None or paused is not None:
+                self._save()
+            return item is not None or paused is not None
         finally:
             if not _locked:
                 self._lock.release()
@@ -154,6 +171,7 @@ class Timers:
             timer, due = item
             timer.cancel()
             self._paused[label] = max(0.0, due - time.monotonic())
+            self._save()
             return True
 
     def resume(self, label: str) -> bool:
@@ -179,18 +197,68 @@ class Timers:
                 timer.cancel()
             self._items.clear()
             self._paused.clear()
+            self._save()
 
     def _fire(self, label: str) -> None:
         with self._lock:
             self._items.pop(label, None)
-        name = "Таймер" if label == NO_NAME else f"Таймер {label}"
-        self._announce(f"{name} — время вышло.")
+            self._save()
+        self._announce(_ring(label))
+
+    # --- переживание перезапуска ----------------------------------------
+    def _save(self) -> None:
+        """Пишет состояние на диск. Замок уже держит вызывающий."""
+        if self.store is None:
+            return
+        shift = time.time() - time.monotonic()
+        data = {
+            "items": {label: due + shift for label, (_, due) in self._items.items()},
+            "paused": dict(self._paused),
+        }
+        try:
+            self.store.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.store.with_name(self.store.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False))
+            tmp.replace(self.store)      # замена целиком, без полуфайлов
+        except OSError as e:
+            log.warning("не смог сохранить таймеры: %s", e)
+
+    def restore(self) -> None:
+        """Поднимает таймеры, пережившие перезапуск сервиса."""
+        if self.store is None or not self.store.exists():
+            return
+        try:
+            data = json.loads(self.store.read_text())
+        except (OSError, ValueError) as e:
+            log.warning("не смог прочитать сохранённые таймеры: %s", e)
+            return
+
+        now = time.time()
+        late = []
+        for label, due in (data.get("items") or {}).items():
+            left = due - now
+            if left > 1:
+                self.add(label, left)
+                log.info("восстановил таймер %r, осталось %.0f с", label, left)
+            else:
+                late.append(label)
+        with self._lock:
+            self._paused.update(data.get("paused") or {})
+            self._save()
+        for label in late:
+            # Сработал, пока сервиса не было. Молчать нельзя: человек ждал.
+            self._announce(f"Пока меня не было, {_ring(label).lower()}")
 
 
 def build_tools(ros, timers: Timers) -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу."""
 
     def battery_guard() -> str | None:
+        # Без связи с шасси команда просто утонет: rosbridge молча выбрасывает
+        # публикацию. Раньше робот в этом случае бодро отвечал «Еду вперёд» и
+        # не ехал — час подряд, пока не заметишь.
+        if not getattr(ros, "connected", True):
+            return "Не могу: нет связи с шасси. Проверь, включён ли робот."
         volt = ros.voltage
         if volt is None:
             return None  # телеметрия ещё не пришла — не блокируем
@@ -271,10 +339,22 @@ def build_tools(ros, timers: Timers) -> list[Tool]:
     def set_timer(minutes: float, label: str = NO_NAME) -> str:
         minutes = max(0.1, min(600.0, float(minutes)))
         label = label.strip() or NO_NAME
+        extra = False
+        if label == NO_NAME:
+            # Второй безымянный таймер раньше молча затирал первый: имя одно,
+            # а add() заменяет по имени. Теперь второй зовётся по времени.
+            taken = {**timers.remaining(), **timers.paused()}
+            if label in taken:
+                label = ru.duration(minutes * 60)
+                while label in taken:
+                    label += " ещё"
+                extra = True
         timers.add(label, minutes * 60)
         log.info("таймер %r на %.1f мин", label, minutes)
-        return (f"Поставил {_named(label)} на "
-                f"{ru.duration(minutes * 60, accusative=True)}.")
+        how_long = ru.duration(minutes * 60, accusative=True)
+        if extra:
+            return f"Поставил ещё один таймер, на {how_long}."
+        return f"Поставил {_named(label)} на {how_long}."
 
     def list_timers() -> str:
         left = timers.remaining()

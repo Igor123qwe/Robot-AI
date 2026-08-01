@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import difflib
 import logging
 import os
 import re
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +38,49 @@ _HALLUCINATION = re.compile(
 
 # Слова, которыми зовут перед именем: «эй, робот», «слушай, робот».
 _FILLERS = {"эй", "ей", "хэй", "слушай", "слушайте", "окей", "ok", "окэй", "привет"}
+
+# Через сколько молчания забываем прошлый разговор. Иначе вечером «а повтори»
+# продолжает утреннюю тему, да и весь этот контекст оплачивается заново.
+FORGET_SECONDS = 600.0
+
+
+class Voice:
+    """Речь робота: одна реплика за раз, и микрофон молчит, пока она звучит.
+
+    Микрофон глушится не «на всякий случай»: аппаратного эхоподавления нет,
+    робот слышит сам себя и отвечает сам себе — проверено на живом роботе.
+    Замок нужен потому, что таймер срабатывает в своём потоке и может
+    заговорить посреди ответа: в режиме local это два piper на одну звуковую
+    карту, в режиме browser — две реплики в очереди пульта.
+    """
+
+    def __init__(self, speaker: Speaker, listener: Listener) -> None:
+        self.speaker = speaker
+        self.listener = listener
+        self._lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def quiet(self):
+        """Заглушает микрофон на время звучания реплики."""
+        self.listener.mute()
+        try:
+            yield
+        finally:
+            self.listener.unmute()
+
+    @contextlib.contextmanager
+    def hold(self):
+        """Занимает голос, не трогая микрофон.
+
+        Для потокового ответа: пока модель думает, робот молчит и должен
+        слышать «стоп» — особенно если модель уже успела вызвать drive.
+        """
+        with self._lock:
+            yield
+
+    def say(self, text: str) -> None:
+        with self._lock, self.quiet():
+            self.speaker.say(text)
 
 
 def _setup_logging() -> None:
@@ -136,9 +181,6 @@ def main() -> None:
     busy = BusyFlag(ros)
     busy.start()
 
-    timers = Timers(announce=speaker.say)
-    tools = build_tools(ros, timers)
-    brain = Brain(cfg, tools)
     recognizer = Recognizer(cfg.whisper_model, cfg.language,
                             beam_size=cfg.whisper_beam)
 
@@ -150,6 +192,13 @@ def main() -> None:
         min_speech_ms=cfg.min_speech_ms,
         max_speech_ms=cfg.max_speech_ms,
     )
+    voice = Voice(speaker, listener)
+
+    # Таймеры переживают перезапуск: автообновление может случиться в любой
+    # момент, а таймер на духовку от этого пропадать не должен.
+    timers = Timers(announce=voice.say, store=Path.home() / ".robot-ai" / "timers.json")
+    tools = build_tools(ros, timers)
+    brain = Brain(cfg, tools)
 
     stopping = False
 
@@ -167,11 +216,12 @@ def main() -> None:
     signal.signal(signal.SIGINT, shutdown)
 
     greeting = cfg.wake_words[0].capitalize() if cfg.wake_words else "Робот"
-    speaker.say(f"{greeting} на связи.")
+    voice.say(f"{greeting} на связи.")
+    timers.restore()
 
     while not stopping:
         try:
-            _listen_loop(cfg, listener, recognizer, brain, speaker, tools)
+            _listen_loop(cfg, listener, recognizer, brain, voice, tools)
         except KeyboardInterrupt:
             shutdown(None, None)
         except Exception:
@@ -208,7 +258,7 @@ def _is_sleep_word(command: str, sleep_words: tuple[str, ...]) -> bool:
 
 
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
-                 brain: Brain, speaker: Speaker, tools: list) -> None:
+                 brain: Brain, voice: Voice, tools: list) -> None:
     by_name = {t.name: t for t in tools}
     name = cfg.wake_words[0].capitalize() if cfg.wake_words else "робот"
     log.info("слушаю, имя — %s, разговор держится %.0f с после ответа",
@@ -222,12 +272,19 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
     if debug_audio:
         log.info("записи услышанного складываю в /tmp/robot-audio")
 
+    last_talk = 0.0
+
     for wav in listener.utterances():
         text = recognizer.transcribe(wav)
         if debug_audio:
             _dump_audio(wav, text)
         if _is_junk(text):
             continue
+
+        # Долгая тишина — значит это уже другой разговор, а не продолжение.
+        if last_talk and time.monotonic() - last_talk > FORGET_SECONDS:
+            log.info("прошлый разговор давно закончился, забываю его")
+            brain.reset()
 
         awake = time.monotonic() < awake_until
         command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
@@ -243,14 +300,16 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
 
         if not command:
             # Позвали и замолчали — откликаемся и ждём продолжения.
-            speaker.say("Да?")
+            voice.say("Да?")
             awake_until = time.monotonic() + cfg.session_seconds
+            last_talk = time.monotonic()
             continue
 
         if awake and _is_sleep_word(command, cfg.sleep_words):
             log.info("отпустили, засыпаю")
             awake_until = 0.0
-            speaker.say("Ага, зови.")
+            brain.reset()   # разговор закончен, тянуть его в следующий незачем
+            voice.say("Ага, зови.")
             continue
 
         log.info("человек: %s", command)
@@ -259,55 +318,68 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         # риска, что модель поймёт «влево» как «вправо». Всё остальное — модели.
         match = intents.parse(command)
         if match is not None and match.tool in by_name:
-            _run_direct(by_name[match.tool], match.args, speaker, listener)
+            _run_direct(by_name[match.tool], match.args, voice)
         else:
             # Помечаем явно: по этим строкам в логе видно, каких формулировок
             # не хватает правилам. Это лучший источник для их пополнения —
             # выборка под конкретного человека, а не общий корпус.
             log.info("правилами не разобрал, спрашиваю модель")
-            _respond(command, brain, speaker, listener)
+            _respond(command, brain, voice)
 
         # Окно отсчитываем от конца ответа, а не от начала: иначе длинная
         # реплика робота съедала бы всё время, отведённое на продолжение.
         awake_until = time.monotonic() + cfg.session_seconds
+        last_talk = awake_until
 
 
-def _run_direct(tool, args: dict, speaker: Speaker, listener: Listener) -> None:
+def _run_direct(tool, args: dict, voice: Voice) -> None:
     """Выполняет команду, разобранную правилом, минуя модель."""
-    listener.mute()
-    try:
-        speaker.say(tool(args))   # say сам пишет реплику в лог
-    finally:
-        listener.unmute()
+    # Инструмент вызываем до заглушения микрофона: движение стартует сразу, и
+    # эти доли секунды робот ещё слышит комнату.
+    answer = tool(args)
+    voice.say(answer)   # say сам пишет реплику в лог
 
 
-def _respond(command: str, brain: Brain, speaker: Speaker, listener: Listener) -> None:
+def _respond(command: str, brain: Brain, voice: Voice) -> None:
     """Отвечает вслух, проговаривая предложения по мере генерации."""
-    listener.mute()  # без аппаратного AEC робот иначе услышит сам себя
-    speech = speaker.stream()
+    speech = voice.speaker.stream()
     buffer = SentenceBuffer()
 
-    def on_text(chunk: str) -> None:
-        for sentence in buffer.push(chunk):
-            log.info("робот: %s", sentence)
-            if speech:
-                speech.feed(sentence)
+    # Микрофон глушим не на весь ход, а с первого произнесённого предложения:
+    # пока модель думает, робот молчит — и должен слышать «стоп», тем более
+    # что модель могла уже вызвать drive и робот в этот момент едет.
+    with voice.hold(), contextlib.ExitStack() as stack:
+        speaking = False
 
-    try:
-        brain.reply(command, on_text)
-        tail = buffer.flush()
-        if tail:
-            log.info("робот: %s", tail)
+        def start_speaking() -> None:
+            nonlocal speaking
+            if not speaking:
+                stack.enter_context(voice.quiet())
+                speaking = True
+
+        def on_text(chunk: str) -> None:
+            for sentence in buffer.push(chunk):
+                log.info("робот: %s", sentence)
+                start_speaking()
+                if speech:
+                    speech.feed(sentence)
+
+        try:
+            brain.reply(command, on_text)
+            tail = buffer.flush()
+            if tail:
+                log.info("робот: %s", tail)
+                start_speaking()
+                if speech:
+                    speech.feed(tail)
+        except Exception:
+            log.exception("не смог ответить")
+            start_speaking()
             if speech:
-                speech.feed(tail)
-    except Exception:
-        log.exception("не смог ответить")
-        if speech:
-            speech.feed("Что-то пошло не так, повтори.")
-    finally:
-        if speech:
-            try:
-                speech.close()
-            except Exception:
-                log.exception("сбой при озвучивании")
-        listener.unmute()
+                speech.feed("Что-то пошло не так, повтори.")
+        finally:
+            if speech:
+                try:
+                    speech.close()
+                except Exception:
+                    log.exception("сбой при озвучивании")

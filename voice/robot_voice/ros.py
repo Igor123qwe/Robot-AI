@@ -19,6 +19,9 @@ log = logging.getLogger(__name__)
 CMD_VEL = "/cmd_vel"
 POWER = "/PowerVoltage"
 
+# Шасси шлёт напряжение раз в секунду. Десять секунд молчания — связи нет.
+VOLTAGE_TTL = 10.0
+
 
 class Ros:
     def __init__(self, url: str) -> None:
@@ -26,6 +29,7 @@ class Ros:
         self._ws: websocket.WebSocketApp | None = None
         self._connected = threading.Event()
         self._voltage: float | None = None
+        self._voltage_at = 0.0
         self._lock = threading.Lock()
         self._stop = False
         # Движение крутится в отдельном потоке, иначе робот не услышит «стоп»,
@@ -85,6 +89,7 @@ class Ros:
         if msg.get("topic") == POWER:
             with self._lock:
                 self._voltage = float(msg["msg"]["data"])
+                self._voltage_at = time.monotonic()
 
         elif msg.get("topic") == CMD_VEL:
             try:
@@ -111,8 +116,20 @@ class Ros:
 
     # --- телеметрия -----------------------------------------------------
     @property
+    def connected(self) -> bool:
+        return self._connected.is_set()
+
+    @property
     def voltage(self) -> float | None:
+        """Напряжение батареи или None, если свежих данных нет.
+
+        Шасси шлёт его раз в секунду. Если данные протухли — связи с шасси
+        нет, и старое значение врёт: иначе робот через сутки после отключения
+        уверенно сообщит «батарея двенадцать вольт».
+        """
         with self._lock:
+            if self._voltage_at and time.monotonic() - self._voltage_at > VOLTAGE_TTL:
+                return None
             return self._voltage
 
     # --- управление -----------------------------------------------------

@@ -28,6 +28,7 @@ IP Webcam умеет только отдавать звук, но не прин�
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import queue
@@ -59,7 +60,9 @@ class SpeechQueue:
         self._lock = threading.Lock()
         self._clips: dict[str, bytes] = {}
         self._order: list[str] = []
-        self._listeners: set[queue.Queue] = set()
+        # Значение — включён ли у вкладки звук. Вкладка с выключенным звуком
+        # видит только титры, и робот не должен считать, что его услышали.
+        self._listeners: dict[queue.Queue, bool] = {}
         self._counter = 0
 
     def add(self, wav: bytes, text: str) -> str:
@@ -85,23 +88,44 @@ class SpeechQueue:
         with self._lock:
             return self._clips.get(clip_id)
 
-    def subscribe(self) -> queue.Queue:
+    def subscribe(self, *, sound: bool) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=16)
         with self._lock:
-            self._listeners.add(q)
+            self._listeners[q] = sound
         return q
 
     def unsubscribe(self, q: queue.Queue) -> None:
         with self._lock:
-            self._listeners.discard(q)
+            self._listeners.pop(q, None)
 
     @property
     def listeners(self) -> int:
         with self._lock:
             return len(self._listeners)
 
+    @property
+    def hearing(self) -> int:
+        """Сколько вкладок реально проиграют реплику."""
+        with self._lock:
+            return sum(1 for on in self._listeners.values() if on)
+
 
 SPEECH = SpeechQueue()
+
+
+def _is_home_address(host: str) -> bool:
+    """Домашний ли это адрес. Имена не пропускаем — только литеральный IP.
+
+    Телефон меняет адрес по DHCP, поэтому src приходится разрешать. Но без
+    ограничения это готовый прокси: робот стоит сразу в двух сетях и по
+    чужой просьбе сходит куда угодно, включая интернет.
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # Локалхост исключён отдельно: за ним сидят службы самого робота.
+    return ip.is_private and not ip.is_loopback and not ip.is_link_local
 
 
 def phone_base(query: str) -> str:
@@ -111,9 +135,10 @@ def phone_base(query: str) -> str:
         return DEFAULT_PHONE
     if not src.startswith(("http://", "https://")):
         src = "http://" + src
-    if ":" not in src.split("//", 1)[1]:
-        src += ":8080"
-    return src.rstrip("/")
+    parsed = urllib.parse.urlsplit(src)
+    if not _is_home_address(parsed.hostname or ""):
+        return DEFAULT_PHONE
+    return f"http://{parsed.hostname}:{parsed.port or 8080}"
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -127,8 +152,16 @@ class Handler(SimpleHTTPRequestHandler):
         if not self.path.startswith("/camera"):
             super().log_message(fmt, *args)
 
+    # Каталог web/ — не файлопомойка: отдаём пульт, а не листинг и не исходники.
+    def list_directory(self, path):
+        self.path = "/pult.html"
+        return SimpleHTTPRequestHandler.send_head(self)
+
     def do_GET(self):
         path, _, query = self.path.partition("?")
+        if path.endswith(".py"):
+            self.fail(404, "нет такой страницы")
+            return
         if path == "/camera":
             self.proxy_stream(phone_base(query) + "/video")
         elif path == "/camera/snapshot":
@@ -136,7 +169,7 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/camera/status":
             self.camera_status(phone_base(query))
         elif path == "/speak/events":
-            self.speak_events()
+            self.speak_events(query)
         elif path.startswith("/speak/") and path.endswith(".wav"):
             self.speak_clip(path[len("/speak/"):-len(".wav")])
         else:
@@ -159,12 +192,14 @@ class Handler(SimpleHTTPRequestHandler):
         wav = self.rfile.read(length)
         text = urllib.parse.unquote(self.headers.get("X-Robot-Text", ""))
         clip_id = SPEECH.add(wav, text)
-        self.send_json({"id": clip_id, "listeners": SPEECH.listeners})
+        self.send_json({"id": clip_id, "listeners": SPEECH.hearing,
+                        "tabs": SPEECH.listeners})
 
     # --- голос ----------------------------------------------------------
-    def speak_events(self) -> None:
+    def speak_events(self, query: str = "") -> None:
         """SSE: держим соединение и шлём пульту id новых реплик."""
-        q = SPEECH.subscribe()
+        sound = urllib.parse.parse_qs(query).get("sound", ["0"])[0] == "1"
+        q = SPEECH.subscribe(sound=sound)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

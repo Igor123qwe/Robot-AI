@@ -30,6 +30,11 @@ HISTORY_LIMIT = 8
 # Предохранитель от зацикливания: модель не должна дёргать инструменты вечно.
 MAX_TOOL_ROUNDS = 6
 
+# Сколько ждём ответа. Умолчание SDK — десять минут: для голосового робота это
+# вечность, потому что микрофон всё это время заглушён, а если модель успела
+# вызвать drive — робот в это время едет и не слышит «стоп».
+TIMEOUT_SECONDS = 25.0
+
 
 class Brain:
     def __init__(self, cfg: Config, tools: list[Tool]) -> None:
@@ -37,7 +42,12 @@ class Brain:
         self.tools = {t.name: t for t in tools}
         self.specs = [t.spec() for t in tools]
 
-        client_args = {"api_key": cfg.api_key}
+        client_args = {
+            "api_key": cfg.api_key,
+            "timeout": TIMEOUT_SECONDS,
+            # Две попытки: сетевой сбой бывает, но ждать третью робот не может.
+            "max_retries": 1,
+        }
         if cfg.api_base:
             client_args["base_url"] = cfg.api_base
         self.client = anthropic.Anthropic(**client_args)
@@ -76,16 +86,38 @@ class Brain:
             }]
         return params
 
-    def _stream(self, messages: list[dict]):
-        """Открывает поток, отступая от кэширования, если его не понимают."""
-        try:
-            return self.client.messages.stream(**self._params(messages))
-        except anthropic.BadRequestError as e:
-            if not self._use_cache:
-                raise
-            log.warning("кэширование промпта не принято (%s) — работаю без него", e)
+    def _degrade(self, error: Exception) -> bool:
+        """Отключает необязательный параметр, который не понял собеседник.
+
+        Сторонний роутер может не знать ни кэширования, ни effort. Раньше
+        отступление стояло вокруг вызова messages.stream(), а он запрос не
+        делает — HTTP уходит только при входе в with. Поэтому отступление
+        не срабатывало никогда, и робот отвечал «что-то пошло не так» на
+        каждый разговорный вопрос до конца жизни процесса.
+        """
+        if self._use_cache:
+            log.warning("кэширование промпта не принято (%s) — работаю без него", error)
             self._use_cache = False
-            return self.client.messages.stream(**self._params(messages))
+            return True
+        if self.cfg.effort:
+            log.warning("параметр effort не принят (%s) — убираю", error)
+            self.cfg.effort = ""
+            return True
+        return False
+
+    def _round(self, messages: list[dict], on_text: Callable[[str], None]):
+        """Один запрос к модели: отдаёт текст кусками, возвращает ответ целиком."""
+        while True:
+            try:
+                with self.client.messages.stream(**self._params(messages)) as stream:
+                    for event in stream:
+                        if (event.type == "content_block_delta"
+                                and getattr(event.delta, "type", "") == "text_delta"):
+                            on_text(event.delta.text)
+                    return stream.get_final_message()
+            except anthropic.BadRequestError as e:
+                if not self._degrade(e):
+                    raise
 
     # --- один ход --------------------------------------------------------
     def reply(self, user_text: str, on_text: Callable[[str], None]) -> str:
@@ -94,14 +126,12 @@ class Brain:
         spoken: list[str] = []
         used_in = used_out = cached = 0
 
+        def collect(chunk: str) -> None:
+            spoken.append(chunk)
+            on_text(chunk)
+
         for round_no in range(MAX_TOOL_ROUNDS):
-            with self._stream(messages) as stream:
-                for event in stream:
-                    if (event.type == "content_block_delta"
-                            and getattr(event.delta, "type", "") == "text_delta"):
-                        spoken.append(event.delta.text)
-                        on_text(event.delta.text)
-                message = stream.get_final_message()
+            message = self._round(messages, collect)
 
             usage = getattr(message, "usage", None)
             if usage is not None:
@@ -159,11 +189,20 @@ def _trim(messages: list[dict]) -> list[dict]:
 
     Резать можно только по настоящей реплике человека: сообщение с tool_result
     без предшествующего tool_use API отклонит.
+
+    Если в последних HISTORY_LIMIT сообщениях реплики человека нет — а так
+    бывает после хода с четырьмя и более вызовами инструментов, — ищем её
+    дальше вглубь. Раньше в этом случае возвращалась вся история целиком, и
+    она росла линейно: каждый тяжёлый ход добавлял по десятку сообщений,
+    которые оплачивались в каждом следующем запросе.
     """
     if len(messages) <= HISTORY_LIMIT:
         return messages
-    for i in range(len(messages) - HISTORY_LIMIT, len(messages)):
-        m = messages[i]
-        if m.get("role") == "user" and isinstance(m.get("content"), str):
+    starts = [i for i, m in enumerate(messages)
+              if m.get("role") == "user" and isinstance(m.get("content"), str)]
+    # Самая ранняя реплика человека, после которой остаётся не больше лимита.
+    for i in starts:
+        if len(messages) - i <= HISTORY_LIMIT:
             return messages[i:]
-    return messages
+    # Все ходы длиннее лимита — берём последний, иначе история не обрежется.
+    return messages[starts[-1]:] if starts else messages

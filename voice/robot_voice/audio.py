@@ -155,38 +155,73 @@ class Pump:
         maxlen = max(10, int(keep_seconds * 1000 / FRAME_MS))
         self._frames: deque[np.ndarray] = deque(maxlen=maxlen)
         self._ready = threading.Condition()
-        self._error: BaseException | None = None
         self._dropped = 0
         self._stop = False
+        self._thread: threading.Thread | None = None
+        # Живой ли сейчас источник — чтобы наверху было что показать человеку.
+        self.online = False
 
     def start(self) -> None:
-        threading.Thread(target=self._run, daemon=True).start()
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
         self._stop = True
+        with self._ready:
+            self._ready.notify_all()
 
     def _run(self) -> None:
-        try:
-            for frame in self.source.frames():
+        """Читает источник, переподключаясь сколько понадобится.
+
+        Обрыв звука — это норма, а не аварийная ситуация: телефон уходит в сон,
+        Wi-Fi моргает, IP Webcam перезапускается. Раньше первая же такая ошибка
+        пробрасывалась наверх и робот глох до ручного `systemctl restart` —
+        поток пересоздавался, но старая ошибка так и оставалась записанной.
+        Теперь переподключение живёт здесь, и наверх ничего не летит.
+        """
+        delay = 1.0
+        while not self._stop:
+            try:
+                for frame in self.source.frames():
+                    if self._stop:
+                        return
+                    if not self.online:
+                        log.info("аудио: источник на связи")
+                        self.online = True
+                    delay = 1.0
+                    with self._ready:
+                        if len(self._frames) == self._frames.maxlen:
+                            self._dropped += 1
+                            # Каждые 500 кадров — это 10 секунд выброшенного
+                            # звука. Обычно значит, что Whisper не успевает:
+                            # рядом говорит телевизор и режется по 20 секунд.
+                            if self._dropped % 500 == 0:
+                                log.warning("аудио: не успеваю разбирать, "
+                                            "выброшено %d кадров", self._dropped)
+                        self._frames.append(frame)
+                        self._ready.notify()
+            except Exception as e:      # noqa: BLE001 — обрыв не повод умирать
                 if self._stop:
                     return
-                with self._ready:
-                    if len(self._frames) == self._frames.maxlen:
-                        self._dropped += 1
-                    self._frames.append(frame)
-                    self._ready.notify()
-        except BaseException as e:      # noqa: BLE001 — пробросим в основной поток
+                if self.online:
+                    log.warning("аудио: источник пропал (%s), переподключаюсь", e)
+                else:
+                    log.debug("аудио: источник не отвечает (%s)", e)
+                self.online = False
+            # Паузу наращиваем, чтобы не долбить выключенный телефон каждую
+            # секунду, но и не спать полминуты, когда он вернулся.
             with self._ready:
-                self._error = e
-                self._ready.notify()
+                self._ready.wait(timeout=delay)
+            delay = min(10.0, delay * 2)
 
     def frames(self):
         while not self._stop:
             with self._ready:
-                while not self._frames and self._error is None and not self._stop:
+                while not self._frames and not self._stop:
                     self._ready.wait(timeout=1.0)
-                if self._error is not None:
-                    raise self._error
                 if not self._frames:
                     continue
                 frame = self._frames.popleft()

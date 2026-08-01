@@ -41,8 +41,25 @@ fi
 
 # --- код -------------------------------------------------------------------
 BEFORE="$(git rev-parse HEAD)"
-git fetch -q origin
-git merge --ff-only -q '@{u}'
+if ! git fetch -q origin; then
+  echo "==> нет связи с GitHub, попробую в следующий раз"
+  exit 0
+fi
+
+# Робот — не рабочая машина, а потребитель кода: его ветка обязана совпадать с
+# GitHub. Раньше одного локального коммита или правки файла хватало, чтобы
+# --ff-only падал каждые две минуты вечно и обновления переставали приезжать
+# молча. Теперь расхождение — не тупик: откладываем локальное в отдельную
+# ветку (ничего не теряется) и встаём на удалённую.
+if ! git merge --ff-only -q '@{u}' 2>/dev/null; then
+  MARK="local-$(date +%Y%m%d-%H%M%S)"
+  echo "==> локальные изменения расходятся с GitHub, откладываю их как $MARK"
+  # Незакоммиченное — в stash, коммиты — в ветку. Достать: git stash list,
+  # git log local-*. Ничего не удаляется, но робот встаёт на код с GitHub.
+  git stash push -u -q -m "$MARK" || true
+  git branch "$MARK" HEAD || true
+  git reset -q --hard '@{u}'
+fi
 AFTER="$(git rev-parse HEAD)"
 
 CHANGED=""
