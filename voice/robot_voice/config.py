@@ -13,13 +13,26 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+def _api_base(raw: str) -> str:
+    """Приводит адрес API к тому, что ждёт SDK.
+
+    Клиент Anthropic сам дописывает /v1/messages. Естественно указать адрес
+    роутера ровно так, как он написан в его документации — «…/api/v1», — и
+    получить /api/v1/v1/messages и 404. Поэтому хвостовой /v1 срезаем.
+    """
+    base = raw.strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base
+
+
 @dataclass
 class Config:
     # --- модель ---
     api_key: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
     # Пусто — идём напрямую в api.anthropic.com. Иначе адрес роутера,
     # понимающего протокол Anthropic (проверяется запросом к /v1/messages).
-    api_base: str = field(default_factory=lambda: _env("ROBOT_API_BASE"))
+    api_base: str = field(default_factory=lambda: _api_base(_env("ROBOT_API_BASE")))
     model: str = field(default_factory=lambda: _env("ROBOT_MODEL", "claude-opus-5"))
     # low/medium держат ответ быстрым — для разговора это важнее глубины.
     # Пусто — не отправлять вовсе: сторонний роутер может этот параметр не знать.
