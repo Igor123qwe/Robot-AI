@@ -7,6 +7,10 @@ Type=simple
 User=wheeltec
 WorkingDirectory=/home/wheeltec/Robot-AI/voice
 EnvironmentFile=/home/wheeltec/.robot-ai.env
+# Каталог для признака «робот едет»: systemd создаёт его сам и удаляет при
+# остановке юнита, поэтому зависший признак не переживёт падения сервиса.
+RuntimeDirectory=robot-ai
+RuntimeDirectoryMode=0755
 ExecStart=/home/wheeltec/Robot-AI/voice/.venv/bin/python -m robot_voice
 Restart=always
 RestartSec=10

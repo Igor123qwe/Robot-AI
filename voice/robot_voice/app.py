@@ -12,6 +12,7 @@ import time
 from . import intents
 from .audio import Listener, make_source
 from .brain import Brain
+from .busyflag import BusyFlag
 from .config import Config
 from .ros import Ros
 from .stt import Recognizer
@@ -104,6 +105,10 @@ def main() -> None:
     if not ros.wait_connected(timeout=15):
         log.warning("rosbridge не ответил — еду вслепую, команды движения не пройдут")
 
+    # Пока робот едет, автообновление не должно перезапускать сервис.
+    busy = BusyFlag(ros)
+    busy.start()
+
     timers = Timers(announce=speaker.say)
     tools = build_tools(ros, timers)
     brain = Brain(cfg, tools)
@@ -127,6 +132,7 @@ def main() -> None:
         log.info("останавливаюсь")
         timers.cancel_all()
         ros.stop_motion()
+        busy.stop()
         ros.stop()
         sys.exit(0)
 

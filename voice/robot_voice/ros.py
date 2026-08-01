@@ -32,6 +32,9 @@ class Ros:
         # пока едет: главный цикл стоял бы в sleep, а микрофон был бы заглушён.
         self._motion_cancel = threading.Event()
         self._motion: threading.Thread | None = None
+        # Когда в /cmd_vel последний раз видели ненулевую скорость. Слушаем сам
+        # топик, а не только себя: гнать робота может и веб-пульт напрямую.
+        self._last_move = 0.0
 
     # --- жизненный цикл -------------------------------------------------
     def start(self) -> None:
@@ -64,6 +67,8 @@ class Ros:
         self._send({"op": "advertise", "topic": CMD_VEL, "type": "geometry_msgs/msg/Twist"})
         self._send({"op": "subscribe", "topic": POWER, "type": "std_msgs/msg/Float32",
                     "throttle_rate": 1000})
+        self._send({"op": "subscribe", "topic": CMD_VEL, "type": "geometry_msgs/msg/Twist",
+                    "throttle_rate": 100})
 
     def _on_close(self, ws, *_a) -> None:
         log.warning("rosbridge: соединение закрыто")
@@ -74,9 +79,23 @@ class Ros:
             msg = json.loads(raw)
         except ValueError:
             return
-        if msg.get("op") == "publish" and msg.get("topic") == POWER:
+        if msg.get("op") != "publish":
+            return
+
+        if msg.get("topic") == POWER:
             with self._lock:
                 self._voltage = float(msg["msg"]["data"])
+
+        elif msg.get("topic") == CMD_VEL:
+            try:
+                body = msg["msg"]
+                speed = (abs(body["linear"]["x"]) + abs(body["linear"]["y"])
+                         + abs(body["angular"]["z"]))
+            except (KeyError, TypeError):
+                return
+            if speed > 1e-3:
+                with self._lock:
+                    self._last_move = time.monotonic()
 
     def _send(self, obj: dict) -> None:
         ws = self._ws
@@ -122,7 +141,22 @@ class Ros:
 
     @property
     def moving(self) -> bool:
+        """Едем ли по своей команде."""
         return self._motion is not None and self._motion.is_alive()
+
+    @property
+    def busy(self) -> bool:
+        """Движется ли робот вообще — хоть по голосу, хоть с веб-пульта.
+
+        Пульт публикует /cmd_vel напрямую через rosbridge, минуя этот класс,
+        поэтому смотрим на сам топик. Полторы секунды — с запасом к 15 Гц,
+        с которыми пульт шлёт команды.
+        """
+        if self.moving:
+            return True
+        with self._lock:
+            last = self._last_move
+        return last > 0 and (time.monotonic() - last) < 1.5
 
     def drive(self, x: float, y: float, wz: float, duration: float,
               block: bool = False) -> None:
