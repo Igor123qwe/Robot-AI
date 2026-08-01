@@ -321,9 +321,96 @@ def test_history() -> None:
               True)
 
 
+def test_dialogue() -> None:
+    """Прогон главного цикла целиком: фразы на входе, реплики на выходе.
+
+    Без микрофона, модели и шасси — всё вокруг цикла подменено. Именно здесь
+    ловятся ошибки порядка: «отбой» на ходу усыплял робота вместо остановки,
+    а «стой» во время переспроса считалось ответом на вопрос.
+    """
+    section("разговор целиком")
+    from robot_voice import app                                  # noqa: E402
+    from robot_voice.config import Config                        # noqa: E402
+
+    said: list[str] = []
+    moved: list[str] = []
+
+    class FakeListener:
+        pump = types.SimpleNamespace(online=True)
+
+        def __init__(self, phrases): self.phrases = phrases
+        def utterances(self): return iter([p.encode() for p in self.phrases])
+        def mute(self): pass
+        def unmute(self): pass
+
+    class FakeVoice:
+        speaker = types.SimpleNamespace(stream=lambda **kw: None, last_said="")
+        def say(self, text, **kw): said.append(text); return 1
+        def heard(self, text): pass
+        def hold(self): return contextlib_nullcontext()
+        def quiet(self): return contextlib_nullcontext()
+
+    import contextlib as _c
+    contextlib_nullcontext = _c.nullcontext
+
+    class FakeBrain:
+        def __init__(self): self.asked: list[str] = []
+        def reply(self, text, on_text):
+            self.asked.append(text)
+            on_text("Отвечаю модели.")
+            return "Отвечаю модели."
+        def reset(self): pass
+
+    class FakeRos:
+        """Едет ровно до команды «стоп» — как настоящее шасси."""
+
+        voltage, connected = 12.4, True
+
+        @property
+        def moving(self): return bool(moved) and moved[-1] == "drive"
+        def drive(self, *a, **k): moved.append("drive")
+        def stop_motion(self): moved.append("stop")
+
+    ros = FakeRos()
+    timers = Timers(announce=lambda t, **k: 1,
+                    store=Path(tempfile.mkdtemp()) / "t.json")
+    addressed = app.Addressed()
+    tools = build_tools(ros, timers, addressed=addressed)
+
+    phrases = [
+        "Кузя вперёд",             # по имени — едет
+        "прямо",                   # без имени — не поедет
+        "Кузя отбой",              # это команда остановки, а не прощание
+        "Кузя поставь таймер на пять минут",
+        "отмена",                  # снимает только что поставленный таймер
+        "Кузя что ты умеешь",
+        "Кузя расскажи про космос",   # это к модели
+        "спасибо",                 # прощание
+        "вперёд",                  # уже спит — не реагирует
+    ]
+    brain = FakeBrain()
+    cfg = Config()
+    app._listen_loop(cfg, FakeListener(phrases), types.SimpleNamespace(
+        transcribe=lambda wav: wav.decode()), brain, FakeVoice(), tools, addressed)
+
+    check("поехал по имени", said[0].startswith("Еду вперёд"), True)
+    check("без имени не поехал", said[1], "Для поездки позови меня по имени.")
+    check("«отбой» остановил, а не усыпил", said[2], "Остановился.")
+    check("колёса действительно встали", moved[-1], "stop")
+    check("таймер поставлен", said[3], "Поставил таймер на пять минут.")
+    check("«отмена» сняла таймер", said[4], "Отменил таймер.")
+    check("таймеров не осталось", timers.remaining(), {})
+    check("умения — из правила", said[5].startswith("Я умею ездить"), True)
+    check("разговор ушёл модели", brain.asked, ["расскажи про космос"])
+    check("попрощался", said[-1], "Ага, зови.")
+    # Реплика модели идёт мимо voice.say — потоком, поэтому её в said нет.
+    check("после прощания молчит", len(said), 7)
+
+
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
-                 test_alarms, test_weather, test_notes, test_history):
+                 test_alarms, test_weather, test_notes, test_history,
+                 test_dialogue):
         test()
         print("   ...")
     if FAILED:
