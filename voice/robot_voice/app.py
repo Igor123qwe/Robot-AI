@@ -50,35 +50,43 @@ def _clean_token(token: str) -> str:
     return token.lower().replace("ё", "е").strip(" ,.!?…—-\"'()")
 
 
-def _sounds_like_wake(token: str, wake_words: tuple[str, ...]) -> bool:
-    """Похоже ли слово на обращение к роботу.
+def _sounds_like_wake(token: str, wake_words: tuple[str, ...], ratio: float) -> bool:
+    """Похоже ли слово на имя робота.
 
-    Whisper пишет имя по-разному — «робот», «Робот,», «роберт», «робут», —
-    поэтому сравниваем нестрого. Порог 0.75 отсекает «работа» и «пробор»,
-    но прощает одну перепутанную букву.
+    Whisper пишет имя по-разному — «Кузя», «Кузь», «Куся», — поэтому сравниваем
+    нестрого. Порог держим высоким: имя короткое, а на четырёх буквах послабление
+    начинает ловить всё подряд.
     """
     if not token:
         return False
     for wake in wake_words:
         if token == wake or token.startswith(wake):
             return True
-        if difflib.SequenceMatcher(None, token, wake).ratio() >= 0.75:
+        if difflib.SequenceMatcher(None, token, wake).ratio() >= ratio:
             return True
     return False
 
 
-def _strip_wake_word(text: str, wake_words: tuple[str, ...]) -> str | None:
-    """Возвращает текст без обращения, либо None, если обращения не было."""
+def _strip_wake_word(text: str, wake_words: tuple[str, ...],
+                     ratio: float = 0.8) -> str | None:
+    """Возвращает текст без имени, либо None, если робота не звали.
+
+    Имя ищется не только в начале: «Кузя, вперёд» и «а ну-ка Кузя вперёд»
+    одинаково законны. Дальше первых трёх слов не смотрим — иначе случайное
+    упоминание в середине разговора будет принято за обращение.
+    """
     if not wake_words:
         return text
 
     tokens = text.split()
-    i = 0
-    while i < len(tokens) and _clean_token(tokens[i]) in _FILLERS:
-        i += 1
-    if i >= len(tokens) or not _sounds_like_wake(_clean_token(tokens[i]), wake_words):
-        return None
-    return " ".join(tokens[i + 1:]).strip(" ,.!?…—-")
+    for i, token in enumerate(tokens[:3]):
+        if _sounds_like_wake(_clean_token(token), wake_words, ratio):
+            rest = tokens[:i] + tokens[i + 1:]
+            # Слова перед именем — обращение («эй», «слушай»), а не команда.
+            if all(_clean_token(t) in _FILLERS for t in tokens[:i]):
+                rest = tokens[i + 1:]
+            return " ".join(rest).strip(" ,.!?…—-")
+    return None
 
 
 def _is_junk(text: str) -> bool:
@@ -139,7 +147,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    speaker.say("Я здесь. Позови по имени.")
+    greeting = cfg.wake_words[0].capitalize() if cfg.wake_words else "Робот"
+    speaker.say(f"{greeting} на связи.")
 
     while not stopping:
         try:
@@ -152,22 +161,51 @@ def main() -> None:
             time.sleep(5)
 
 
+def _is_sleep_word(command: str, sleep_words: tuple[str, ...]) -> bool:
+    """Отпустили ли робота. Сравниваем фразу целиком, а не по вхождению:
+    «спасибо» — прощание, «спасибо что напомнил про таймер» — нет."""
+    cleaned = re.sub(r"[^\w\s]", "", command.lower().replace("ё", "е")).strip()
+    return cleaned in sleep_words
+
+
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                  brain: Brain, speaker: Speaker, tools: list) -> None:
     by_name = {t.name: t for t in tools}
-    log.info("слушаю")
+    name = cfg.wake_words[0].capitalize() if cfg.wake_words else "робот"
+    log.info("слушаю, имя — %s, разговор держится %.0f с после ответа",
+             name, cfg.session_seconds)
+
+    # Робот слушает всегда, но реагирует только после имени. Дальше остаётся
+    # в разговоре и отвечает без имени, пока не замолчат.
+    awake_until = 0.0
 
     for wav in listener.utterances():
         text = recognizer.transcribe(wav)
         if _is_junk(text):
             continue
 
-        command = _strip_wake_word(text, cfg.wake_words)
+        awake = time.monotonic() < awake_until
+        command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
+
         if command is None:
-            log.info("не мне (%r)", text)
-            continue
+            if not awake:
+                log.info("не мне (%r)", text)
+                continue
+            # В разговоре имя не нужно.
+            command = text.strip()
+        elif not awake:
+            log.info("проснулся по имени")
+
         if not command:
-            speaker.say("Слушаю.")
+            # Позвали и замолчали — откликаемся и ждём продолжения.
+            speaker.say("Да?")
+            awake_until = time.monotonic() + cfg.session_seconds
+            continue
+
+        if awake and _is_sleep_word(command, cfg.sleep_words):
+            log.info("отпустили, засыпаю")
+            awake_until = 0.0
+            speaker.say("Ага, зови.")
             continue
 
         log.info("человек: %s", command)
@@ -183,6 +221,10 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # выборка под конкретного человека, а не общий корпус.
             log.info("правилами не разобрал, спрашиваю модель")
             _respond(command, brain, speaker, listener)
+
+        # Окно отсчитываем от конца ответа, а не от начала: иначе длинная
+        # реплика робота съедала бы всё время, отведённое на продолжение.
+        awake_until = time.monotonic() + cfg.session_seconds
 
 
 def _run_direct(tool, args: dict, speaker: Speaker, listener: Listener) -> None:
