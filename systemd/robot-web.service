@@ -1,12 +1,14 @@
 [Unit]
-Description=Robot-AI: веб-пульт (порт 8000)
+Description=Robot-AI: веб-пульт и прокси камеры (порт 8000)
 After=network.target
 
 [Service]
 Type=simple
 User=wheeltec
 WorkingDirectory=/home/wheeltec/Robot-AI/web
-ExecStart=/usr/bin/python3 -m http.server 8000
+# Адрес телефона с IP Webcam берётся отсюда; файла может не быть — не страшно.
+EnvironmentFile=-/home/wheeltec/.robot-ai.env
+ExecStart=/usr/bin/python3 /home/wheeltec/Robot-AI/web/server.py
 Restart=always
 RestartSec=5
 

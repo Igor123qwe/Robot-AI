@@ -148,7 +148,7 @@
 
   <div class="side">
   <div class="row">
-    <input type="text" id="camUrl" placeholder="192.168.3.9:8080" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <input type="text" id="camUrl" placeholder="/camera — через робота" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="camBtn">Видео</button>
   </div>
 
@@ -366,11 +366,18 @@ function updateBattery(volt) {
 const camUrl = $('camUrl'), camBtn = $('camBtn'), videoBox = $('videoBox'), videoHint = $('videoHint');
 camUrl.value = localStorage.getItem('robot.camUrl') || '';
 
+
+// По умолчанию берём поток через робота: он сидит и в сети Ростелекома, и в
+// сети Huawei, поэтому пульт открывается откуда угодно. Прямой адрес телефона
+// оставлен на случай отладки — тогда браузер должен сам видеть телефон.
+const PROXY_CAM = '/camera';
+
 // «192.168.3.9» → «http://192.168.3.9:8080»: IP Webcam слушает 8080,
-// и вводить схему с портом каждый раз с телефона неудобно.
+// и набирать схему с портом каждый раз с телефона неудобно.
 function normalizeCamUrl(raw) {
   let s = raw.trim().replace(/\/+$/, '');
-  if (!s) return '';
+  if (!s) return PROXY_CAM;
+  if (s.startsWith('/')) return s;         // путь на самом роботе
   if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
   const host = s.slice(s.indexOf('//') + 2);
   if (!/:\d+/.test(host)) s += ':8080';
@@ -380,29 +387,27 @@ function normalizeCamUrl(raw) {
 camBtn.addEventListener('click', () => {
   const base = normalizeCamUrl(camUrl.value);
   camUrl.value = base;
+  localStorage.setItem('robot.camUrl', base);
+
   const old = videoBox.querySelector('img');
   if (old) old.remove();
 
-  if (!base) {
-    localStorage.removeItem('robot.camUrl');
-    videoHint.style.display = '';
-    videoHint.innerHTML = 'видео выключено<br>введите адрес IP Webcam выше';
-    return;
-  }
-
-  localStorage.setItem('robot.camUrl', base);
+  // Прокси отдаёт поток прямо по /camera, у телефона он лежит в /video.
+  const src = base.startsWith('/') ? base : base + '/video';
   const img = document.createElement('img');
-  img.src = base + '/video';           // MJPEG-поток IP Webcam
+  img.src = src;
   img.onerror = () => {
     img.remove();
     videoHint.style.display = '';
-    videoHint.textContent = 'не удалось открыть ' + base + '/video';
+    videoHint.textContent = base.startsWith('/')
+      ? 'робот не смог забрать поток с телефона — запущен ли сервер в IP Webcam?'
+      : 'не удалось открыть ' + src;
   };
   videoHint.style.display = 'none';
   videoBox.appendChild(img);
 });
 
-if (camUrl.value) camBtn.click();
+camBtn.click();
 
 // ── Главный цикл ─────────────────────────────────────────────────────────
 connect();
