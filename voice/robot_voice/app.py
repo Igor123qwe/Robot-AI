@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 
+from . import intents
 from .audio import Listener, make_source
 from .brain import Brain
 from .config import Config
@@ -72,7 +73,8 @@ def main() -> None:
         log.warning("rosbridge не ответил — еду вслепую, команды движения не пройдут")
 
     timers = Timers(announce=speaker.say)
-    brain = Brain(cfg, build_tools(ros, timers))
+    tools = build_tools(ros, timers)
+    brain = Brain(cfg, tools)
     recognizer = Recognizer(cfg.whisper_model, cfg.language)
 
     listener = Listener(
@@ -101,7 +103,7 @@ def main() -> None:
 
     while not stopping:
         try:
-            _listen_loop(cfg, listener, recognizer, brain, speaker)
+            _listen_loop(cfg, listener, recognizer, brain, speaker, tools)
         except KeyboardInterrupt:
             shutdown(None, None)
         except Exception:
@@ -111,8 +113,10 @@ def main() -> None:
 
 
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
-                 brain: Brain, speaker: Speaker) -> None:
+                 brain: Brain, speaker: Speaker, tools: list) -> None:
+    by_name = {t.name: t for t in tools}
     log.info("слушаю")
+
     for wav in listener.utterances():
         text = recognizer.transcribe(wav)
         if _is_junk(text):
@@ -127,7 +131,23 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             continue
 
         log.info("человек: %s", command)
-        _respond(command, brain, speaker, listener)
+
+        # Простые команды разбираем правилами: мгновенно, бесплатно и без
+        # риска, что модель поймёт «влево» как «вправо». Всё остальное — модели.
+        match = intents.parse(command)
+        if match is not None and match.tool in by_name:
+            _run_direct(by_name[match.tool], match.args, speaker, listener)
+        else:
+            _respond(command, brain, speaker, listener)
+
+
+def _run_direct(tool, args: dict, speaker: Speaker, listener: Listener) -> None:
+    """Выполняет команду, разобранную правилом, минуя модель."""
+    listener.mute()
+    try:
+        speaker.say(tool(args))   # say сам пишет реплику в лог
+    finally:
+        listener.unmute()
 
 
 def _respond(command: str, brain: Brain, speaker: Speaker, listener: Listener) -> None:
