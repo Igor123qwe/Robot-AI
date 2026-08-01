@@ -84,15 +84,25 @@ class Speech:
             self._pump.start()
 
     def _transfer(self, volume: float) -> None:
+        broken = False
         try:
             while True:
                 chunk = self._piper.stdout.read(4096)
                 if not chunk:
                     break
                 self._aplay.stdin.write(scale(chunk, volume))
-            self._aplay.stdin.close()
-        except (BrokenPipeError, ValueError, OSError):
-            log.debug("piper: поток звука оборвался")
+        except (BrokenPipeError, ValueError, OSError) as e:
+            broken = True
+            log.warning("звук до динамика не дошёл: %s", e)
+        finally:
+            # Закрыть надо в любом случае: иначе aplay ждёт EOF, а piper —
+            # свободного места в трубе, и close() честно висит две минуты.
+            for pipe in (self._aplay.stdin, self._piper.stdout if broken else None):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except OSError:
+                    pass
 
     def feed(self, sentence: str) -> None:
         sentence = sentence.strip()
@@ -116,7 +126,9 @@ class Speech:
             pass
         for name, proc in (("piper", self._piper), ("aplay", self._aplay)):
             try:
-                proc.wait(timeout=120)
+                # Тридцати секунд хватает самой длинной реплике. Больше ждать
+                # нельзя: всё это время робот глухой и немой.
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 # Зависший процесс держит звуковую карту, и следующая реплика
                 # её уже не откроет. Лучше убить, чем онеметь навсегда.

@@ -44,9 +44,15 @@ def _wake_up(target) -> str:
     return f"{greeting}, {ru.clock(target)}."
 
 
+def _key(label: str) -> str:
+    """Имя таймера для сравнения: регистр и ё/е не должны мешать."""
+    return " ".join(label.lower().replace("ё", "е").split())
+
+
 def _free_label(base: str, taken: dict) -> str:
     label = base
-    while label in taken:
+    keys = {_key(name) for name in taken}
+    while _key(label) in keys:
         label += " ещё"
     return label
 
@@ -248,9 +254,10 @@ class Timers:
             tries = self._tries.get(label, 1)
             self._save()
 
-        # Будильник и напоминание человек ставил сам — они звучат в полную
-        # громкость даже в тихие часы.
-        heard = self._announce(message or _ring(label), loud=bool(message))
+        # Таймер, будильник и напоминание человек ставил сам — они звучат в
+        # полную громкость даже в тихие часы. Иначе тихий режим превращает
+        # будильник в бесполезный.
+        heard = self._announce(message or _ring(label), loud=True)
 
         # Своего динамика нет: реплику играет вкладка пульта, а она бывает
         # закрыта или с выключенным звуком. Прозвонить в пустоту и забыть —
@@ -317,13 +324,28 @@ class Timers:
 
 
 def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
-                place: tuple[float, float] | None = None) -> list[Tool]:
+                place: tuple[float, float] | None = None,
+                addressed: Callable[[], bool] | None = None) -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
     speaker нужен для громкости и «повтори», notes — для списка покупок,
-    place — координаты дома для погоды. Всё необязательно: без этого
-    соответствующие инструменты не появятся, и модель о них не узнает.
+    place — координаты дома для погоды, addressed отвечает, звали ли робота
+    по имени в текущей реплике. Всё необязательно: без этого соответствующие
+    инструменты не появятся, и модель о них не узнает.
     """
+
+    def name_guard() -> str | None:
+        """Ехать — только по имени, кто бы ни просил: правило или модель.
+
+        Проверка стоит здесь, а не в правилах, намеренно: «поезжай на кухню»
+        правилами не разбирается и уходит модели, а именно такие формулировки
+        и звучат из телевизора. Раньше страховка ловила только однозначное
+        «вперёд» и пропускала всё остальное.
+        """
+        if addressed is None or addressed():
+            return None
+        log.info("движение без имени — не поеду")
+        return "Для поездки позови меня по имени."
 
     def battery_guard() -> str | None:
         # Без связи с шасси команда просто утонет: rosbridge молча выбрасывает
@@ -344,7 +366,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if key not in _DIRECTIONS:
             return f"Не понял направление {direction!r}. Можно: вперёд, назад, влево, вправо."
 
-        blocked = battery_guard()
+        blocked = name_guard() or battery_guard()
         if blocked:
             return blocked
 
@@ -365,7 +387,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         else:
             return f"Не понял сторону {direction!r}. Можно: влево или вправо."
 
-        blocked = battery_guard()
+        blocked = name_guard() or battery_guard()
         if blocked:
             return blocked
 
@@ -399,13 +421,19 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         return "таймер" if label == NO_NAME else f"таймер {label}"
 
     def _the_only(label: str, pool: dict[str, float]) -> str | None:
-        """Имя единственного таймера — когда названное не нашлось.
+        """Имя таймера, о котором речь. None — непонятно, надо переспросить.
 
-        Таймер часто зовут не так, как он записан: «сними таймер на пять минут»
-        вместо названия. Если он всего один, гадать не о чем.
+        Сравниваем нестрого: робот сам зачитывает название вслух, человек
+        повторяет его как услышал, а Whisper пишет то «Лапша», то «лапша»,
+        то «ёжик» через «е». При точном сравнении переспрос зацикливался:
+        робот спрашивал одно и то же на каждый ответ.
+
+        Если таймер всего один — гадать вообще не о чем.
         """
-        if label in pool:
-            return label
+        key = _key(label)
+        for name in pool:
+            if _key(name) == key:
+                return name
         return next(iter(pool)) if len(pool) == 1 else None
 
     def set_timer(minutes: float, label: str = NO_NAME) -> str:
@@ -417,9 +445,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             # а add() заменяет по имени. Теперь второй зовётся по времени.
             taken = {**timers.remaining(), **timers.paused()}
             if label in taken:
-                label = ru.duration(minutes * 60)
-                while label in taken:
-                    label += " ещё"
+                label = _free_label(ru.duration(minutes * 60), taken)
                 extra = True
         timers.add(label, minutes * 60)
         log.info("таймер %r на %.1f мин", label, minutes)
@@ -475,9 +501,10 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
     def _which(label: str, pool: dict[str, float], question: str) -> str:
         """Переспрос, когда непонятно, о каком именно таймере речь."""
+        # Сюда попадаем, только когда таймеров больше одного: единственный
+        # разбирается в _the_only без вопросов.
         names = ["безымянный" if n == NO_NAME else n for n in pool]
-        listed = names[0] if len(names) == 1 else \
-            ", ".join(names[:-1]) + " и " + names[-1]
+        listed = ", ".join(names[:-1]) + " и " + names[-1]
         head = f"Таймера {label} нет. " if label else ""
         return f"{head}Есть {listed}. {question}"
 

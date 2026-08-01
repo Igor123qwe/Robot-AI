@@ -232,10 +232,6 @@ class Pump:
         with self._ready:
             self._frames.clear()
 
-    @property
-    def dropped(self) -> int:
-        return self._dropped
-
 
 # --------------------------------------------------------------------------
 # Нарезка на фразы

@@ -2,16 +2,35 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 VOICE_DIR = Path(__file__).resolve().parent.parent
 
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def _num(name: str, default: float) -> float:
+    """Число из окружения. Пустая строка и мусор — это «не задано».
+
+    В env-файле легко оставить `ROBOT_VOLUME=` пустым, и раньше сервис от
+    этого падал при старте с ValueError, а робот молча не поднимался.
+    """
+    raw = _env(name)
+    if not raw:
+        return default
+    try:
+        return float(raw.replace(",", "."))
+    except ValueError:
+        log.warning("%s=%r — не число, беру %s", name, raw, default)
+        return default
 
 
 def _api_base(raw: str) -> str:
@@ -38,7 +57,7 @@ class Config:
     # low/medium держат ответ быстрым — для разговора это важнее глубины.
     # Пусто — не отправлять вовсе: сторонний роутер может этот параметр не знать.
     effort: str = field(default_factory=lambda: _env("ROBOT_EFFORT", "low"))
-    max_tokens: int = field(default_factory=lambda: int(_env("ROBOT_MAX_TOKENS", "2048")))
+    max_tokens: int = field(default_factory=lambda: int(_num("ROBOT_MAX_TOKENS", 2048)))
 
     # --- аудио ---
     # phone — Android с IP Webcam, local — микрофон в RDK X5
@@ -58,7 +77,7 @@ class Config:
     # --- распознавание ---
     whisper_model: str = field(default_factory=lambda: _env("ROBOT_WHISPER_MODEL", "base"))
     # 1 — жадный поиск, быстро. 5 — точнее, но втрое дольше на A55.
-    whisper_beam: int = field(default_factory=lambda: int(_env("ROBOT_WHISPER_BEAM", "1")))
+    whisper_beam: int = field(default_factory=lambda: int(_num("ROBOT_WHISPER_BEAM", 1)))
     language: str = "ru"
 
     # --- синтез ---
@@ -72,13 +91,13 @@ class Config:
     # Громкость по умолчанию, 0.1–1.0. Меняется голосом («говори тише») и
     # переживает перезапуск: настройка ночью не должна откатываться сама.
     volume: float = field(
-        default_factory=lambda: float(_env("ROBOT_VOLUME", "1.0")))
+        default_factory=lambda: _num("ROBOT_VOLUME", 1.0))
     # Тихие часы: в это время робот говорит вполголоса и не здоровается при
     # перезапуске. Будильник и таймер звучат в полную громкость — их для того
     # и ставили. Пусто — режим выключен.
     quiet_hours: str = field(default_factory=lambda: _env("ROBOT_QUIET_HOURS", "23-8"))
     quiet_volume: float = field(
-        default_factory=lambda: float(_env("ROBOT_QUIET_VOLUME", "0.45")))
+        default_factory=lambda: _num("ROBOT_QUIET_VOLUME", 0.45))
 
     # --- ROS ---
     rosbridge_url: str = field(default_factory=lambda: _env("ROBOT_ROSBRIDGE_URL", "ws://127.0.0.1:9090"))
@@ -90,14 +109,16 @@ class Config:
     motion_needs_name: bool = field(
         default_factory=lambda: _env("ROBOT_MOTION_NEEDS_NAME", "1") not in ("0", "нет", "no"))
 
-    # Где хранится то, что должно пережить перезапуск сервиса.
+    # Где хранится то, что должно пережить перезапуск сервиса. Пустая строка в
+    # env-файле — это «не задано», а не «текущий каталог»: иначе таймеры и
+    # список покупок легли бы внутрь репозитория, откуда их сметёт обновление.
     data_dir: Path = field(default_factory=lambda: Path(
-        _env("ROBOT_DATA_DIR", str(Path.home() / ".robot-ai"))))
+        _env("ROBOT_DATA_DIR") or str(Path.home() / ".robot-ai")))
 
     # Координаты дома для погоды. Пусто — робот честно скажет, что не знает,
     # где находится: врать про погоду в чужом городе хуже, чем молчать.
-    lat: float = field(default_factory=lambda: float(_env("ROBOT_LAT", "0") or 0))
-    lon: float = field(default_factory=lambda: float(_env("ROBOT_LON", "0") or 0))
+    lat: float = field(default_factory=lambda: _num("ROBOT_LAT", 0.0))
+    lon: float = field(default_factory=lambda: _num("ROBOT_LON", 0.0))
 
     # --- имя и режим разговора ---
     # Робот слушает всегда, но реагирует только на своё имя. После обращения
@@ -112,15 +133,18 @@ class Config:
         if w.strip()))
     # Сколько секунд после ответа робот продолжает слушать без имени.
     session_seconds: float = field(
-        default_factory=lambda: float(_env("ROBOT_SESSION_SECONDS", "20")))
+        default_factory=lambda: _num("ROBOT_SESSION_SECONDS", 20))
     # Порог похожести имени: 4 буквы — короткое слово, послабление опасно.
     wake_ratio: float = field(
-        default_factory=lambda: float(_env("ROBOT_WAKE_RATIO", "0.8")))
+        default_factory=lambda: _num("ROBOT_WAKE_RATIO", 0.8))
     # Чем отпустить робота, не дожидаясь паузы. «Хватит» и «стоп» сюда не
     # попали намеренно: это команды остановить движение, а не закончить разговор.
     # «Забудь», «неважно», «проехали» — из интента HassNevermind Home Assistant:
     # человек передумал, и правильная реакция — замолчать, а не спрашивать модель.
-    sleep_words: tuple[str, ...] = ("спасибо", "отбой", "свободен", "спи",
+    # «Отбой» сюда не входит: это команда остановки из правила _stop, и
+    # проверяется она раньше. Иначе «отбой!» на ходу усыплял бы робота, а
+    # ехать он продолжал.
+    sleep_words: tuple[str, ...] = ("спасибо", "свободен", "спи",
                                     "все", "спасибо кузя", "иди спи",
                                     "забудь", "забей", "неважно", "не важно",
                                     "проехали", "отмена", "ничего")

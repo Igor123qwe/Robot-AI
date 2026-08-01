@@ -190,24 +190,29 @@ def _is_junk(text: str) -> bool:
     return bool(_HALLUCINATION.search(stripped)) and len(stripped) < 120
 
 
-class BatteryWatch:
-    """Сам говорит, что садится.
+class Watchdog:
+    """Присматривает за тем, о чём человек узнаёт последним.
 
-    Полоску заряда в пульте видно, только если пульт открыт и на него смотрят.
+    Заряд: полоску в пульте видно, только если пульт открыт и на него смотрят.
     Робот ездит по квартире, а садится всегда не вовремя, поэтому о разряде он
-    сообщает голосом — но ровно по одному разу на каждый порог, иначе это
-    превращается в нытьё.
+    сообщает голосом — но ровно по одному разу на порог, иначе это нытьё.
+
+    Микрофон: если телефон уснул или Wi-Fi моргнул, робот молчит, и снаружи
+    это неотличимо от «обиделся». Состояние уходит в пульт строкой.
     """
 
     LEVELS = ((11.1, "Батарея меньше половины."),
               (10.8, "Батарея садится, пора на зарядку."),
               (CUTOFF_VOLT, "Батарея почти пустая, ехать я больше не буду."))
 
-    def __init__(self, ros, voice: Voice, period: float = 60.0) -> None:
+    def __init__(self, ros, voice: Voice, listener: Listener,
+                 period: float = 30.0) -> None:
         self.ros = ros
         self.voice = voice
+        self.listener = listener
         self.period = period
         self._said: set[float] = set()
+        self._mic_was: bool | None = None
         self._stop = threading.Event()
 
     def start(self) -> None:
@@ -218,17 +223,33 @@ class BatteryWatch:
 
     def _run(self) -> None:
         while not self._stop.wait(self.period):
-            volt = self.ros.voltage
-            if volt is None:
-                continue
-            # Зарядили — снова можно предупреждать.
-            self._said = {v for v in self._said if volt <= v}
-            for level, phrase in self.LEVELS:
-                if volt <= level and level not in self._said:
-                    self._said.add(level)
-                    log.info("батарея %.1f В — предупреждаю", volt)
-                    self.voice.say(phrase)
-                    break
+            try:
+                self._battery()
+                self._mic()
+            except Exception:
+                log.exception("наблюдатель споткнулся")
+
+    def _battery(self) -> None:
+        volt = self.ros.voltage
+        if volt is None:
+            return
+        # Зарядили — снова можно предупреждать.
+        self._said = {v for v in self._said if volt <= v}
+        for level, phrase in self.LEVELS:
+            if volt <= level and level not in self._said:
+                self._said.add(level)
+                log.info("батарея %.1f В — предупреждаю", volt)
+                self.voice.say(phrase)
+                break
+
+    def _mic(self) -> None:
+        online = self.listener.pump.online
+        if online == self._mic_was:
+            return
+        self._mic_was = online
+        log.info("микрофон %s", "на связи" if online else "не отвечает")
+        self.voice.heard("микрофон на связи" if online
+                         else "микрофон не отвечает — проверь телефон")
 
 
 def _post_heard(speak_endpoint: str, text: str) -> None:
@@ -288,12 +309,13 @@ def main() -> None:
     # любой момент, а таймер на духовку от этого пропадать не должен.
     timers = Timers(announce=voice.say, store=cfg.data_dir / "timers.json")
     notes = Notes(cfg.data_dir / "notes.json")
+    addressed = Addressed()
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
-                        place=(cfg.lat, cfg.lon))
+                        place=(cfg.lat, cfg.lon), addressed=addressed)
     brain = Brain(cfg, tools)
 
-    # Робот сам скажет, что садится: смотреть на полоску в пульте некому.
-    watch = BatteryWatch(ros, voice)
+    # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.
+    watch = Watchdog(ros, voice, listener)
     watch.start()
 
     stopping = False
@@ -305,6 +327,7 @@ def main() -> None:
         timers.cancel_all()
         ros.stop_motion()
         busy.stop()
+        watch.stop()
         ros.stop()
         sys.exit(0)
 
@@ -329,7 +352,7 @@ def main() -> None:
 
     while not stopping:
         try:
-            _listen_loop(cfg, listener, recognizer, brain, voice, tools)
+            _listen_loop(cfg, listener, recognizer, brain, voice, tools, addressed)
         except KeyboardInterrupt:
             shutdown(None, None)
         except Exception:
@@ -365,8 +388,24 @@ def _is_sleep_word(command: str, sleep_words: tuple[str, ...]) -> bool:
     return cleaned in sleep_words
 
 
+class Addressed:
+    """Звали ли робота по имени в текущей реплике.
+
+    Инструменты движения спрашивают об этом сами: «поезжай на кухню» правилами
+    не разбирается и уходит модели, а такие формулировки как раз и звучат из
+    телевизора. Проверка в одном месте — в tools.py — закрывает оба пути.
+    """
+
+    def __init__(self) -> None:
+        self.by_name = True
+
+    def __call__(self) -> bool:
+        return self.by_name
+
+
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
-                 brain: Brain, voice: Voice, tools: list) -> None:
+                 brain: Brain, voice: Voice, tools: list,
+                 addressed: Addressed) -> None:
     by_name = {t.name: t for t in tools}
     name = cfg.wake_words[0].capitalize() if cfg.wake_words else "робот"
     log.info("слушаю, имя — %s, разговор держится %.0f с после ответа",
@@ -403,7 +442,9 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
 
         awake = time.monotonic() < awake_until
         command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
-        by_name_called = command is not None
+        # Инструменты движения смотрят на этот признак: ехать можно только по
+        # имени, кто бы ни попросил — правило или модель.
+        addressed.by_name = command is not None or not cfg.motion_needs_name
 
         if command is None:
             if not awake:
@@ -429,15 +470,31 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             last_talk = time.monotonic()
             continue
 
+        log.info("человек: %s", command)
+
+        # Простые команды разбираем правилами: мгновенно, бесплатно и без
+        # риска, что модель поймёт «влево» как «вправо». Всё остальное — модели.
+        match = intents.parse(command)
+
+        # «Стоп» не должен ни за чем стоять в очереди. Раньше «отбой» на ходу
+        # усыплял робота, а «стой» во время переспроса про таймеры считалось
+        # ответом на вопрос — робот вежливо отвечал и продолжал ехать.
+        if match is not None and match.tool == "stop":
+            pending.clear()
+            _run_direct(by_name["stop"], {}, voice)
+            awake_until = time.monotonic() + cfg.session_seconds
+            last_talk = awake_until
+            continue
+
+        # «Отмена» сразу после ошибочно поставленного таймера — это просьба
+        # его снять, а не попрощаться. Так это понимают все ассистенты, и так
+        # это понимает человек: он только что услышал «Поставил таймер».
+        if awake and undo.take(command, by_name, voice):
+            awake_until = time.monotonic() + cfg.session_seconds
+            last_talk = awake_until
+            continue
+
         if awake and _is_sleep_word(command, cfg.sleep_words):
-            # «Отмена» сразу после ошибочно поставленного таймера — это просьба
-            # его снять, а не попрощаться. Так это понимают все ассистенты, и
-            # так это понимает человек: он только что услышал «Поставил таймер».
-            undone = undo.take(command, by_name, voice)
-            if undone:
-                awake_until = time.monotonic() + cfg.session_seconds
-                last_talk = awake_until
-                continue
             log.info("отпустили, засыпаю")
             awake_until = 0.0
             pending.clear()
@@ -445,26 +502,12 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             voice.say("Ага, зови.")
             continue
 
-        log.info("человек: %s", command)
-
-        # Простые команды разбираем правилами: мгновенно, бесплатно и без
-        # риска, что модель поймёт «влево» как «вправо». Всё остальное — модели.
-        match = intents.parse(command)
-
         answered = pending.consume(command, match, voice)
         if answered:
             pass                    # это был ответ на вопрос робота
         elif match is not None and match.tool in by_name:
-            if (match.tool in ("drive", "turn") and cfg.motion_needs_name
-                    and not by_name_called):
-                # Пока окно разговора открыто, командой выглядит любая фраза из
-                # комнаты — телевизор, разговор с другим человеком. Поехать по
-                # ошибке нельзя отменить, поэтому на движение нужно имя.
-                log.info("движение без имени — не поеду")
-                voice.say(f"Для поездки позови по имени: {name}, вперёд.")
-            else:
-                _run_direct(by_name[match.tool], match.args, voice, pending)
-                undo.remember(match.tool, match.args)
+            _run_direct(by_name[match.tool], match.args, voice, pending)
+            undo.remember(match.tool, match.args)
         else:
             # Помечаем явно: по этим строкам в логе видно, каких формулировок
             # не хватает правилам. Это лучший источник для их пополнения —

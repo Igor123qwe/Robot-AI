@@ -124,7 +124,8 @@ class Brain:
         """Отвечает на реплику. on_text вызывается на каждый кусок текста."""
         messages = self.history + [{"role": "user", "content": user_text}]
         spoken: list[str] = []
-        used_in = used_out = cached = 0
+        used_in = used_out = cached = written = 0
+        truncated = False
 
         def collect(chunk: str) -> None:
             spoken.append(chunk)
@@ -138,6 +139,14 @@ class Brain:
                 used_in += getattr(usage, "input_tokens", 0) or 0
                 used_out += getattr(usage, "output_tokens", 0) or 0
                 cached += getattr(usage, "cache_read_input_tokens", 0) or 0
+                # Запись в кэш тоже оплачивается и в input_tokens не попадает:
+                # без неё счётчик врал в меньшую сторону каждый раз, когда
+                # промпт клался в кэш заново.
+                written += getattr(usage, "cache_creation_input_tokens", 0) or 0
+
+            if message.stop_reason == "max_tokens":
+                truncated = True
+                log.warning("ответ обрезан по лимиту в %d токенов", self.cfg.max_tokens)
 
             if message.stop_reason == "refusal":
                 log.warning("модель отказалась отвечать: %s",
@@ -170,12 +179,22 @@ class Brain:
         else:
             log.warning("исчерпан лимит вызовов инструментов за один ход")
 
-        self.total_in += used_in
+        self.total_in += used_in + written
         self.total_out += used_out
+        details = []
+        if cached:
+            details.append(f"из кэша {cached}")
+        if written:
+            details.append(f"в кэш {written}")
         log.info("токены: %d вход + %d выход%s | всего за сеанс %d + %d",
-                 used_in, used_out,
-                 f" (из кэша {cached})" if cached else "",
+                 used_in + written, used_out,
+                 f" ({', '.join(details)})" if details else "",
                  self.total_in, self.total_out)
+
+        if truncated:
+            # Иначе робот замолкает на полуслове, и понять почему нельзя:
+            # человек думает, что он отвлёкся, и повторяет вопрос.
+            collect(" Дальше не помещаюсь, спроси покороче.")
 
         self.history = _trim(messages)
         return "".join(spoken).strip()

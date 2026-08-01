@@ -30,7 +30,6 @@ class BusyFlag:
         self.path = Path(path or os.environ.get("ROBOT_BUSY_FLAG", DEFAULT_PATH))
         self.poll = poll
         self._stop = threading.Event()
-        self._enabled = True
         self._raised = False
 
     def start(self) -> None:
@@ -41,7 +40,6 @@ class BusyFlag:
             # движении. Ронять из-за этого голосового ассистента незачем.
             log.warning("не могу создать %s (%s) — признак движения отключён",
                         self.path.parent, e)
-            self._enabled = False
             return
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -58,10 +56,16 @@ class BusyFlag:
 
     def _set(self) -> None:
         if self._raised:
-            # Обновляем время: update.sh считает залежавшийся признак
-            # устаревшим, чтобы убитый сервис не заблокировал обновления.
-            os.utime(self.path, None)
-            return
+            try:
+                # Обновляем время: update.sh считает залежавшийся признак
+                # устаревшим, чтобы убитый сервис не заблокировал обновления.
+                os.utime(self.path, None)
+                return
+            except FileNotFoundError:
+                # Файл кто-то убрал. Молча продолжать нельзя: update.sh решит,
+                # что робот стоит, и перезапустит сервис прямо на ходу.
+                log.warning("признак движения пропал — создаю заново")
+                self._raised = False
         self.path.touch()
         self._raised = True
 

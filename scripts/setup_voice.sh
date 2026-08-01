@@ -8,7 +8,9 @@ ENVFILE="$HOME/.robot-ai.env"
 
 # Ключ может быть и не от Anthropic напрямую — через роутер он выглядит иначе,
 # поэтому проверяем только что строка заполнена и это не заглушка.
-KEY="$(grep -E '^ANTHROPIC_API_KEY=' "$ENVFILE" 2>/dev/null | cut -d= -f2-)"
+# || true обязателен: под set -e пустой grep уронил бы скрипт молча, без
+# понятного сообщения — а именно этот случай и надо объяснить человеку.
+KEY="$(grep -E '^ANTHROPIC_API_KEY=' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
 case "$KEY" in
   ""|"sk-ant-..."|*"..."*)
     echo "!! в $ENVFILE не задан ANTHROPIC_API_KEY"
@@ -39,7 +41,7 @@ fi
 
 echo "==> голос Piper"
 mkdir -p "$VOICE/models"
-VOICE_NAME="$(grep -E '^ROBOT_PIPER_VOICE=' "$ENVFILE" | cut -d= -f2)"
+VOICE_NAME="$(grep -E '^ROBOT_PIPER_VOICE=' "$ENVFILE" | cut -d= -f2 || true)"
 VOICE_NAME="${VOICE_NAME:-ru_RU-irina-medium}"
 
 # ru_RU-irina-medium → .../main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx
@@ -58,6 +60,12 @@ for ext in onnx onnx.json; do
     }
   fi
 done
+
+# Быстрая проверка, что окружение собралось и правила на месте: без неё
+# первое «он меня не понимает» начинается с гадания.
+echo "==> самопроверка"
+"$VOICE/.venv/bin/python" "$VOICE/selftest.py" | tail -3 || \
+  echo "!! самопроверка не прошла — запустите её отдельно и посмотрите вывод"
 
 echo "==> включаю сервис"
 sudo systemctl enable robot-voice
