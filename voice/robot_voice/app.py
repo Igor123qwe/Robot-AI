@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import collections
 import difflib
 import logging
+import os
 import re
 import signal
 import sys
 import time
+from pathlib import Path
 
 from . import intents
 from .audio import Listener, make_source
@@ -89,9 +92,25 @@ def _strip_wake_word(text: str, wake_words: tuple[str, ...],
     return None
 
 
+def _is_looped(text: str) -> bool:
+    """Зациклился ли Whisper: «сантиметров, сантиметров, сантиметров…».
+
+    Живая речь так не выглядит: даже «да да да» — это три слова, а не сорок.
+    Страховка на случай, если параметры против повторов не сработают.
+    """
+    words = re.findall(r"\w+", text.lower())
+    if len(words) < 8:
+        return False
+    top = max(collections.Counter(words).values())
+    return top / len(words) > 0.4
+
+
 def _is_junk(text: str) -> bool:
     stripped = text.strip()
     if _JUNK.match(stripped) or not re.search(r"[а-яa-z]", stripped, re.I):
+        return True
+    if _is_looped(stripped):
+        log.info("whisper зациклился, отбрасываю")
         return True
     # Титры переводчиков осмысленны по форме, но появляются только на тишине.
     return bool(_HALLUCINATION.search(stripped)) and len(stripped) < 120
@@ -161,6 +180,26 @@ def main() -> None:
             time.sleep(5)
 
 
+def _dump_audio(wav: bytes, text: str) -> None:
+    """Сохраняет услышанное, чтобы можно было послушать ушами.
+
+    Когда Whisper выдаёт бессмыслицу, вопрос всегда один: он плохо распознаёт
+    или ему приносят шум? Ответить можно только послушав. Включается
+    переменной ROBOT_DEBUG_AUDIO=1.
+    """
+    folder = Path("/tmp/robot-audio")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        # Оставляем последние два десятка, флешку забивать незачем.
+        old = sorted(folder.glob("*.wav"))[:-20]
+        for f in old:
+            f.unlink(missing_ok=True)
+        name = time.strftime("%H%M%S") + "-" + re.sub(r"\W+", "_", text[:30] or "пусто")
+        (folder / f"{name}.wav").write_bytes(wav)
+    except OSError as e:
+        log.warning("не смог сохранить запись: %s", e)
+
+
 def _is_sleep_word(command: str, sleep_words: tuple[str, ...]) -> bool:
     """Отпустили ли робота. Сравниваем фразу целиком, а не по вхождению:
     «спасибо» — прощание, «спасибо что напомнил про таймер» — нет."""
@@ -179,8 +218,14 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
     # в разговоре и отвечает без имени, пока не замолчат.
     awake_until = 0.0
 
+    debug_audio = os.environ.get("ROBOT_DEBUG_AUDIO") == "1"
+    if debug_audio:
+        log.info("записи услышанного складываю в /tmp/robot-audio")
+
     for wav in listener.utterances():
         text = recognizer.transcribe(wav)
+        if debug_audio:
+            _dump_audio(wav, text)
         if _is_junk(text):
             continue
 
