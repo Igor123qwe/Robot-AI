@@ -24,6 +24,12 @@ IP Webcam умеет только отдавать звук, но не прин�
   POST /speak         ← голосовой пайплайн кладёт сюда WAV (только с самого робота)
   /speak/events       → SSE: пульту сообщается, что появилась новая реплика
   /speak/<id>.wav     → сама реплика
+
+Третье — микрофон. Компьютер может говорить с роботом сам, без телефона:
+
+  POST /listen        ← вкладка шлёт сырой PCM 16 кГц с микрофона
+  /listen/stream      → голосовой пайплайн забирает его потоком
+  /listen/status      → JSON: идёт ли звук
 """
 
 from __future__ import annotations
@@ -51,6 +57,8 @@ CONNECT_TIMEOUT = 5
 # Реплики держим в памяти: они живут секунды, писать их на флешку незачем.
 CLIP_LIMIT = 12
 MAX_CLIP_BYTES = 8 * 1024 * 1024
+# Кусок звука с микрофона компьютера: полсекунды при 16 кГц — 16 КБ.
+MAX_MIC_CHUNK = 256 * 1024
 
 
 class SpeechQueue:
@@ -120,7 +128,52 @@ class SpeechQueue:
             return sum(1 for on in self._listeners.values() if on)
 
 
+class MicRelay:
+    """Микрофон компьютера: вкладка шлёт сюда звук, робот забирает потоком.
+
+    Нужно для отладки без телефона: наушники на голове, эха нет, поднимать
+    IP Webcam не надо. Формат — тот же, что ждёт голосовой пайплайн:
+    16 кГц, моно, int16, без заголовков.
+
+    Тишина в паузах шлётся намеренно: без неё соединение робота уснёт по
+    таймауту и он начнёт переподключаться каждые полминуты.
+    """
+
+    SILENCE = b"\x00" * 640          # 20 мс тишины при 16 кГц
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._listeners: set[queue.Queue] = set()
+        self._last_chunk = 0.0
+
+    def push(self, data: bytes) -> None:
+        with self._lock:
+            self._last_chunk = time.monotonic()
+            listeners = list(self._listeners)
+        for q in listeners:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass                  # робот не успевает — свежесть важнее
+
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=64)
+        with self._lock:
+            self._listeners.add(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            self._listeners.discard(q)
+
+    @property
+    def live(self) -> bool:
+        with self._lock:
+            return time.monotonic() - self._last_chunk < 3.0
+
+
 SPEECH = SpeechQueue()
+MIC = MicRelay()
 
 
 def _is_home_address(host: str) -> bool:
@@ -159,7 +212,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     # Логи по каждому кадру не нужны — иначе journal распухнет.
     def log_message(self, fmt, *args):
-        if not self.path.startswith("/camera"):
+        if not self.path.startswith(("/camera", "/listen")):
             super().log_message(fmt, *args)
 
     # Каталог web/ — не файлопомойка: отдаём пульт, а не листинг и не исходники.
@@ -182,6 +235,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.camera_status(phone_base(query))
         elif path == "/speak/events":
             self.speak_events(query)
+        elif path == "/listen/stream":
+            self.listen_stream()
+        elif path == "/listen/status":
+            self.send_json({"live": MIC.live})
         elif path.startswith("/speak/") and path.endswith(".wav"):
             self.speak_clip(path[len("/speak/"):-len(".wav")])
         else:
@@ -189,6 +246,19 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.partition("?")[0]
+
+        if path == "/listen":
+            # Звук с микрофона компьютера. Приходит из браузера, то есть не с
+            # локалхоста, — проверка ниже сюда не распространяется намеренно.
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= MAX_MIC_CHUNK:
+                self.close_connection = True
+                self.fail(400, "пустой или слишком большой кусок звука")
+                return
+            MIC.push(self.rfile.read(length))
+            self.send_json({"ok": True})
+            return
+
         if path not in ("/speak", "/speak/stop", "/speak/heard", "/speak/status"):
             self.fail(404, "нет такой ручки")
             return
@@ -254,6 +324,34 @@ class Handler(SimpleHTTPRequestHandler):
             pass
         finally:
             SPEECH.unsubscribe(q)
+        self.close_connection = True
+
+    # --- микрофон компьютера ---------------------------------------------
+    def listen_stream(self) -> None:
+        """Непрерывный PCM для голосового пайплайна. Только с самого робота."""
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            self.close_connection = True
+            self.fail(403, "поток микрофона — только для самого робота")
+            return
+
+        q = MIC.subscribe()
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/L16; rate=16000; channels=1")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            while True:
+                try:
+                    chunk = q.get(timeout=0.5)
+                except queue.Empty:
+                    # Никто не говорит — шлём тишину, чтобы соединение жило.
+                    chunk = MicRelay.SILENCE
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            MIC.unsubscribe(q)
         self.close_connection = True
 
     def speak_clip(self, clip_id: str) -> None:

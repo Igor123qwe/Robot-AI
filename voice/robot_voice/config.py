@@ -60,7 +60,8 @@ class Config:
     max_tokens: int = field(default_factory=lambda: int(_num("ROBOT_MAX_TOKENS", 2048)))
 
     # --- аудио ---
-    # phone — Android с IP Webcam, local — микрофон в RDK X5
+    # phone — Android с IP Webcam, local — микрофон в RDK X5,
+    # browser — микрофон компьютера через вкладку пульта
     audio_source: str = field(default_factory=lambda: _env("ROBOT_AUDIO_SOURCE", "phone"))
     phone_url: str = field(default_factory=lambda: _env("ROBOT_PHONE_URL", "http://192.168.0.77:8080"))
     sample_rate: int = 16000
@@ -173,8 +174,9 @@ class Config:
             raise SystemExit(
                 "не задан ANTHROPIC_API_KEY — заполните ~/.robot-ai.env"
             )
-        if self.audio_source not in ("phone", "local"):
-            raise SystemExit(f"ROBOT_AUDIO_SOURCE должен быть phone или local, а не {self.audio_source!r}")
+        if self.audio_source not in ("phone", "local", "browser"):
+            raise SystemExit("ROBOT_AUDIO_SOURCE должен быть phone, local или "
+                             f"browser, а не {self.audio_source!r}")
         if self.audio_out not in ("browser", "local"):
             raise SystemExit(f"ROBOT_AUDIO_OUT должен быть browser или local, а не {self.audio_out!r}")
 

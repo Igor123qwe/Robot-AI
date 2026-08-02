@@ -309,7 +309,8 @@ def main() -> None:
                             beam_size=cfg.whisper_beam)
 
     listener = Listener(
-        make_source(cfg.audio_source, cfg.phone_url, cfg.sample_rate),
+        make_source(cfg.audio_source, cfg.phone_url, cfg.sample_rate,
+                    web_url=cfg.web_endpoint.rsplit("/speak", 1)[0]),
         sample_rate=cfg.sample_rate,
         vad_level=cfg.vad_level,
         silence_ms=cfg.silence_ms,

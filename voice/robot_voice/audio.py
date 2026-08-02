@@ -1,8 +1,11 @@
 """Захват звука и нарезка на фразы по детектору речи.
 
-Два источника:
-  local — микрофон, воткнутый в RDK X5 (после приезда ReSpeaker Lite);
-  phone — старый Android с приложением IP Webcam, отдаёт /audio.wav.
+Три источника:
+  local   — микрофон, воткнутый в RDK X5 (после приезда ReSpeaker Lite);
+  phone   — старый Android с приложением IP Webcam, отдаёт /audio.wav;
+  browser — микрофон компьютера: вкладка пульта шлёт звук на веб-сервер
+            робота, а мы забираем его оттуда потоком. Удобно для отладки:
+            наушники на голове, эха нет, телефон не нужен.
 
 Режим строго половинного дуплекса: пока робот говорит, микрофон заглушён. Программный
 AEC поверх Wi-Fi с плавающей задержкой всё равно не работает, так что barge-in
@@ -132,9 +135,48 @@ def _resample(samples: np.ndarray, src: int, dst: int) -> np.ndarray:
     return np.interp(idx, np.arange(len(x)), x).astype(np.int16)
 
 
-def make_source(audio_source: str, phone_url: str, sample_rate: int):
+class BrowserSource:
+    """Микрофон компьютера через вкладку пульта.
+
+    Вкладка шлёт сырой PCM на веб-сервер робота (`POST /listen`), а мы
+    забираем его непрерывным потоком с `GET /listen/stream`. Формат уже
+    нужный — 16 кГц, моно, int16, — так что ни заголовков, ни
+    передискретизации: браузер это делает лучше нас.
+    """
+
+    def __init__(self, web_url: str, sample_rate: int) -> None:
+        self.url = web_url.rstrip("/") + "/listen/stream"
+        self.sample_rate = sample_rate
+        self.frame_len = sample_rate * FRAME_MS // 1000
+
+    def frames(self) -> Iterator[np.ndarray]:
+        import requests
+
+        log.info("аудио: жду звук из браузера на %s", self.url)
+        resp = requests.get(self.url, stream=True, timeout=(5, 30))
+        resp.raise_for_status()
+
+        tail = np.empty(0, dtype=np.int16)
+        # Читаем ровно по кадру: с большим буфером тишина, которой сервер
+        # держит соединение живым, копилась бы по несколько секунд.
+        for buf in resp.iter_content(chunk_size=self.frame_len * 2):
+            if not buf:
+                continue
+            samples = np.frombuffer(buf[: len(buf) // 2 * 2], dtype="<i2")
+            tail = np.concatenate([tail, samples])
+            n = len(tail) // self.frame_len
+            for i in range(n):
+                yield tail[i * self.frame_len:(i + 1) * self.frame_len]
+            tail = tail[n * self.frame_len:]
+        raise ConnectionError("поток из браузера оборвался")
+
+
+def make_source(audio_source: str, phone_url: str, sample_rate: int,
+                web_url: str = "http://127.0.0.1:8000"):
     if audio_source == "local":
         return LocalSource(sample_rate)
+    if audio_source == "browser":
+        return BrowserSource(web_url, sample_rate)
     return PhoneSource(phone_url, sample_rate)
 
 
