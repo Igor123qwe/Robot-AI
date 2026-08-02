@@ -448,6 +448,40 @@ def test_dialogue() -> None:
     # Реплика модели идёт мимо voice.say — потоком, поэтому её в said нет.
     check("после прощания молчит", len(said), 7)
 
+    # --- второй сценарий: шум, чужой разговор и движение через модель ---
+    said.clear()
+    moved.clear()
+    addressed = app.Addressed()
+    tools2 = build_tools(ros, timers, addressed=addressed)
+    by_name = {t.name: t for t in tools2}
+
+    # Модель, которая пытается поехать, не спросив имени.
+    class DrivingBrain(FakeBrain):
+        def reply(self, text, on_text):
+            self.asked.append(text)
+            answer = by_name["drive"]({"direction": "вперёд"})
+            on_text(answer)
+            said.append(answer)     # чтобы увидеть, что ответил инструмент
+            return answer
+
+    phrases = [
+        "Кузя который час",        # проснулись по имени
+        "...",                     # мусор от Whisper — «не расслышал»
+        "...",                     # второй подряд — молчим
+        "а я вчера ходил в магазин и купил там очень много всякой всячины",
+        "поезжай на кухню",        # без имени, через модель — ехать нельзя
+    ]
+    app._listen_loop(cfg, FakeListener(phrases), types.SimpleNamespace(
+        transcribe=lambda wav: wav.decode()), DrivingBrain(), FakeVoice(),
+        tools2, addressed)
+
+    check("на мусор ответил один раз", said.count("Не расслышал."), 1)
+    check("длинная чужая фраза не ушла модели",
+          any("магазин" in s for s in said), False)
+    check("модель без имени не поехала", said[-1],
+          "Для поездки позови меня по имени.")
+    check("колёса не тронулись", moved, [])
+
 
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,

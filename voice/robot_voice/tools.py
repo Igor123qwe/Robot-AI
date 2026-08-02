@@ -44,6 +44,14 @@ def _wake_up(target) -> str:
     return f"{greeting}, {ru.clock(target)}."
 
 
+def _short(text: str, limit: int = 30) -> str:
+    """Обрезает по границе слова: имя таймера робот читает вслух."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] or text[:limit]
+
+
 def _key(label: str) -> str:
     """Имя таймера для сравнения: регистр и ё/е не должны мешать."""
     return " ".join(label.lower().replace("ё", "е").split())
@@ -240,6 +248,11 @@ class Timers:
         with self._lock:
             return dict(self._paused)
 
+    def messages(self) -> dict[str, str]:
+        """Кому что сказать при срабатывании. Пусто — обычный таймер."""
+        with self._lock:
+            return dict(self._messages)
+
     def cancel_all(self) -> None:
         with self._lock:
             for timer, _ in self._items.values():
@@ -426,8 +439,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 f"{_say_percent(volt_to_percent(volt))}.{note}")
 
     def _named(label: str) -> str:
-        """«таймер лапша» или просто «таймер», если названия нет."""
-        return "таймер" if label == NO_NAME else f"таймер {label}"
+        """«таймер лапша», «напоминание позвонить маме», «будильник»."""
+        if label == NO_NAME:
+            return "таймер"
+        if label.startswith(ALARM):
+            return label            # «будильник», «будильник ещё»
+        kind = "напоминание" if label in timers.messages() else "таймер"
+        return f"{kind} {label}"
 
     def _the_only(label: str, pool: dict[str, float]) -> str | None:
         """Имя таймера, о котором речь. None — непонятно, надо переспросить.
@@ -494,7 +512,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         else:
             return "Когда напомнить?"
 
-        label = _free_label(text[:30], {**timers.remaining(), **timers.paused()})
+        label = _free_label(_short(text), {**timers.remaining(), **timers.paused()})
         timers.add(label, minutes * 60, message=f"Напоминаю: {text}.")
         log.info("напоминание %r через %.1f мин", text, minutes)
         return f"Напомню {said_when}."
