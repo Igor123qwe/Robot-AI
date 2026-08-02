@@ -18,6 +18,7 @@ import io
 import logging
 import struct
 import threading
+import time
 import wave
 from collections import deque
 from typing import Iterator
@@ -28,6 +29,11 @@ import webrtcvad
 log = logging.getLogger(__name__)
 
 FRAME_MS = 20  # webrtcvad принимает только 10, 20 или 30 мс
+
+# Сколько «микрофон считается живым» после последнего настоящего звука.
+# Пять секунд: человек молчит между фразами дольше, чем можно подумать,
+# а вот закрытая вкладка молчит навсегда.
+REAL_AUDIO_TTL = 5.0
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +154,15 @@ class BrowserSource:
         self.url = web_url.rstrip("/") + "/listen/stream"
         self.sample_rate = sample_rate
         self.frame_len = sample_rate * FRAME_MS // 1000
+        # Когда последний раз приходил НАСТОЯЩИЙ звук. Сервер робота держит
+        # соединение живым, подсыпая ровные нули, и по «кадры идут» источник
+        # выглядел живым всегда: робот бодро сообщал «микрофон на связи» и
+        # при закрытой вкладке, и при выключенной кнопке микрофона.
+        self._real_at = 0.0
+
+    def live(self) -> bool:
+        """Идёт ли настоящий звук, а не одна тишина-заполнитель."""
+        return time.monotonic() - self._real_at < REAL_AUDIO_TTL
 
     def frames(self) -> Iterator[np.ndarray]:
         import requests
@@ -162,6 +177,10 @@ class BrowserSource:
         for buf in resp.iter_content(chunk_size=self.frame_len * 2):
             if not buf:
                 continue
+            # Ровные нули — это заполнитель сервера, а не звук: настоящий
+            # микрофон всегда шумит хотя бы младшим битом.
+            if any(buf):
+                self._real_at = time.monotonic()
             samples = np.frombuffer(buf[: len(buf) // 2 * 2], dtype="<i2")
             tail = np.concatenate([tail, samples])
             n = len(tail) // self.frame_len
@@ -273,6 +292,18 @@ class Pump:
                     continue
                 frame = self._frames.popleft()
             yield frame
+
+    @property
+    def alive(self) -> bool:
+        """Идёт ли настоящий звук, а не только строки, держащие связь.
+
+        Сам факт «кадры приходят» ничего не значит для браузерного источника:
+        сервер робота подсыпает ровные нули, чтобы соединение не уснуло. Робот
+        поэтому бодро сообщал «микрофон на связи» и при закрытой вкладке, и
+        при выключенной кнопке микрофона.
+        """
+        live = getattr(self.source, "live", None)
+        return self.online and (live() if callable(live) else True)
 
     def drop_pending(self) -> None:
         """Выбросить накопленное — например, всё, что робот наговорил сам."""

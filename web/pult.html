@@ -354,6 +354,14 @@ function setStatus(text, ok) {
   elConn.classList.toggle('on', !!ok);
 }
 
+// Только текст, без индикатора. Точка слева показывает связь с rosbridge, и
+// микрофон к ней отношения не имеет: раньше она гасла от тишины в микрофоне
+// при полностью живом соединении и так и оставалась красной — а по этой точке
+// человек заранее понимает, сработает ли СТОП.
+function setNote(text) {
+  elStatus.textContent = text;
+}
+
 function connect() {
   clearTimeout(reconnectTimer);
   // Пока не доставлен стоп, шапку не трогаем: переподключение идёт каждые
@@ -470,7 +478,16 @@ function emergencyStop() {
 }
 
 // ── Батарея ──────────────────────────────────────────────────────────────
+// Когда в последний раз приходило напряжение. Показания обязаны протухать:
+// если умерло шасси, а rosbridge жив, сообщения просто перестают идти — и
+// раньше в шапке навсегда застывало бодрое «12.3 В, 90 %». Голосовая часть
+// эту ошибку уже знает (ros.py, VOLTAGE_TTL), пульт — нет, а смотрят на заряд
+// именно по нему, и сборку 3S нельзя переразряжать.
+let battAt = 0;
+const BATT_TTL = 10000;
+
 function updateBattery(volt) {
+  battAt = Date.now();
   const pct = voltToPercent(volt);
   elBattFill.style.width = pct.toFixed(0) + '%';
   elBattText.textContent = pct.toFixed(0) + ' %';
@@ -478,6 +495,19 @@ function updateBattery(volt) {
   elBattFill.style.background =
     volt < 10.8 ? 'var(--bad)' : volt < 11.4 ? 'var(--warn)' : 'var(--ok)';
 }
+
+function forgetBattery() {
+  elBattFill.style.width = '0%';
+  elBattText.textContent = '— %';
+  elBattVolt.textContent = '— В';
+}
+
+setInterval(() => {
+  if (battAt && Date.now() - battAt > BATT_TTL) {
+    battAt = 0;
+    forgetBattery();
+  }
+}, 1000);
 
 // ── Камера (IP Webcam) ───────────────────────────────────────────────────
 const camUrl = $('camUrl'), camBtn = $('camBtn'), videoBox = $('videoBox'), videoHint = $('videoHint');
@@ -669,7 +699,7 @@ function downsample(input, inRate) {
 
 async function micStart() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    setStatus('микрофон запрещён: открой пульт через localhost', false);
+    setNote('микрофон запрещён: открой пульт через localhost');
     return;
   }
   try {
@@ -678,7 +708,7 @@ async function micStart() {
                noiseSuppression: true, autoGainControl: true },
     });
   } catch (e) {
-    setStatus('микрофон не дали: ' + e.name, false);
+    setNote('микрофон не дали: ' + e.name);
     return;
   }
   micCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -725,7 +755,7 @@ async function micStart() {
   micSilentSince = Date.now();
   micBtn.textContent = '🎙';
   micBtn.classList.add('on');
-  setStatus('микрофон включён (' + rate + ' Гц) — говори «Кузя, …»', true);
+  setNote('микрофон включён (' + rate + ' Гц) — говори «Кузя, …»');
 }
 
 // Видимый уровень: без него «робот меня не слышит» проверяется только
@@ -738,7 +768,7 @@ function micLevel(peak) {
     micSilentSince = Date.now();
   } else if (micSilentSince && Date.now() - micSilentSince > 5000) {
     micSilentSince = 0;
-    setStatus('микрофон отдаёт тишину — проверь устройство записи в Windows', false);
+    setNote('микрофон отдаёт тишину — проверь устройство записи в Windows');
   }
 }
 

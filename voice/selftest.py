@@ -462,6 +462,19 @@ def test_slicing() -> None:
         l._muted = th.Event()
         return [round((len(w) - 44) / 2 / 16000, 1) for w in l.utterances()]
 
+    # Признак «микрофон на связи». Сервер робота подсыпает ровные нули, чтобы
+    # соединение не уснуло, и по «кадры идут» источник выглядел живым всегда:
+    # робот бодро сообщал «микрофон на связи» и при закрытой вкладке.
+    from robot_voice.audio import BrowserSource, Pump
+    источник = BrowserSource("http://тест", 16000)
+    насос = Pump(источник)
+    насос.online = True
+    check("одна тишина — микрофон не считается живым", насос.alive, False)
+    источник._real_at = __import__("time").monotonic()
+    check("пришёл настоящий звук — живой", насос.alive, True)
+    check("источник без своего мнения не мешает",
+          Pump(types.SimpleNamespace()).alive, False)
+
     check("одиночный щелчок отброшен",
           прогон([(False, 20), (True, 2), (False, 40)]), [])
     check("настоящая фраза проходит",

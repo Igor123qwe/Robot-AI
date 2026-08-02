@@ -253,7 +253,7 @@ class Watchdog:
                 break
 
     def _mic(self) -> None:
-        online = self.listener.pump.online
+        online = self.listener.pump.alive
         if online == self._mic_was:
             return
         self._mic_was = online

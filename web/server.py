@@ -56,6 +56,12 @@ CONNECT_TIMEOUT = 5
 
 # Реплики держим в памяти: они живут секунды, писать их на флешку незачем.
 CLIP_LIMIT = 12
+
+# Сколько ждём, пока строка keepalive уйдёт подписчику. Без этого мёртвая
+# вкладка числится живой около пятнадцати минут — столько TCP повторяет
+# отправку, прежде чем сдаться. Десяти секунд хватает любой живой сети, а
+# мёртвая отваливается сразу.
+SSE_WRITE_TIMEOUT = 10.0
 MAX_CLIP_BYTES = 8 * 1024 * 1024
 # Кусок звука с микрофона компьютера: полсекунды при 16 кГц — 16 КБ.
 MAX_MIC_CHUNK = 256 * 1024
@@ -307,6 +313,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
+        # Обрыв без FIN — крышку ноутбука закрыли, Wi-Fi пропал, телефон
+        # уснул — запись в сокет не падает: семнадцать байт keepalive спокойно
+        # ложатся в буфер ядра, и ошибка приходит только когда TCP исчерпает
+        # ретрансмиссии, то есть минут через пятнадцать. Всё это время робот
+        # считает вкладку слушателем: синтезирует реплику, честно ждёт конца
+        # звучания и не повторяет таймер, который никто не слышал.
+        try:
+            self.connection.settimeout(SSE_WRITE_TIMEOUT)
+        except OSError:
+            pass
         try:
             while True:
                 try:
@@ -320,7 +336,7 @@ class Handler(SimpleHTTPRequestHandler):
                     payload = ": keepalive\n\n"   # чтобы соединение не уснуло
                 self.wfile.write(payload.encode())
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass
         finally:
             SPEECH.unsubscribe(q)
