@@ -354,6 +354,7 @@ def test_dialogue() -> None:
     contextlib_nullcontext = _c.nullcontext
 
     class FakeBrain:
+        last_talk = 0.0
         def __init__(self): self.asked: list[str] = []
         def reply(self, text, on_text):
             self.asked.append(text)

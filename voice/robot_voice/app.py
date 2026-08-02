@@ -76,7 +76,7 @@ class Voice:
         self._lock = threading.RLock()
         # Куда показать услышанное. Пульт рисует это субтитрами: без экрана и
         # без SSH иначе не понять, расслышал робот или нет.
-        self.on_heard: Callable[[str], None] | None = None
+        self.on_heard: Callable[[str, str], None] | None = None
 
     @contextlib.contextmanager
     def quiet(self):
@@ -105,11 +105,18 @@ class Voice:
             return self.speaker.say(text, loud=loud)
 
     def heard(self, text: str) -> None:
+        self._show("heard", text)
+
+    def status(self, text: str) -> None:
+        """Состояние робота, а не реплика человека: рисуется иначе."""
+        self._show("status", text)
+
+    def _show(self, kind: str, text: str) -> None:
         if self.on_heard is not None and text:
             try:
-                self.on_heard(text)
+                self.on_heard(kind, text)
             except Exception:
-                log.debug("не смог показать услышанное в пульте", exc_info=True)
+                log.debug("не смог показать %s в пульте", kind, exc_info=True)
 
 
 def _setup_logging() -> None:
@@ -248,14 +255,14 @@ class Watchdog:
             return
         self._mic_was = online
         log.info("микрофон %s", "на связи" if online else "не отвечает")
-        self.voice.heard("микрофон на связи" if online
-                         else "микрофон не отвечает — проверь телефон")
+        self.voice.status("микрофон на связи" if online
+                          else "микрофон не отвечает — проверь телефон")
 
 
-def _post_heard(speak_endpoint: str, text: str) -> None:
+def _post_heard(speak_endpoint: str, kind: str, text: str) -> None:
     """Показать в пульте, что робот расслышал. Ошибку глушим: это подсказка."""
     req = urllib.request.Request(
-        speak_endpoint + "/heard", data=text.encode(), method="POST",
+        f"{speak_endpoint}/{kind}", data=text.encode(), method="POST",
         headers={"Content-Type": "text/plain; charset=utf-8"})
     try:
         urllib.request.urlopen(req, timeout=3).close()
@@ -309,7 +316,7 @@ def main() -> None:
         max_speech_ms=cfg.max_speech_ms,
     )
     voice = Voice(speaker, listener)
-    voice.on_heard = lambda text: _post_heard(cfg.web_endpoint, text)
+    voice.on_heard = lambda kind, text: _post_heard(cfg.web_endpoint, kind, text)
 
     # Таймеры и список переживают перезапуск: автообновление может случиться в
     # любой момент, а таймер на духовку от этого пропадать не должен.
@@ -423,7 +430,9 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
     if debug_audio:
         log.info("записи услышанного складываю в /tmp/robot-audio")
 
-    last_talk = 0.0
+    # Момент последней реплики живёт в brain: цикл может перезапуститься после
+    # сбоя, а разговор от этого не становится свежим.
+    last_talk = brain.last_talk
     deaf = False        # прошлая фраза не разобралась — второй раз не ноем
     pending = Pending()
     undo = Undo()
@@ -476,7 +485,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # Позвали и замолчали — откликаемся и ждём продолжения.
             voice.say("Да?")
             awake_until = time.monotonic() + cfg.session_seconds
-            last_talk = time.monotonic()
+            last_talk = brain.last_talk = time.monotonic()
             continue
 
         log.info("человек: %s", command)
@@ -492,7 +501,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             pending.clear()
             _run_direct(by_name["stop"], {}, voice)
             awake_until = time.monotonic() + cfg.session_seconds
-            last_talk = awake_until
+            last_talk = brain.last_talk = time.monotonic()
             continue
 
         # «Отмена» сразу после ошибочно поставленного таймера — это просьба
@@ -500,7 +509,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         # это понимает человек: он только что услышал «Поставил таймер».
         if awake and undo.take(command, by_name, voice):
             awake_until = time.monotonic() + cfg.session_seconds
-            last_talk = awake_until
+            last_talk = brain.last_talk = time.monotonic()
             continue
 
         if awake and _is_sleep_word(command, cfg.sleep_words):
@@ -527,7 +536,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         # Окно отсчитываем от конца ответа, а не от начала: иначе длинная
         # реплика робота съедала бы всё время, отведённое на продолжение.
         awake_until = time.monotonic() + cfg.session_seconds
-        last_talk = awake_until
+        last_talk = brain.last_talk = time.monotonic()
 
 
 class Undo:
@@ -674,13 +683,17 @@ def _failure_phrase(error: Exception) -> str:
 
 def _respond(command: str, brain: Brain, voice: Voice) -> None:
     """Отвечает вслух, проговаривая предложения по мере генерации."""
-    speech = voice.speaker.stream()
     buffer = SentenceBuffer()
 
     # Микрофон глушим не на весь ход, а с первого произнесённого предложения:
     # пока модель думает, робот молчит — и должен слышать «стоп», тем более
     # что модель могла уже вызвать drive и робот в этот момент едет.
+    #
+    # Синтез открываем уже под замком: в режиме local это отдельный процесс
+    # piper на общую звуковую карту, и открывать его раньше, чем занят голос,
+    # значит однажды наложиться на объявление таймера.
     with voice.hold(), contextlib.ExitStack() as stack:
+        speech = voice.speaker.stream()
         speaking = False
 
         def start_speaking() -> None:

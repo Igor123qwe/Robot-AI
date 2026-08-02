@@ -110,6 +110,10 @@ fi
 DONE=""
 for unit in $RESTART; do
   case " $DONE " in *" $unit "*) continue ;; esac
+  # Себя не перезапускаем: этот скрипт и есть robot-autopull, и systemctl
+  # restart убьёт его на полуслове — остальные сервисы обновлены не будут.
+  # Новый юнит подхватится сам при следующем срабатывании таймера.
+  [ "$unit" = robot-autopull ] && continue
   DONE="$DONE $unit"
   if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
     $SUDO systemctl restart "$unit"

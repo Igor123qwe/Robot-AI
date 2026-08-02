@@ -39,6 +39,10 @@ class Ros:
         # Когда в /cmd_vel последний раз видели ненулевую скорость. Слушаем сам
         # топик, а не только себя: гнать робота может и веб-пульт напрямую.
         self._last_move = 0.0
+        # Когда мы сами в последний раз опубликовали ноль. Свои нули
+        # прилетают обратно по подписке, и без этой отметки поездка,
+        # начатая сразу после предыдущей, отменялась собственным хвостом.
+        self._own_zero_at = 0.0
 
     # --- жизненный цикл -------------------------------------------------
     def start(self) -> None:
@@ -101,7 +105,7 @@ class Ros:
             if speed > 1e-3:
                 with self._lock:
                     self._last_move = time.monotonic()
-            elif self.moving:
+            elif self.moving and not self._own_zero():
                 # Ноль в топике, пока мы едем, — это кто-то другой требует
                 # остановиться: кнопка СТОП в пульте или отпущенный джойстик.
                 # Без этого поток движения через 66 мс снова подаёт скорость,
@@ -141,7 +145,15 @@ class Ros:
             return self._voltage
 
     # --- управление -----------------------------------------------------
+    def _own_zero(self, window: float = 0.5) -> bool:
+        """Наш ли это ноль. Эхо своей же остановки не должно ничего отменять."""
+        with self._lock:
+            return time.monotonic() - self._own_zero_at < window
+
     def publish_twist(self, x: float = 0.0, y: float = 0.0, wz: float = 0.0) -> None:
+        if abs(x) + abs(y) + abs(wz) <= 1e-3:
+            with self._lock:
+                self._own_zero_at = time.monotonic()
         self._send({
             "op": "publish",
             "topic": CMD_VEL,

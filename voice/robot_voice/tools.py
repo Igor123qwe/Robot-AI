@@ -176,7 +176,9 @@ class Timers:
         self._messages: dict[str, str] = {}
         # Сколько раз таймер уже звонил в пустоту.
         self._tries: dict[str, int] = {}
-        self._lock = threading.Lock()
+        # Рекурсивный: SIGTERM приходит в главный поток, и обработчик зовёт
+        # cancel_all() ровно тогда, когда этот же поток может держать замок.
+        self._lock = threading.RLock()
         self.store = store
 
     def add(self, label: str, seconds: float, message: str = "") -> None:
@@ -200,6 +202,7 @@ class Timers:
                 item[0].cancel()
             if item is not None or paused is not None:
                 self._messages.pop(label, None)
+                self._tries.pop(label, None)
                 self._save()
             return item is not None or paused is not None
         finally:
@@ -252,7 +255,9 @@ class Timers:
             self._items.pop(label, None)
             message = self._messages.get(label, "")
             tries = self._tries.get(label, 1)
-            self._save()
+            # На диске таймер пока остаётся: если сервис перезапустят прямо
+            # сейчас (автообновление раз в две минуты), напоминание не должно
+            # пропасть — restore() увидит просроченный и произнесёт его.
 
         # Таймер, будильник и напоминание человек ставил сам — они звучат в
         # полную громкость даже в тихие часы. Иначе тихий режим превращает
@@ -316,6 +321,10 @@ class Timers:
                 late.append(label)
         with self._lock:
             self._paused.update(data.get("paused") or {})
+            # Текст напоминания, стоящего на паузе, тоже надо вернуть: иначе
+            # после продолжения робот скажет безликое «время вышло».
+            self._messages.update({k: v for k, v in messages.items()
+                                   if k in self._paused or k in self._items})
             self._save()
         for label in late:
             # Сработал, пока сервиса не было. Молчать нельзя: человек ждал.
@@ -460,7 +469,10 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if target is None:
             return f"Не понял время {at!r}. Скажи, например, в семь утра."
         minutes = when.minutes_until(target)
-        label = label.strip() or ALARM
+        # Имя по умолчанию у всех одно, а add() заменяет по имени: без этого
+        # второй будильник молча стирал первый, подтвердив оба вслух.
+        label = _free_label(label.strip() or ALARM,
+                            {**timers.remaining(), **timers.paused()})
         timers.add(label, minutes * 60, message=_wake_up(target))
         log.info("будильник %r на %s (через %.0f мин)", label, target, minutes)
         return f"Разбужу {ru.when_phrase(target)}."

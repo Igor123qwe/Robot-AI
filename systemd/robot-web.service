@@ -6,7 +6,10 @@ After=network.target
 Type=simple
 User=wheeltec
 WorkingDirectory=/home/wheeltec/Robot-AI/web
-# Адрес телефона с IP Webcam берётся отсюда; файла может не быть — не страшно.
+# Отсюда берётся адрес телефона с IP Webcam и порт пульта; файла может не
+# быть — не страшно. Заодно сюда попадает и ключ от роутера, который этому
+# процессу не нужен: развести конфиги на два файла — значит однажды поменять
+# адрес телефона не в том, поэтому пока живём с одним и помним об этом.
 EnvironmentFile=-/home/wheeltec/.robot-ai.env
 ExecStart=/usr/bin/python3 /home/wheeltec/Robot-AI/web/server.py
 Restart=always

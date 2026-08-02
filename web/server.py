@@ -169,7 +169,9 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
-        if path.endswith(".py"):
+        # Сравниваем раскодированный путь: иначе /server%2Epy проходит мимо
+        # проверки, и исходник сервера уезжает любому в домашней сети.
+        if urllib.parse.unquote(path).endswith(".py"):
             self.fail(404, "нет такой страницы")
             return
         if path == "/camera":
@@ -187,11 +189,12 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.partition("?")[0]
-        if path not in ("/speak", "/speak/stop", "/speak/heard"):
+        if path not in ("/speak", "/speak/stop", "/speak/heard", "/speak/status"):
             self.fail(404, "нет такой ручки")
             return
         # Говорить роботом может только сам робот, не любое устройство в сети.
         if self.client_address[0] not in ("127.0.0.1", "::1"):
+            self.close_connection = True
             self.fail(403, "только с самого робота")
             return
 
@@ -204,15 +207,17 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True})
             return
 
-        if path == "/speak/heard":
-            # Что робот расслышал. Экрана у него нет, а «он меня не слышит»
-            # иначе проверяется только через SSH и journalctl.
-            heard = self.rfile.read(min(length, 4096)).decode("utf-8", "replace")
-            SPEECH.broadcast({"heard": heard})
+        if path in ("/speak/heard", "/speak/status"):
+            # Что робот расслышал и в каком он состоянии. Экрана у него нет, а
+            # «он меня не слышит» иначе проверяется только через SSH.
+            body = self.rfile.read(max(0, min(length, 4096))).decode("utf-8", "replace")
+            SPEECH.broadcast({path.rsplit("/", 1)[1]: body})
             self.send_json({"ok": True})
             return
 
         if not 0 < length <= MAX_CLIP_BYTES:
+            # Не дочитав тело, мы ломаем следующий запрос в том же соединении.
+            self.close_connection = True
             self.fail(400, "пустая или слишком большая реплика")
             return
 
@@ -235,7 +240,11 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             while True:
                 try:
-                    event = q.get(timeout=15)
+                    # Три секунды, а не пятнадцать: закрытую вкладку надо
+                    # заметить быстро. Иначе робот считает её слушателем,
+                    # честно ждёт конца реплики — и не повторяет таймер,
+                    # хотя его никто не слышал.
+                    event = q.get(timeout=3)
                     payload = f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 except queue.Empty:
                     payload = ": keepalive\n\n"   # чтобы соединение не уснуло

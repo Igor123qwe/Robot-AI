@@ -299,7 +299,7 @@ makeJoystick($('padMove'), (dx, dy) => {
 // Правый: только горизонталь — разворот на месте.
 // angular.z положительная — против часовой (влево).
 makeJoystick($('padTurn'), (dx) => {
-  cmd.wz = -dx * MAX_WZ;
+  cmd.wz = -dx * MAX_WZ * (limit / 0.80);   // предел действует и на разворот
 });
 
 // ── Кинематика меканума (для индикаторов) ────────────────────────────────
@@ -399,6 +399,11 @@ function publishCmdVel() {
 function emergencyStop() {
   cmd.x = cmd.y = cmd.wz = 0;
   idleZeros = 0;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    // Кнопка мигнула, а робот едет дальше — молчать об этом нельзя.
+    setStatus('СТОП НЕ УШЁЛ — нет связи с роботом', false);
+    return;
+  }
   for (let i = 0; i < 5; i++) {
     send({
       op: 'publish',
@@ -435,9 +440,14 @@ function normalizeCamUrl(raw) {
   if (!s) return PROXY_CAM;
   if (s.startsWith('/')) return s;         // путь на самом роботе
   if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
-  const host = s.slice(s.indexOf('//') + 2);
-  if (!/:\d+/.test(host)) s += ':8080';
-  return s;
+  // Разбираем адрес по-настоящему: IP Webcam показывает на экране телефона
+  // ссылку сразу с путём (192.168.3.9:8080/video), и дописывание порта в
+  // конец строки превращало её в мусор вида http://192.168.3.9/video:8080.
+  let u;
+  try { u = new URL(s); } catch (e) { return PROXY_CAM; }
+  if (!u.port) u.port = 8080;
+  const path = u.pathname.replace(/\/(video|shot\.jpg|audio\.wav)$/, '').replace(/\/$/, '');
+  return u.origin + path;
 }
 
 camBtn.addEventListener('click', () => {
@@ -532,6 +542,10 @@ function listen() {
       showCaption('вы: ' + data.heard, true);
       return;
     }
+    if (data.status !== undefined) {  // состояние робота, а не чья-то реплика
+      setStatus(data.status, !/не отвечает|нет /.test(data.status));
+      return;
+    }
 
     showCaption(data.text);
     if (!soundOn) return;       // текст показываем всегда, звук — по кнопке
@@ -547,9 +561,12 @@ listen();
 if (localStorage.getItem('soundOn') === '1') {
   sndBtn.textContent = '🔈';
   sndBtn.title = 'Звук был включён — коснитесь страницы, чтобы вернуть';
-  const unlock = () => {
+  const unlock = ev => {
     window.removeEventListener('pointerdown', unlock);
     window.removeEventListener('keydown', unlock);
+    // Если нажали на саму кнопку — её собственный обработчик уже включит
+    // звук. Иначе он включит, а этот выключит обратно, и надо жать дважды.
+    if (ev && ev.target && ev.target.closest && ev.target.closest('#sndBtn')) return;
     setSound(true);
   };
   window.addEventListener('pointerdown', unlock);
