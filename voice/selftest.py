@@ -811,7 +811,15 @@ def test_names() -> None:
 
     section("забытые импорты")
     here = Path(__file__).resolve().parent
-    for path in sorted((here / "robot_voice").glob("*.py")) + [here / "selftest.py"]:
+    files = sorted((here / "robot_voice").glob("*.py")) + [here / "selftest.py"]
+    # Веб-слой и ПК тоже. В режиме browser через веб-сервер идут И микрофон,
+    # И динамик: забытый импорт там делает робота разом глухим и немым, а
+    # голосовой сервис при этом бодро работает и не жалуется — обрывы звука
+    # он считает нормой. На ПК то же самое: мозг молча перестанет отвечать.
+    files += sorted((here.parent / "web").glob("*.py"))
+    files += sorted((here.parent / "pc").glob("*.py"))
+
+    for path in files:
         top = symtable.symtable(path.read_text(), str(path), "exec")
         known = {s.get_name() for s in top.get_symbols()} | set(dir(builtins))
         missing: list[str] = []

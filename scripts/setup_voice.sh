@@ -13,14 +13,15 @@ ENVFILE="$HOME/.robot-ai.env"
 KEY="$(grep -E '^ANTHROPIC_API_KEY=' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
 # Мозг может стоять на домашнем ПК — тогда облако не обязательно и ключ не
 # нужен. Отказывать в установке из-за его отсутствия было бы неправильно.
-PC="$(grep -E '^ROBOT_LOCAL_API_BASE=.+' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
+PC="$(grep -E '^(ROBOT_PC_URL|ROBOT_LOCAL_API_BASE)=.+' "$ENVFILE" 2>/dev/null \
+      | head -1 | cut -d= -f2- || true)"
 case "$KEY" in
   ""|"sk-ant-..."|*"..."*)
     if [ -n "$PC" ]; then
       echo "-- ANTHROPIC_API_KEY не задан: работаем только через ПК ($PC)."
       echo "   Выключите ПК — и поговорить будет не с кем; команды продолжат работать."
     else
-      echo "!! в $ENVFILE не задан ни ANTHROPIC_API_KEY, ни ROBOT_LOCAL_API_BASE"
+      echo "!! в $ENVFILE не задан ни ANTHROPIC_API_KEY, ни ROBOT_PC_URL"
       echo "   заполните и запустите скрипт снова: nano $ENVFILE"
       exit 1
     fi
@@ -60,14 +61,40 @@ SPEAKER="${REST%-*}"                # irina
 QUALITY="${REST##*-}"               # medium
 BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/$LANG_DIR/$LOCALE/$SPEAKER/$QUALITY"
 
+# Качаем во временный файл и переименовываем только после успеха. Иначе
+# оборванная закачка оставляет на диске обрезок, повторный запуск видит файл
+# на месте и закачку пропускает — навсегда. Робот при этом молчит: piper
+# падает на каждой реплике, а проверка смотрит только на существование файла.
+# (--remove-on-error не годится: он появился в curl 7.83, на роботе 7.81.)
 for ext in onnx onnx.json; do
-  if [ ! -f "$VOICE/models/$VOICE_NAME.$ext" ]; then
+  TARGET="$VOICE/models/$VOICE_NAME.$ext"
+  if [ ! -s "$TARGET" ]; then
+    rm -f "$TARGET"
     echo "    качаю $VOICE_NAME.$ext"
-    curl -fL "$BASE/$VOICE_NAME.$ext" -o "$VOICE/models/$VOICE_NAME.$ext" || {
+    if curl -fL "$BASE/$VOICE_NAME.$ext" -o "$TARGET.part" && [ -s "$TARGET.part" ]; then
+      mv "$TARGET.part" "$TARGET"
+    else
+      rm -f "$TARGET.part"
       echo "    !! не скачалось — положите файл вручную в $VOICE/models/"
-    }
+    fi
   fi
 done
+
+# Модель распознавания тянется из сети при первом обращении, и делает это
+# уже внутри сервиса. Если сети в тот момент нет, сервис падает на старте, а
+# systemd поднимает его каждые десять секунд — молча и бесконечно. Лучше
+# выяснить это здесь, пока человек смотрит на экран.
+echo "==> модель распознавания"
+WHISPER_NAME="$(grep -E '^ROBOT_WHISPER_MODEL=' "$ENVFILE" | cut -d= -f2 || true)"
+WHISPER_NAME="${WHISPER_NAME:-base}"
+if ! "$VOICE/.venv/bin/python" -c "
+from faster_whisper import WhisperModel
+WhisperModel('$WHISPER_NAME', device='cpu', compute_type='int8')
+print('    модель $WHISPER_NAME на месте')
+"; then
+  echo "!! модель $WHISPER_NAME не скачалась — робот не будет слышать."
+  echo "   Проверьте интернет и запустите скрипт снова."
+fi
 
 # Быстрая проверка, что окружение собралось и правила на месте: без неё
 # первое «он меня не понимает» начинается с гадания.
