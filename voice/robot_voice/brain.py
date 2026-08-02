@@ -40,7 +40,10 @@ class Brain:
     def __init__(self, cfg: Config, tools: list[Tool]) -> None:
         self.cfg = cfg
         self.tools = {t.name: t for t in tools}
-        self.specs = [t.spec() for t in tools]
+        # Модели показываем не всё: постоянная часть промпта уезжает в каждом
+        # запросе и оплачивается каждый раз. Правила закрывают таймеры,
+        # список, громкость и прочее — модели эти схемы возить незачем.
+        self.specs = [t.spec() for t in tools if not t.hidden]
 
         client_args = {
             "api_key": cfg.api_key,

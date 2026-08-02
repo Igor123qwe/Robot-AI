@@ -109,6 +109,11 @@ class Tool:
     description: str
     input_schema: dict
     run: Callable[..., str]
+    # Инструменты, которые надёжно разбираются правилами, модели не показываем:
+    # каждая схема едет в КАЖДОМ запросе и оплачивается каждый раз. Вызвать
+    # такой инструмент модель не сможет, но ей это и не нужно — до неё эти
+    # фразы просто не доходят.
+    hidden: bool = False
 
     def spec(self) -> dict:
         """То, что уходит в API."""
@@ -673,8 +678,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     tools = [
         Tool(
             name="drive",
-            description="Проехать в заданную сторону. Колёса меканум, поэтому "
-                        "робот может двигаться боком, не разворачиваясь.",
+            description="Проехать в сторону. Колёса меканум: может ехать боком.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -685,7 +689,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                     },
                     "distance": {
                         "type": "number",
-                        "description": "Сколько метров проехать, от 0.05 до 3.0.",
+                        "description": "Метров, 0.05–3.0.",
                     },
                 },
                 "required": ["direction"],
@@ -705,7 +709,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                     },
                     "degrees": {
                         "type": "number",
-                        "description": "На сколько градусов повернуться, от 5 до 360.",
+                        "description": "Градусов, 5–360.",
                     },
                 },
                 "required": ["direction"],
@@ -726,17 +730,17 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="set_timer",
-            description="Поставить таймер. Когда он сработает, робот скажет об этом вслух.",
+            description="Таймер на N минут. Сработает — робот скажет вслух.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "minutes": {
                         "type": "number",
-                        "description": "Через сколько минут сработает, от 0.1 до 600.",
+                        "description": "Через сколько минут, 0.1–600.",
                     },
                     "label": {
                         "type": "string",
-                        "description": "Короткое название, чтобы отличать таймеры друг от друга.",
+                        "description": "Короткое название, чтобы отличать таймеры.",
                     },
                 },
                 "required": ["minutes"],
@@ -745,27 +749,25 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="time_now",
-            description="Узнать текущее время. Часов у тебя нет, поэтому "
-                        "спрашивай здесь, а не отвечай по памяти.",
+            description="Текущее время. Часов у тебя нет — не отвечай по памяти.",
             input_schema=EMPTY_SCHEMA,
             run=time_now,
         ),
         Tool(
             name="date_now",
-            description="Узнать сегодняшнюю дату и день недели. Календаря у "
-                        "тебя нет, поэтому спрашивай здесь.",
+            description="Сегодняшняя дата и день недели. Календаря у тебя нет.",
             input_schema=EMPTY_SCHEMA,
             run=date_now,
         ),
         Tool(
             name="list_timers",
-            description="Показать, какие таймеры сейчас идут и сколько им осталось.",
+            description="Какие таймеры идут и сколько осталось.",
             input_schema=EMPTY_SCHEMA,
             run=list_timers,
         ),
         Tool(
             name="cancel_timer",
-            description="Снять таймер. Без названия — если таймер всего один.",
+            description="Снять таймер. Без названия — если он один.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -779,14 +781,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="set_alarm",
-            description="Поставить будильник на конкретное время суток. "
-                        "Для «через сколько-то минут» есть set_timer.",
+            description="Будильник на время суток. Через N минут — это set_timer.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "at": {
                         "type": "string",
-                        "description": "Время: «7:30», «семь утра», «восемь вечера».",
+                        "description": "«7:30», «семь утра», «восемь вечера».",
                     },
                     "label": {
                         "type": "string",
@@ -799,15 +800,14 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="set_reminder",
-            description="Напомнить о деле: робот произнесёт текст вслух в "
-                        "назначенное время. Нужно указать либо at, либо minutes.",
+            description="Напоминание: робот произнесёт текст в назначенное время. "
+                        "Нужно указать at или minutes.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "О чём напомнить, как это скажет человек: "
-                                       "«выключить плиту», «позвонить маме».",
+                        "description": "О чём напомнить: «выключить плиту».",
                     },
                     "at": {
                         "type": "string",
@@ -824,6 +824,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="pause_timer",
+            hidden=True,
             description="Приостановить таймер, не сбрасывая его. Без названия — "
                         "если таймер всего один.",
             input_schema={
@@ -839,6 +840,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="resume_timer",
+            hidden=True,
             description="Продолжить таймер, снятый с паузы.",
             input_schema={
                 "type": "object",
@@ -853,6 +855,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="cancel_all_timers",
+            hidden=True,
             description="Отменить сразу все идущие таймеры. Если их несколько, "
                         "инструмент сначала переспросит — тогда повтори вызов "
                         "с confirmed, но только после согласия человека.",
@@ -869,10 +872,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="weather",
-            description="Узнать погоду на улице там, где стоит робот. Своих "
-                        "датчиков у него нет, данные берутся из интернета — не "
-                        "отвечай по памяти. Про другой город этот инструмент "
-                        "ничего не знает: так и скажи, а его не вызывай.",
+            description="Погода там, где стоит робот. По памяти не отвечай. "
+                        "Про другой город не знает — так и скажи, не вызывай.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -887,6 +888,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="abilities",
+            hidden=True,
             description="Рассказать, что робот умеет. Отвечай этим, а не своими "
                         "словами: список умений тут точный.",
             input_schema=EMPTY_SCHEMA,
@@ -898,6 +900,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         tools += [
             Tool(
                 name="volume",
+                hidden=True,
                 description="Сделать голос тише или громче.",
                 input_schema={
                     "type": "object",
@@ -914,6 +917,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="hush",
+                hidden=True,
                 description="Замолчать немедленно: перестать проговаривать то, "
                             "что уже отправлено, и ничего не отвечать.",
                 input_schema=EMPTY_SCHEMA,
@@ -921,6 +925,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="repeat",
+                hidden=True,
                 description="Повторить последнюю сказанную фразу.",
                 input_schema=EMPTY_SCHEMA,
                 run=repeat,
@@ -931,6 +936,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         tools += [
             Tool(
                 name="notes_add",
+                hidden=True,
                 description="Добавить пункт в список покупок и дел.",
                 input_schema={
                     "type": "object",
@@ -944,12 +950,14 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="notes_list",
+                hidden=True,
                 description="Прочитать вслух список покупок и дел.",
                 input_schema=EMPTY_SCHEMA,
                 run=notes_list,
             ),
             Tool(
                 name="notes_remove",
+                hidden=True,
                 description="Убрать один пункт из списка.",
                 input_schema={
                     "type": "object",
@@ -962,6 +970,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="notes_clear",
+                hidden=True,
                 description="Стереть весь список целиком.",
                 input_schema=EMPTY_SCHEMA,
                 run=notes_clear,

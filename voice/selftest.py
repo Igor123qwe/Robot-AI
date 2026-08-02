@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import types
@@ -39,6 +40,7 @@ for name, make_stub in _STUBS.items():
 
 from robot_voice import ru, weather, when                      # noqa: E402
 from robot_voice.brain import HISTORY_LIMIT, _trim    # noqa: E402
+from robot_voice.config import SYSTEM_PROMPT          # noqa: E402
 from robot_voice.intents import parse                 # noqa: E402
 from robot_voice.notes import Notes                   # noqa: E402
 from robot_voice.tools import Timers, build_tools     # noqa: E402
@@ -307,6 +309,38 @@ def test_notes() -> None:
     check("пережил перезапуск", Notes(store).items(), ["хлеб"])
 
 
+def test_hidden() -> None:
+    """Скрытый от модели инструмент обязан вызываться правилом.
+
+    Схемы инструментов уезжают в каждый запрос и оплачиваются каждый раз,
+    поэтому те, что надёжно разбираются правилами, модели не показываются.
+    Цена ошибки высокая: скрыть инструмент, до которого правило не достаёт, —
+    значит потерять умение совсем, причём молча.
+    """
+    section("скрытые от модели инструменты")
+    store = Path(tempfile.mkdtemp())
+    timers = Timers(announce=lambda text, **kw: None, store=store / "timers.json")
+    ros = types.SimpleNamespace(voltage=12.4, moving=False, connected=True,
+                                drive=lambda *a, **k: None, stop_motion=lambda: None)
+    speaker = types.SimpleNamespace(volume=1.0, last_said="",
+                                    set_volume=lambda v: None, hush=lambda: None)
+    tools = build_tools(ros, timers, speaker=speaker,
+                        notes=Notes(store / "notes.json"))
+    hidden = {t.name for t in tools if t.hidden}
+    phrases = [
+        "приостанови таймер", "продолжи таймер", "сбрось все таймеры",
+        "что ты умеешь", "говори тише", "замолчи", "повтори",
+        "добавь в список молоко", "что в списке", "убери молоко из списка",
+        "очисти список",
+    ]
+    reachable = {m.tool for m in (parse(p) for p in phrases) if m is not None}
+    check("до каждого скрытого достают правила", sorted(hidden - reachable), [])
+    visible = [t.spec() for t in tools if not t.hidden]
+    print(f"   модель видит {len(visible)} инструментов из {len(tools)}, "
+          f"{len(json.dumps(visible, ensure_ascii=False))} символов схем "
+          f"плюс {len(SYSTEM_PROMPT)} символов промпта")
+
+
 def test_history() -> None:
     section("обрезка истории диалога")
 
@@ -485,7 +519,7 @@ def test_dialogue() -> None:
 
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
-                 test_alarms, test_weather, test_notes, test_history,
+                 test_alarms, test_weather, test_notes, test_hidden, test_history,
                  test_names, test_dialogue):
         test()
         print("   ...")
