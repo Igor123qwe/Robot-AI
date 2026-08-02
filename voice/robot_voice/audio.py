@@ -342,12 +342,18 @@ class Listener:
         speech: list[np.ndarray] = []
         silence = 0
         voiced_run = 0
+        # Речевых кадров в куске — именно речевых, а не «всего минус хвост
+        # тишины». Раньше считалось вторым способом, и в счёт попадали
+        # предбуфер и семьсот миллисекунд тишины на конце: одиночный щелчок
+        # набирал ровно порог и уезжал в распознавание как секунда почти
+        # тишины. Порог при этом не работал вообще ни на чём.
+        voiced_total = 0
         talking = False
 
         for frame in self.pump.frames():
             if self._muted.is_set():
                 speech.clear()
-                silence = voiced_run = 0
+                silence = voiced_run = voiced_total = 0
                 talking = False
                 continue
 
@@ -360,25 +366,41 @@ class Listener:
                     talking = True
                     speech = list(self.preroll)
                     silence = 0
+                    voiced_total = voiced_run
                 continue
 
             speech.append(frame)
+            if is_speech:
+                voiced_total += 1
             silence = 0 if is_speech else silence + 1
 
             # Либо человек замолчал, либо говорит слишком долго — режем.
             too_long = len(speech) >= self.max_speech_frames
-            if silence >= self.silence_frames or too_long:
-                if too_long:
-                    log.info("аудио: фраза длиннее %d с, режу", self.max_speech_frames * FRAME_MS // 1000)
+            if too_long:
+                # Такой кусок в распознавание не отдаём вовсе. Домашняя
+                # команда столько не длится — это шум или чужой разговор, а
+                # цена ошибки высока: распознавание идёт втрое дольше самого
+                # звука и в это время робот не реагирует ни на что, включая
+                # «стоп». Двадцать секунд шума превращались в минуту немоты.
+                log.info("аудио: непрерывный звук дольше %d с — не речь, отбрасываю",
+                         self.max_speech_frames * FRAME_MS // 1000)
+                speech = []
+                silence = voiced_run = voiced_total = 0
+                talking = False
+                self.preroll.clear()
+                continue
+
+            if silence >= self.silence_frames:
                 talking = False
                 voiced_run = 0
-                voiced = len(speech) - silence
                 payload, speech = speech, []
+                voiced, voiced_total = voiced_total, 0
                 self.preroll.clear()
                 if voiced >= self.min_speech_frames:
                     yield to_wav(np.concatenate(payload), self.sample_rate)
                 else:
-                    log.debug("аудио: слишком короткий фрагмент, пропускаю")
+                    log.debug("аудио: слишком короткий фрагмент (%d кадров речи), "
+                              "пропускаю", voiced)
 
 
 def to_wav(samples: np.ndarray, sample_rate: int) -> bytes:

@@ -32,6 +32,12 @@ ALARM = "будильник"
 RING_TRIES = 3
 RING_RETRY = 45.0
 
+# Насколько просроченный таймер ещё стоит объявлять после перезапуска.
+# Полчаса — это «робот моргнул, пока ты выходил на кухню». Всё, что старше,
+# уже не новость, а испуг: робот стоял неделю и вдруг объявляет будильник
+# недельной давности.
+STALE_SECONDS = 1800.0
+
 
 def _ring(label: str) -> str:
     name = "Таймер" if label == NO_NAME else f"Таймер {label}"
@@ -194,8 +200,25 @@ class Timers:
         self._lock = threading.RLock()
         self.store = store
 
+    def _known(self, label: str) -> str:
+        """Уже заведённое имя с тем же ключом, иначе само label.
+
+        Хранились имена точной строкой, а искались нестрого — с приведением
+        регистра и ё к е. Из-за расхождения «Лапша» и «лапша» становились
+        двумя разными таймерами, но одним и тем же для поиска: робот отменял
+        первый попавшийся, бодро отвечал «отменил», а второй продолжал идти.
+        Приводим к одному имени здесь, в хранилище, а не в каждом месте, где
+        таймер ищут.
+        """
+        key = _key(label)
+        for name in list(self._items) + list(self._paused):
+            if _key(name) == key:
+                return name
+        return label
+
     def add(self, label: str, seconds: float, message: str = "") -> None:
         with self._lock:
+            label = self._known(label)
             self.cancel(label, _locked=True)
             timer = threading.Timer(seconds, self._fire, args=(label,))
             timer.daemon = True
@@ -209,6 +232,7 @@ class Timers:
         if not _locked:
             self._lock.acquire()
         try:
+            label = self._known(label)
             paused = self._paused.pop(label, None)
             item = self._items.pop(label, None)
             if item is not None:
@@ -225,7 +249,7 @@ class Timers:
     def pause(self, label: str) -> bool:
         """Останавливает отсчёт, запомнив остаток."""
         with self._lock:
-            item = self._items.pop(label, None)
+            item = self._items.pop(self._known(label), None)
             if item is None:
                 return False
             timer, due = item
@@ -236,6 +260,7 @@ class Timers:
 
     def resume(self, label: str) -> bool:
         with self._lock:
+            label = self._known(label)
             left = self._paused.pop(label, None)
             message = self._messages.get(label, "")
         if left is None:
@@ -290,6 +315,10 @@ class Timers:
             self._items.pop(label, None)
             message = self._messages.get(label, "")
             tries = self._tries.get(label, 1)
+            # Отметка «этот таймер сейчас звонит». По ней после объявления
+            # видно, не отменили ли его, пока замок был отпущен: cancel и
+            # cancel_all её снимают.
+            self._tries[label] = tries
             # На диске таймер пока остаётся: если сервис перезапустят прямо
             # сейчас (автообновление раз в две минуты), напоминание не должно
             # пропасть — restore() увидит просроченный и произнесёт его.
@@ -303,11 +332,23 @@ class Timers:
         # закрыта или с выключенным звуком. Прозвонить в пустоту и забыть —
         # это потерянный таймер на духовке, поэтому повторяем.
         if heard is not None and heard <= 0 and tries < RING_TRIES:
-            log.info("таймер %r никто не услышал, повторю через %.0f с",
-                     label, RING_RETRY)
             with self._lock:
+                # Объявление длится секунды, и замок на это время отпущен.
+                # За это время человек мог сказать «отмени все» — тогда
+                # повторять нечего. Раньше повтор просто создавал таймер
+                # заново, и отменённый будильник воскресал, да ещё и
+                # записывался обратно на диск.
+                if label not in self._tries:
+                    log.info("таймер %r отменили, пока он звонил", label)
+                    return
+                log.info("таймер %r никто не услышал, повторю через %.0f с",
+                         label, RING_RETRY)
+                # Счёт попыток ставим ПОСЛЕ add: он внутри зовёт cancel, а тот
+                # отметку снимает. Раньше строки шли наоборот, счётчик
+                # обнулялся на каждом круге, и таймер в закрытую вкладку звонил
+                # бы вечно вместо трёх раз.
+                self.add(label, RING_RETRY, message)
                 self._tries[label] = tries + 1
-            self.add(label, RING_RETRY, message)
             return
 
         with self._lock:
@@ -352,8 +393,16 @@ class Timers:
             if left > 1:
                 self.add(label, left, messages.get(label, ""))
                 log.info("восстановил таймер %r, осталось %.0f с", label, left)
-            else:
+            elif -left <= STALE_SECONDS:
                 late.append(label)
+            else:
+                # Слишком старое. Робот стоял неделю, а по возвращении
+                # объявлял недельной давности будильник — это не забота, это
+                # пугает. Плюс часы на этой плате врут при старте: сервис
+                # поднимается раньше, чем NTP их поправит, и «просроченным»
+                # может показаться таймер, который на самом деле идёт.
+                log.info("таймер %r просрочен на %.0f ч — молчу",
+                         label, -left / 3600)
         with self._lock:
             self._paused.update(data.get("paused") or {})
             # Текст напоминания, стоящего на паузе, тоже надо вернуть: иначе

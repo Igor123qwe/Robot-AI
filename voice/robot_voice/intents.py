@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
-from . import when
+from . import ru, when
 
 log = logging.getLogger(__name__)
 
@@ -349,9 +349,14 @@ def _cancel_timers(t: str) -> Match | None:
     duration, label = m.group(1), (m.group(2) or "").strip()
     if duration:
         # Таймер называют по длительности: «отмени таймер на пять минут».
-        # Инструмент сам разберётся — если такого названия нет, а таймер
-        # всего один, снимет его.
-        return Match("cancel_timer", {"label": duration.strip()}, "снять таймер по времени")
+        # Имя приводим к той же словесной форме, которой робот сам назвал
+        # второй безымянный таймер. Раньше сюда уходило «10 минут» цифрами, а
+        # в хранилище лежало «десять минут» — совпасть они не могли никогда, и
+        # робот на «отмени таймер на десять минут» переспрашивал, перечисляя
+        # ровно тот таймер, который у него просили снять.
+        return Match("cancel_timer",
+                     {"label": ru.duration(_duration_minutes(duration) * 60)},
+                     "снять таймер по времени")
     if not label:
         # «Отмени таймер» без уточнения: если он один — снимаем, если их
         # несколько — инструмент переспросит. Снимать все по такой фразе

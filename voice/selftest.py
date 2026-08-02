@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import types
 from datetime import datetime
 from pathlib import Path
@@ -324,6 +325,32 @@ def test_survives_restart() -> None:
     fresh.restore()
     check("снятые человеком не воскресают", fresh.remaining(), {})
 
+    # Регистр и ё не должны плодить дубли: «Лапша» и «лапша» — один таймер.
+    # Раньше хранились они точной строкой, а искались нестрого, и робот
+    # отменял первый попавшийся, бодро отвечая «отменил», — второй шёл дальше.
+    двойник = Timers(announce=lambda text, **kw: None, store=store)
+    двойник.add("Лапша", 600)
+    двойник.add("лапша", 300)
+    check("регистр не плодит таймеры", len(двойник.remaining()), 1)
+    check("снимается по любому написанию", двойник.cancel("ЛАПША"), True)
+    check("после снятия пусто", двойник.remaining(), {})
+
+    # Просроченное объявляем только если это свежая просрочка. Робот стоял
+    # неделю — объявлять будильник недельной давности не забота, а испуг.
+    from robot_voice.tools import STALE_SECONDS
+    сказано: list[str] = []
+    старый = Path(tempfile.mkdtemp()) / "timers.json"
+    старый.write_text(json.dumps({
+        "items": {"духовка": time.time() - STALE_SECONDS - 60,
+                  "чайник": time.time() - 60},
+        "paused": {}, "messages": {},
+    }), encoding="utf-8")
+    Timers(announce=lambda text, **kw: сказано.append(text),
+           store=старый).restore()
+    check("недельную просрочку не объявляем",
+          any("духовка" in s for s in сказано), False)
+    check("свежую — объявляем", any("чайник" in s for s in сказано), True)
+
 
 def test_alarm_rules() -> None:
     """Три случая, в которых будильник вёл себя не так, как сказано вслух."""
@@ -397,6 +424,53 @@ def test_notes() -> None:
     check("убрали", notes.remove("МОЛОКО"), "молоко")
     check("чужого нет", notes.remove("сыр"), None)
     check("пережил перезапуск", Notes(store).items(), ["хлеб"])
+
+
+def test_slicing() -> None:
+    """Нарезка на фразы: что уезжает в распознавание, а что нет.
+
+    Два порога тут не работали вовсе. Одиночный щелчок проходил как секунда
+    почти-тишины, потому что «речевыми» считались и предбуфер, и семьсот
+    миллисекунд тишины на конце. А непрерывный шум длиннее двадцати секунд
+    не отбрасывался, а отдавался как обычная фраза — и робот замолкал на
+    минуту, потому что распознавание идёт втрое дольше самого звука.
+    """
+    section("нарезка на фразы")
+    import threading as th
+    from collections import deque
+
+    import numpy as np
+
+    from robot_voice import audio
+
+    def прогон(схема) -> list[float]:
+        """Схема — список (речь?, сколько кадров). Возвращает длины фраз."""
+        кадры, признаки = [], []
+        for речь, n in схема:
+            for _ in range(n):
+                кадры.append(np.zeros(160, dtype=np.int16))
+                признаки.append(речь)
+        подряд = iter(признаки)
+        l = audio.Listener.__new__(audio.Listener)
+        l.pump = types.SimpleNamespace(start=lambda: None,
+                                       frames=lambda: iter(кадры))
+        l.sample_rate = 16000
+        l.vad = types.SimpleNamespace(is_speech=lambda *a: next(подряд))
+        l.silence_frames, l.min_speech_frames = 35, 15     # 700 мс, 300 мс
+        l.max_speech_frames = 1000                          # 20 с
+        l.start_frames, l.preroll = 2, deque(maxlen=15)
+        l._muted = th.Event()
+        return [round((len(w) - 44) / 2 / 16000, 1) for w in l.utterances()]
+
+    check("одиночный щелчок отброшен",
+          прогон([(False, 20), (True, 2), (False, 40)]), [])
+    check("настоящая фраза проходит",
+          len(прогон([(False, 20), (True, 50), (False, 40)])), 1)
+    check("двадцать секунд шума не уезжают в распознавание",
+          прогон([(True, 1000), (False, 40)]), [])
+    check("после отброшенного куска слух возвращается",
+          прогон([(True, 1000), (False, 40), (True, 50), (False, 40)])[-1] < 2.0,
+          True)
 
 
 def test_stop_while_thinking() -> None:
@@ -960,7 +1034,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_stop_while_thinking,
+                 test_weather, test_notes, test_slicing, test_stop_while_thinking,
                  test_speech_streams,
                  test_pc_url, test_hidden,
                  test_thinkless, test_endpoints, test_brain_money,
