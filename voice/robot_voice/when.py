@@ -56,7 +56,10 @@ def at_time(text: str, now: datetime | None = None) -> datetime | None:
 
     part = _PART.get(m.group(3) or "")
     if part == "am":
-        hour = 0 if hour == 12 else hour
+        # Ничего не меняем намеренно. По-английски 12 AM — это полночь, и
+        # раньше так считалось и здесь; по-русски «двенадцать утра» — полдень,
+        # а полночь говорят «двенадцать ночи», и её разбирает ветка ниже.
+        pass
     elif part == "pm":
         hour = hour if hour >= 12 else hour + 12
     elif part == "night":

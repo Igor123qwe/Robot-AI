@@ -443,10 +443,19 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         return f"Разворачиваюсь {key} на {turn_words}."
 
     def stop() -> str:
+        # moving — это «едем ли по СВОЕЙ команде». Когда робота гонят
+        # джойстиком с пульта, оно ложно, и робот отвечал «я и так стою»,
+        # продолжая ехать: наши три нуля тут же перебивал поток пульта,
+        # идущий пятнадцать раз в секунду. Врать в такой момент нельзя.
         was_moving = ros.moving
+        was_busy = getattr(ros, "busy", was_moving)
         ros.stop_motion()
         log.info("стоп")
-        return "Остановился." if was_moving else "Я и так стою."
+        if was_moving:
+            return "Остановился."
+        if was_busy:
+            return "Меня ведут с пульта — отпусти джойстик, сам я не встану."
+        return "Я и так стою."
 
     def battery() -> str:
         volt = ros.voltage

@@ -593,8 +593,11 @@ class Undo:
         if not self.tool or time.monotonic() - self.at > UNDO_SECONDS:
             return False
         plain = re.sub(r"[^\w\s]", "", command.lower().replace("ё", "е")).strip()
-        if plain not in ("отмена", "отмени", "отменить", "забудь", "не надо",
-                         "неважно", "не важно"):
+        # «Забудь», «неважно», «не надо» отсюда убраны намеренно: это слова
+        # прощания — человек передумал разговаривать, и правильная реакция
+        # замолчать, а не снимать поставленный минуту назад таймер. Раньше
+        # отмена проверялась раньше прощания и перехватывала их.
+        if plain not in ("отмена", "отмени", "отменить"):
             return False
 
         name, field = self.UNDOABLE[self.tool]
@@ -765,8 +768,9 @@ def _respond(command: str, brain: Brain, voice: Voice,
                 if speech:
                     speech.feed(sentence)
 
+        said = ""
         try:
-            brain.reply(command, on_text)
+            said = brain.reply(command, on_text)
             tail = buffer.flush()
             if tail:
                 log.info("робот: %s", tail)
@@ -784,6 +788,12 @@ def _respond(command: str, brain: Brain, voice: Voice,
                     speech.close()
                 except Exception:
                     log.exception("сбой при озвучивании")
+            # «Повтори» до сих пор не умело повторять именно то, ради чего его
+            # и просят: разговорный ответ шёл мимо Speaker.say, и last_said
+            # хранил старую реплику правила. Фразу про сбой сюда не пишем —
+            # после неудачи повторять надо прошлый нормальный ответ.
+            if said:
+                voice.speaker.last_said = said
             # Строго до выхода из ExitStack: на выходе микрофон разглушается,
             # и накопленное будет выброшено.
             if recognizer is not None and ros is not None:
