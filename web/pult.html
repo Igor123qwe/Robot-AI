@@ -592,10 +592,32 @@ if (localStorage.getItem('soundOn') === '1') {
 // браузер откажет — открывай пульт через localhost (см. README, туннель по
 // ssh) или разреши этот адрес в chrome://flags.
 const micBtn = $('micBtn');
-const MIC_RATE = 16000;
-const MIC_CHUNK = MIC_RATE / 4;          // четверть секунды
+const MIC_RATE = 16000;                   // столько ждёт пайплайн робота
+const MIC_CHUNK = MIC_RATE / 4;           // четверть секунды в одном POST
 let micOn = false, micCtx = null, micStream = null, micNode = null;
-let micBuf = new Int16Array(0);
+let micBuf = new Int16Array(0);           // готовый PCM, ждёт отправки
+let micRaw = new Float32Array(0);         // сырой вход, ждёт пересчёта
+let micPeak = 0, micSilentSince = 0;
+
+// Браузер отдаёт микрофон на своей частоте (обычно 48 кГц) и просьбу про
+// 16 кГц может проигнорировать — проверено: приходило 31 кГц вместо 16, то
+// есть речь ускорялась в два раза. Поэтому пересчитываем сами, усреднением:
+// это грубый фильтр низких частот, без него верхние частоты заворачиваются
+// в слышимую полосу и шипящие превращаются в свист.
+function downsample(input, inRate) {
+  if (inRate === MIC_RATE) return { out: Float32Array.from(input), used: input.length };
+  const ratio = inRate / MIC_RATE;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const from = Math.floor(i * ratio);
+    const to = Math.min(input.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    for (let j = from; j < to; j++) sum += input[j];
+    out[i] = sum / Math.max(1, to - from);
+  }
+  return { out, used: Math.floor(outLen * ratio) };
+}
 
 async function micStart() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -611,46 +633,77 @@ async function micStart() {
     setStatus('микрофон не дали: ' + e.name, false);
     return;
   }
-  // Просим сразу 16 кГц: браузер пересчитает лучше, чем мы вручную.
-  micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: MIC_RATE });
+  micCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (micCtx.state === 'suspended') await micCtx.resume();
+  const rate = micCtx.sampleRate;
   const src = micCtx.createMediaStreamSource(micStream);
   micNode = micCtx.createScriptProcessor(4096, 1, 1);
+
   micNode.onaudioprocess = ev => {
     if (!micOn) return;
     // Пока играет ответ робота — не шлём: иначе он услышит сам себя,
     // если звук идёт из колонок, а не из наушников.
     if (playing) return;
+
     const input = ev.inputBuffer.getChannelData(0);
-    const pcm = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-      const v = Math.max(-1, Math.min(1, input[i]));
+    const merged = new Float32Array(micRaw.length + input.length);
+    merged.set(micRaw); merged.set(input, micRaw.length);
+    const { out, used } = downsample(merged, rate);
+    micRaw = merged.slice(used);          // хвост донесём следующим куском
+
+    let peak = 0;
+    const pcm = new Int16Array(out.length);
+    for (let i = 0; i < out.length; i++) {
+      const v = Math.max(-1, Math.min(1, out[i]));
+      if (Math.abs(v) > peak) peak = Math.abs(v);
       pcm[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
     }
-    const merged = new Int16Array(micBuf.length + pcm.length);
-    merged.set(micBuf); merged.set(pcm, micBuf.length);
-    micBuf = merged;
+    micLevel(peak);
+
+    const all = new Int16Array(micBuf.length + pcm.length);
+    all.set(micBuf); all.set(pcm, micBuf.length);
+    micBuf = all;
     while (micBuf.length >= MIC_CHUNK) {
       const part = micBuf.slice(0, MIC_CHUNK);
       micBuf = micBuf.slice(MIC_CHUNK);
       fetch('/listen', { method: 'POST', body: part.buffer }).catch(() => {});
     }
   };
+
   src.connect(micNode);
   micNode.connect(micCtx.destination);   // без этого узел не тикает
   micOn = true;
+  micPeak = 0;
+  micSilentSince = Date.now();
   micBtn.textContent = '🎙';
   micBtn.classList.add('on');
-  setStatus('микрофон включён — говори «Кузя, …»', true);
+  setStatus('микрофон включён (' + rate + ' Гц) — говори «Кузя, …»', true);
+}
+
+// Видимый уровень: без него «робот меня не слышит» проверяется только
+// командами на роботе. Кнопка краснеет, когда в микрофон реально говорят.
+function micLevel(peak) {
+  micPeak = Math.max(micPeak * 0.9, peak);
+  micBtn.classList.toggle('talking', micPeak > 0.02);
+  micBtn.title = 'уровень микрофона: ' + Math.round(micPeak * 100) + ' %';
+  if (micPeak > 0.02) {
+    micSilentSince = Date.now();
+  } else if (micSilentSince && Date.now() - micSilentSince > 5000) {
+    micSilentSince = 0;
+    setStatus('микрофон отдаёт тишину — проверь устройство записи в Windows', false);
+  }
 }
 
 function micStop() {
   micOn = false;
   micBuf = new Int16Array(0);
+  micRaw = new Float32Array(0);
   if (micNode) { micNode.disconnect(); micNode.onaudioprocess = null; micNode = null; }
   if (micCtx) { micCtx.close(); micCtx = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   micBtn.textContent = '🎤';
-  micBtn.classList.remove('on');
+  micBtn.classList.remove('on', 'talking');
+  micBtn.title = 'Говорить с роботом в микрофон этого компьютера';
 }
 
 micBtn.addEventListener('click', () => (micOn ? micStop() : micStart()));
