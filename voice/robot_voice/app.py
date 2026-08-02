@@ -92,8 +92,10 @@ class Voice:
     def hold(self):
         """Занимает голос, не трогая микрофон.
 
-        Для потокового ответа: пока модель думает, робот молчит и должен
-        слышать «стоп» — особенно если модель уже успела вызвать drive.
+        Пока модель думает, робот молчит, и сказанное в этот момент копится в
+        буфере звука. Мгновенно он на «стоп» не среагирует — главный цикл в
+        это время висит в разговоре с моделью, — но и не потеряет: хвост
+        разбирается сразу после ответа, см. _caught_stop.
         """
         with self._lock:
             yield
@@ -382,7 +384,8 @@ def main() -> None:
 
     while True:
         try:
-            _listen_loop(cfg, listener, recognizer, brain, voice, tools, addressed)
+            _listen_loop(cfg, listener, recognizer, brain, voice, tools,
+                         addressed, ros)
         except KeyboardInterrupt:
             shutdown(None, None)
         except Exception:
@@ -435,7 +438,7 @@ class Addressed:
 
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                  brain: Brain, voice: Voice, tools: list,
-                 addressed: Addressed) -> None:
+                 addressed: Addressed, ros=None) -> None:
     by_name = {t.name: t for t in tools}
     name = cfg.wake_words[0].capitalize() if cfg.wake_words else "робот"
     log.info("слушаю, имя — %s, разговор держится %.0f с после ответа",
@@ -550,7 +553,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # не хватает правилам. Это лучший источник для их пополнения —
             # выборка под конкретного человека, а не общий корпус.
             log.info("правилами не разобрал, спрашиваю модель")
-            _respond(command, brain, voice)
+            _respond(command, brain, voice, recognizer, ros)
 
         # Окно отсчитываем от конца ответа, а не от начала: иначе длинная
         # реплика робота съедала бы всё время, отведённое на продолжение.
@@ -700,9 +703,41 @@ def _failure_phrase(error: Exception) -> str:
     return "Что-то пошло не так, повтори."
 
 
-def _respond(command: str, brain: Brain, voice: Voice) -> None:
+def _caught_stop(wav: bytes, recognizer, ros) -> bool:
+    """Не сказал ли человек «стоп», пока робот думал над ответом.
+
+    Пока идёт разговор с моделью, главный цикл висит в нём и фраз не читает —
+    а модель к этому моменту могла уже отправить робота ехать, и поездка
+    длится до пятнадцати секунд. Разбираем накопленный хвост задним числом:
+    это не мгновенная остановка, но лучше, чем никакой.
+
+    Настоящее решение — отдельный поток слуха; оно крупнее и отложено. Пока
+    так, и лучше честно, чем обещать в комментариях несуществующее.
+    """
+    if not wav or not ros.moving:
+        return False
+    try:
+        text = recognizer.transcribe(wav)
+    except Exception:
+        log.debug("не смог разобрать хвост", exc_info=True)
+        return False
+    if _is_junk(text):
+        return False
+    match = intents.parse(text)
+    if match is None or match.tool != "stop":
+        return False
+    log.warning("«%s» прозвучало, пока я думал — останавливаюсь", text.strip())
+    ros.stop_motion()
+    return True
+
+
+def _respond(command: str, brain: Brain, voice: Voice,
+             recognizer=None, ros=None) -> None:
     """Отвечает вслух, проговаривая предложения по мере генерации."""
     buffer = SentenceBuffer()
+    # Хвост снимаем в момент, когда робот собирается заговорить: дальше в нём
+    # будет уже его собственный голос, и искать в этом «стоп» бессмысленно.
+    unheard = b""
 
     # Микрофон глушим не на весь ход, а с первого произнесённого предложения:
     # пока модель думает, робот молчит — и должен слышать «стоп», тем более
@@ -716,8 +751,10 @@ def _respond(command: str, brain: Brain, voice: Voice) -> None:
         speaking = False
 
         def start_speaking() -> None:
-            nonlocal speaking
+            nonlocal speaking, unheard
             if not speaking:
+                if recognizer is not None and ros is not None:
+                    unheard = voice.listener.unheard()
                 stack.enter_context(voice.quiet())
                 speaking = True
 
@@ -747,3 +784,11 @@ def _respond(command: str, brain: Brain, voice: Voice) -> None:
                     speech.close()
                 except Exception:
                     log.exception("сбой при озвучивании")
+            # Строго до выхода из ExitStack: на выходе микрофон разглушается,
+            # и накопленное будет выброшено.
+            if recognizer is not None and ros is not None:
+                try:
+                    if _caught_stop(unheard, recognizer, ros):
+                        voice.status("остановился по «стоп»")
+                except Exception:
+                    log.exception("сбой при разборе хвоста")

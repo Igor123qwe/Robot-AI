@@ -371,6 +371,44 @@ def test_notes() -> None:
     check("пережил перезапуск", Notes(store).items(), ["хлеб"])
 
 
+def test_stop_while_thinking() -> None:
+    """«Стоп», сказанный пока робот думает, не должен пропадать.
+
+    Главный цикл в это время висит в разговоре с моделью и фраз не читает, а
+    модель могла уже отправить робота ехать — поездка длится до пятнадцати
+    секунд. Мгновенной остановки тут нет и не обещается, но потерять команду
+    совсем нельзя.
+    """
+    section("«стоп» из паузы не теряется")
+    from robot_voice.app import _caught_stop
+
+    stopped: list[str] = []
+    ros = types.SimpleNamespace(moving=True,
+                                stop_motion=lambda: stopped.append("стоп"))
+    # Распознаватель тут простой: что подсунули, то и «услышал».
+    ears = types.SimpleNamespace(transcribe=lambda wav: wav.decode())
+
+    check("«стоп» пойман", _caught_stop("стоп".encode(), ears, ros), True)
+    check("колёса встали", stopped, ["стоп"])
+
+    stopped.clear()
+    check("обычная фраза не останавливает",
+          _caught_stop("а сколько времени".encode(), ears, ros), False)
+    check("мусор не останавливает", _caught_stop("...".encode(), ears, ros), False)
+    check("пустой хвост не разбираем", _caught_stop(b"", ears, ros), False)
+
+    ros.moving = False
+    check("стоим — разбирать нечего", _caught_stop("стоп".encode(), ears, ros), False)
+    check("лишних остановок не было", stopped, [])
+
+    # Сбой распознавания не должен ронять ответ: это происходит в блоке,
+    # который выполняется уже после того, как робот всё сказал.
+    падучий = types.SimpleNamespace(
+        transcribe=lambda wav: (_ for _ in ()).throw(RuntimeError("нет связи")))
+    ros.moving = True
+    check("сбой распознавания не роняет", _caught_stop("звук".encode(), падучий, ros), False)
+
+
 def test_speech_streams() -> None:
     """Первое предложение уходит в пульт, пока модель ещё договаривает.
 
@@ -823,7 +861,8 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_speech_streams,
+                 test_weather, test_notes, test_stop_while_thinking,
+                 test_speech_streams,
                  test_pc_url, test_hidden,
                  test_thinkless, test_endpoints, test_history,
                  test_names, test_dialogue):
