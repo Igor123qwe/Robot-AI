@@ -68,6 +68,62 @@ def _timeout(connect: float | None):
     return httpx.Timeout(TIMEOUT_SECONDS, connect=connect)
 
 
+class Thinkless:
+    """Не даёт роботу зачитать вслух ход мысли модели.
+
+    Локальные модели (Qwen3 и родня) выводят размышления прямо в текст ответа,
+    между <think> и </think>. Для голоса это катастрофа: робот полминуты вслух
+    рассуждает сам с собой, прежде чем сказать «привет». В облаке размышления
+    едут отдельным блоком и в текст не попадают, так что фильтр там просто
+    ничего не делает.
+
+    Текст приходит кусками, и тег легко разрывается пополам — «<thi» в одном
+    куске, «nk>» в другом. Поэтому хвост, похожий на начало тега, придерживаем
+    до следующего куска.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self.emit = emit
+        self.buf = ""
+        self.inside = False
+
+    def feed(self, chunk: str) -> None:
+        self.buf += chunk
+        while self.buf:
+            tag = self.CLOSE if self.inside else self.OPEN
+            at = self.buf.find(tag)
+            if at >= 0:
+                if not self.inside and at:
+                    self.emit(self.buf[:at])
+                self.buf = self.buf[at + len(tag):]
+                self.inside = not self.inside
+                continue
+            # Тега нет. Оставляем в буфере хвост, которым тег мог бы начаться,
+            # а остальное отдаём — иначе речь пойдёт рывками по одному куску.
+            keep = _tail_of(self.buf, tag)
+            if not self.inside and len(self.buf) > keep:
+                self.emit(self.buf[:len(self.buf) - keep])
+            self.buf = self.buf[len(self.buf) - keep:]
+            return
+
+    def close(self) -> None:
+        """Ответ кончился: придержанный хвост тегом так и не стал."""
+        if self.buf and not self.inside:
+            self.emit(self.buf)
+        self.buf = ""
+
+
+def _tail_of(text: str, tag: str) -> int:
+    """Длина хвоста text, который является началом tag."""
+    for n in range(min(len(text), len(tag) - 1), 0, -1):
+        if tag.startswith(text[-n:]):
+            return n
+    return 0
+
+
 @dataclass
 class Endpoint:
     """Один собеседник: куда идти, какой моделью и во сколько это обходится."""
@@ -244,9 +300,14 @@ class Brain:
         used_in = used_out = cached = written = 0
         truncated = False
 
-        def collect(chunk: str) -> None:
+        def emit(chunk: str) -> None:
             spoken.append(chunk)
             on_text(chunk)
+
+        # Размышления модели до речи не доходят: робот должен отвечать, а не
+        # читать вслух, как он к ответу шёл.
+        thinkless = Thinkless(emit)
+        collect = thinkless.feed
 
         rounds = 0
         answered: Endpoint | None = None
@@ -297,6 +358,9 @@ class Brain:
             messages.append({"role": "user", "content": results})
         else:
             log.warning("исчерпан лимит вызовов инструментов за один ход (%d)", rounds)
+
+        # Придержанный хвост тегом так и не стал — договариваем его.
+        thinkless.close()
 
         if answered is not None:
             answered.spent_in += used_in + written

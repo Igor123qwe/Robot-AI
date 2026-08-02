@@ -40,7 +40,7 @@ for name, make_stub in _STUBS.items():
         sys.modules[name] = make_stub()
 
 from robot_voice import ru, weather, when                      # noqa: E402
-from robot_voice.brain import HISTORY_LIMIT, Brain, _trim  # noqa: E402
+from robot_voice.brain import HISTORY_LIMIT, Brain, Thinkless, _trim  # noqa: E402
 from robot_voice.config import SYSTEM_PROMPT, Config   # noqa: E402
 from robot_voice.intents import parse                 # noqa: E402
 from robot_voice.notes import Notes                   # noqa: E402
@@ -342,6 +342,40 @@ def test_hidden() -> None:
           f"плюс {len(SYSTEM_PROMPT)} символов промпта")
 
 
+def test_thinkless() -> None:
+    """Размышления модели не должны звучать вслух.
+
+    Локальные модели выводят ход мысли прямо в текст, между <think> и
+    </think>. Робот прочитает это вслух — полминуты рассуждений вместо
+    ответа. Тег при этом легко разрывается между кусками потока, и именно
+    на разрыве такой фильтр обычно и ломается.
+    """
+    section("размышления модели не звучат вслух")
+
+    def run(chunks: list[str]) -> str:
+        said: list[str] = []
+        f = Thinkless(said.append)
+        for c in chunks:
+            f.feed(c)
+        f.close()
+        return "".join(said)
+
+    check("без размышлений — как есть", run(["Привет", ", Игорь"]), "Привет, Игорь")
+    check("размышления вырезаны",
+          run(["<think>надо посчитать</think>Восемь часов"]), "Восемь часов")
+    check("тег разорван между кусками",
+          run(["<thi", "nk>", "думаю", "</thi", "nk>", "Готово"]), "Готово")
+    check("текст до и после",
+          run(["Сейчас", "<think>ага</think>", " посмотрю"]), "Сейчас посмотрю")
+    check("угловая скобка не от тега",
+          run(["Цена < 5 рублей"]), "Цена < 5 рублей")
+    check("размышления не закрылись — вслух ничего",
+          run(["<think>завис на полуслове"]), "")
+    # Хвост, похожий на начало тега, придерживается — но если ответ на нём
+    # кончился, его надо договорить, а не проглотить.
+    check("недописанный хвост договаривается", run(["Готово<"]), "Готово<")
+
+
 def test_endpoints() -> None:
     """ПК основной, облако запасное: выключенный ПК не должен ломать разговор.
 
@@ -595,7 +629,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_weather, test_notes, test_hidden,
-                 test_endpoints, test_history,
+                 test_thinkless, test_endpoints, test_history,
                  test_names, test_dialogue):
         test()
         print("   ...")
