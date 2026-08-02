@@ -543,7 +543,9 @@ function listen() {
       return;
     }
     if (data.status !== undefined) {  // состояние робота, а не чья-то реплика
-      setStatus(data.status, !/не отвечает|нет /.test(data.status));
+      // Только текст: точка слева показывает связь с rosbridge, и молчащий
+      // микрофон к ней отношения не имеет.
+      elStatus.textContent = data.status;
       return;
     }
 
