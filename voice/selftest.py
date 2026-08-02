@@ -370,6 +370,39 @@ def test_notes() -> None:
     check("пережил перезапуск", Notes(store).items(), ["хлеб"])
 
 
+def test_pc_url() -> None:
+    """Одна настройка на всё: адрес ПК включает и разговор, и распознавание.
+
+    Разнести их по разным строкам легко, а забыть одну — ещё легче, и тогда
+    робот молча продолжит распознавать сам, вчетверо медленнее, а человек
+    будет думать, что ПК подключён.
+    """
+    section("адрес ПК включает и разговор, и распознавание")
+    import os
+
+    было = {k: os.environ.get(k) for k in
+            ("ROBOT_PC_URL", "ROBOT_LOCAL_API_BASE", "ROBOT_STT_URL")}
+    try:
+        os.environ["ROBOT_PC_URL"] = "http://192.168.0.5:4000/"
+        os.environ.pop("ROBOT_LOCAL_API_BASE", None)
+        os.environ.pop("ROBOT_STT_URL", None)
+        cfg = Config()
+        check("разговор", cfg.local_api_base, "http://192.168.0.5:4000")
+        check("распознавание", cfg.stt_url, "http://192.168.0.5:4000/stt")
+        check("без ключа старт разрешён", (cfg.api_key or "") == "" and
+              cfg.check() is None, True)
+
+        # Заданное явно главнее: значит человек знает, зачем разносил.
+        os.environ["ROBOT_STT_URL"] = "http://другой:9000/stt"
+        check("явный адрес не перебивается", Config().stt_url, "http://другой:9000/stt")
+    finally:
+        for k, v in было.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_hidden() -> None:
     """Скрытый от модели инструмент обязан вызываться правилом.
 
@@ -730,7 +763,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_hidden,
+                 test_weather, test_notes, test_pc_url, test_hidden,
                  test_thinkless, test_endpoints, test_history,
                  test_names, test_dialogue):
         test()

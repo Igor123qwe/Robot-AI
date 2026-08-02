@@ -26,7 +26,7 @@ from .config import Config
 from .notes import Notes
 from .ros import Ros
 from .state import State
-from .stt import Recognizer
+from .stt import Recognizer, Remote
 from .tools import CUTOFF_VOLT, Timers, build_tools
 from .tts import SentenceBuffer, Speaker
 
@@ -280,8 +280,9 @@ def main() -> None:
              cfg.model, cfg.api_base or "api.anthropic.com",
              cfg.effort or "не задан", cfg.audio_source, cfg.audio_out)
     if cfg.local_api_base:
-        log.info("основной собеседник — ПК: %s через %s, облако остаётся про запас",
-                 cfg.local_model, cfg.local_api_base)
+        log.info("основной собеседник — ПК: %s через %s, %s",
+                 cfg.local_model, cfg.local_api_base,
+                 "облако остаётся про запас" if cfg.api_key else "облака нет")
     # Часы робота видны сразу: от них зависят будильники, напоминания и тихие
     # часы. На свежем образе время обычно в UTC, и «разбуди в семь» окажется
     # на три часа мимо — а понять это по поведению трудно.
@@ -308,8 +309,18 @@ def main() -> None:
     busy = BusyFlag(ros)
     busy.start()
 
-    recognizer = Recognizer(cfg.whisper_model, cfg.language,
-                            beam_size=cfg.whisper_beam)
+    def local_recognizer() -> Recognizer:
+        return Recognizer(cfg.whisper_model, cfg.language,
+                          beam_size=cfg.whisper_beam)
+
+    if cfg.stt_url:
+        # Модель на роботе при этом не грузится вовсе — поднимется сама, если
+        # ПК замолчит. Это полторы сотни мегабайт памяти и несколько секунд
+        # старта, которые в обычный день не нужны ни разу.
+        log.info("распознавание на ПК: %s", cfg.stt_url)
+        recognizer = Remote(cfg.stt_url, local_recognizer)
+    else:
+        recognizer = local_recognizer()
 
     listener = Listener(
         make_source(cfg.audio_source, cfg.phone_url, cfg.sample_rate,

@@ -1,4 +1,14 @@
-"""Распознавание речи — faster-whisper на CPU RDK X5."""
+"""Распознавание речи.
+
+Двумя способами. Основной — на домашнем ПК: там видеокарта, и та же фраза
+разбирается за доли секунды и самой крупной моделью. Запасной — здесь же, на
+роботе: медленно и самой лёгкой моделью, зато без чужой помощи.
+
+Разница не косметическая. На Cortex-A55 без видеокарты Whisper тратит впятеро
+больше времени, чем длится сама фраза, и вынужденно работает моделью, которая
+половину слов перевирает. Каждая такая ошибка — это ещё один круг «не
+расслышал» и, если фраза дошла до модели, оплаченный запрос впустую.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +18,15 @@ import os
 import time
 
 log = logging.getLogger(__name__)
+
+# Дозвон до ПК — коротко: он или отвечает сразу, или его нет. Само
+# распознавание может занять секунды, поэтому чтение ждём дольше.
+PC_CONNECT = 2.0
+PC_READ = 30.0
+
+# Столько не трогаем ПК после отказа. Иначе каждая фраза будет начинаться с
+# ожидания связи, и выключенный компьютер станет хуже, чем его отсутствие.
+PC_DOWN = 60.0
 
 # Подсказки модели (initial_prompt) здесь НЕТ, и это осознанно. Казалось бы,
 # список доменных слов должен помогать с короткими командами — на деле на
@@ -88,3 +107,55 @@ class Recognizer:
             log.info("whisper: версия без защиты от повторов, работаю без неё")
             stream.seek(0)
             return self.model.transcribe(stream, **common)
+
+
+class Remote:
+    """Распознаёт на домашнем ПК. Не отвечает — переходим на свои силы.
+
+    Местная модель поднимается лениво, при первом же отказе ПК. Грузить её
+    заранее — это полторы сотни мегабайт памяти и несколько секунд старта за
+    то, чем в обычный день не пользуются ни разу.
+    """
+
+    def __init__(self, url: str, make_local) -> None:
+        self.url = url
+        self._make_local = make_local
+        self._local = None
+        self._down_until = 0.0
+        self._said_local = False
+
+    def transcribe(self, wav_bytes: bytes) -> str:
+        if time.monotonic() >= self._down_until:
+            text = self._ask_pc(wav_bytes)
+            if text is not None:
+                return text
+        return self._fallback(wav_bytes)
+
+    def _ask_pc(self, wav_bytes: bytes) -> str | None:
+        import requests
+
+        started = time.monotonic()
+        try:
+            resp = requests.post(
+                self.url, data=wav_bytes,
+                headers={"Content-Type": "audio/wav"},
+                timeout=(PC_CONNECT, PC_READ),
+            )
+            resp.raise_for_status()
+            text = (resp.json().get("text") or "").strip()
+        except Exception as e:
+            self._down_until = time.monotonic() + PC_DOWN
+            log.warning("ПК не распознал (%s) — перехожу на свои силы", e)
+            return None
+        log.info("ПК: %.2f с → %r", time.monotonic() - started, text)
+        self._said_local = False
+        return text
+
+    def _fallback(self, wav_bytes: bytes) -> str:
+        if self._local is None:
+            log.info("поднимаю распознавание на роботе — это займёт время")
+            self._local = self._make_local()
+        if not self._said_local:
+            self._said_local = True
+            log.warning("распознаю сам: медленнее и хуже, чем на ПК")
+        return self._local.transcribe(wav_bytes)

@@ -1,0 +1,607 @@
+"""Мозг робота на домашнем ПК: распознавание речи и разговор.
+
+Зачем это вообще. У RDK X5 нет видеокарты, и не будет: языковую модель он не
+потянет, а Whisper тянет через силу — самую лёгкую версию и втрое медленнее
+звука. Дома при этом стоит компьютер с видеокартой, который включён ровно
+тогда, когда с роботом разговаривают. Пусть считает он.
+
+Что здесь есть:
+
+  POST /v1/messages   разговор. Снаружи выглядит как Anthropic, внутри —
+                      Ollama. Робот из-за этого не меняется ни на строку:
+                      в настройках он просто ходит по другому адресу.
+  POST /stt           звук WAV → текст. Whisper на видеокарте разбирает
+                      двухсекундную фразу примерно за треть секунды вместо
+                      3.7 секунды на роботе, и заметно точнее.
+  GET  /health        что живо: Ollama, модель, Whisper, видеокарта.
+
+Почему не LiteLLM. Он умеет то же самое, но это полтысячи мегабайт
+зависимостей и отдельное окно, которое надо не закрыть. Здесь один файл,
+который держит и разговор, и распознавание, — и на Windows это разница
+между «работает» и «в прошлый раз я что-то забыл запустить».
+
+Запуск:
+    python kuzya_pc.py --model qwen3:4b --whisper small
+
+Робот на своей стороне: ROBOT_PC_URL=http://адрес-этого-ПК:4000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+log = logging.getLogger("кузя-пк")
+
+OLLAMA = "http://127.0.0.1:11434"
+
+# Сколько ждём Ollama. Генерация идёт секунды, а вот дозвон должен быть
+# быстрым: если Ollama не запущена, робот должен узнать об этом сразу и уйти
+# в облако, а не молчать полминуты.
+OLLAMA_CONNECT = 3.0
+OLLAMA_READ = 300.0
+
+
+# --------------------------------------------------------------------------
+# Перевод: язык Anthropic → язык Ollama
+# --------------------------------------------------------------------------
+def _text_of(content) -> str:
+    """Текст из того, что Anthropic кладёт в поле content.
+
+    Там бывает и голая строка, и список блоков — например у результата
+    инструмента. Уронить сервер из-за формы данных нельзя: робот в этот
+    момент ждёт ответа с заглушённым микрофоном.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in content
+        ).strip()
+    return "" if content is None else str(content)
+
+
+def to_ollama_messages(system, messages: list) -> list[dict]:
+    """Переводит переписку в вид, который понимает Ollama.
+
+    Две вещи не совпадают по форме, и обе важны. Первая: системный промпт у
+    Anthropic отдельным полем, у Ollama — первым сообщением. Вторая:
+    результат инструмента у Anthropic лежит внутри сообщения человека, а у
+    Ollama это отдельное сообщение с ролью tool. Если сложить их как есть,
+    модель решит, что человек зачем-то зачитал ей вслух служебный вывод.
+    """
+    out: list[dict] = []
+    text = _text_of(system)
+    if text:
+        out.append({"role": "system", "content": text})
+
+    # Ollama помечает результат именем инструмента, Anthropic — идентификатором
+    # вызова. Связь между ними видна только по переписке, поэтому запоминаем.
+    names: dict[str, str] = {}
+
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content")
+
+        if not isinstance(content, list):
+            out.append({"role": role, "content": _text_of(content)})
+            continue
+
+        said: list[str] = []
+        calls: list[dict] = []
+        results: list[tuple[str, str]] = []
+
+        for b in content:
+            if not isinstance(b, dict):
+                said.append(str(b))
+                continue
+            kind = b.get("type")
+            if kind == "text":
+                said.append(b.get("text", ""))
+            elif kind == "tool_use":
+                names[b.get("id", "")] = b.get("name", "")
+                calls.append({"function": {
+                    "name": b.get("name", ""),
+                    "arguments": b.get("input") or {},
+                }})
+            elif kind == "tool_result":
+                results.append((b.get("tool_use_id", ""),
+                                _text_of(b.get("content"))))
+
+        for call_id, result in results:
+            out.append({
+                "role": "tool",
+                "tool_name": names.get(call_id, ""),
+                "content": result,
+            })
+
+        joined = "\n".join(p for p in said if p).strip()
+        if calls:
+            out.append({"role": "assistant", "content": joined,
+                        "tool_calls": calls})
+        elif joined:
+            out.append({"role": role, "content": joined})
+
+    return out
+
+
+def to_ollama_tools(tools: list | None) -> list[dict]:
+    """Схемы инструментов: у Anthropic плоско, у Ollama обёрнуто в function."""
+    return [{
+        "type": "function",
+        "function": {
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
+        },
+    } for t in (tools or [])]
+
+
+# --------------------------------------------------------------------------
+# Перевод обратно: поток Ollama → события Anthropic
+# --------------------------------------------------------------------------
+def _sse(event: str, data: dict) -> bytes:
+    return (f"event: {event}\n"
+            f"data: {json.dumps(data, ensure_ascii=False)}\n\n").encode("utf-8")
+
+
+class AnthropicStream:
+    """Собирает из ответа Ollama те события, которых ждёт клиент Anthropic.
+
+    Порядок событий жёсткий, и клиент на нарушение отвечает исключением
+    посреди фразы. Текстовый блок открывается на первом же куске текста —
+    заранее нельзя, потому что ответ может начаться сразу с вызова
+    инструмента, и пустой текстовый блок собьёт разбор.
+    """
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.index = 0
+        self.text_open = False
+        self.calls = 0
+
+    def start(self):
+        yield _sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": f"msg_{int(time.time()*1000):x}",
+                "type": "message",
+                "role": "assistant",
+                "model": self.model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        })
+
+    def text(self, chunk: str):
+        if not chunk:
+            return
+        if not self.text_open:
+            self.text_open = True
+            yield _sse("content_block_start", {
+                "type": "content_block_start", "index": self.index,
+                "content_block": {"type": "text", "text": ""},
+            })
+        yield _sse("content_block_delta", {
+            "type": "content_block_delta", "index": self.index,
+            "delta": {"type": "text_delta", "text": chunk},
+        })
+
+    def _close_text(self):
+        if self.text_open:
+            yield _sse("content_block_stop",
+                       {"type": "content_block_stop", "index": self.index})
+            self.text_open = False
+            self.index += 1
+
+    def tool_call(self, name: str, args):
+        """Вызов инструмента. Ollama отдаёт его целиком, поэтому одним куском."""
+        yield from self._close_text()
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {}
+        self.calls += 1
+        yield _sse("content_block_start", {
+            "type": "content_block_start", "index": self.index,
+            "content_block": {
+                "type": "tool_use",
+                "id": f"toolu_{self.index}_{int(time.time()*1000):x}",
+                "name": name,
+                "input": {},
+            },
+        })
+        yield _sse("content_block_delta", {
+            "type": "content_block_delta", "index": self.index,
+            "delta": {"type": "input_json_delta",
+                      "partial_json": json.dumps(args or {}, ensure_ascii=False)},
+        })
+        yield _sse("content_block_stop",
+                   {"type": "content_block_stop", "index": self.index})
+        self.index += 1
+
+    def finish(self, used_in: int, used_out: int, truncated: bool):
+        yield from self._close_text()
+        if self.calls:
+            stop = "tool_use"
+        elif truncated:
+            stop = "max_tokens"
+        else:
+            stop = "end_turn"
+        yield _sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": {"input_tokens": used_in, "output_tokens": used_out},
+        })
+        yield _sse("message_stop", {"type": "message_stop"})
+
+
+# --------------------------------------------------------------------------
+# Ollama
+# --------------------------------------------------------------------------
+class Ollama:
+    def __init__(self, base: str = OLLAMA) -> None:
+        self.base = base.rstrip("/")
+
+    def _post(self, path: str, payload: dict, *, stream: bool):
+        req = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        # Дозвон коротким таймаутом не задать через urlopen — он один на всё.
+        # Читать ответ можно долго, поэтому берём длинный: неотвеченный
+        # дозвон до localhost и так падает мгновенно.
+        return urllib.request.urlopen(req, timeout=OLLAMA_READ if stream else 10)
+
+    def chat(self, model: str, messages: list, tools: list, max_tokens: int):
+        """Поток ответов Ollama, разобранный по строкам."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": {"num_predict": max_tokens},
+        }
+        if tools:
+            payload["tools"] = tools
+        with self._post("/api/chat", payload, stream=True) as resp:
+            for line in resp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    log.warning("Ollama прислала не JSON: %r", line[:200])
+
+    def alive(self) -> bool:
+        try:
+            with urllib.request.urlopen(self.base + "/api/tags", timeout=2) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def models(self) -> list[str]:
+        try:
+            with urllib.request.urlopen(self.base + "/api/tags", timeout=2) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            return [m.get("name", "") for m in data.get("models", [])]
+        except Exception:
+            return []
+
+
+# --------------------------------------------------------------------------
+# Whisper
+# --------------------------------------------------------------------------
+class Whisper:
+    """Распознавание. Модель грузится при первом обращении, а не при старте.
+
+    Так сервер поднимается мгновенно и отвечает на /health даже до того, как
+    видеокарта прогрелась. Первая фраза за это платит несколькими секундами —
+    один раз за запуск.
+    """
+
+    def __init__(self, size: str, language: str = "ru") -> None:
+        self.size = size
+        self.language = language
+        self.device = "не загружена"
+        self._model = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        from faster_whisper import WhisperModel
+
+        # Сначала видеокарта: ради неё всё и затевалось. Если CUDA нет или
+        # библиотеки не встали — честно отступаем на процессор. Даже он на
+        # настольной машине быстрее, чем Cortex-A55 на роботе.
+        for device, compute in (("cuda", "float16"), ("cpu", "int8")):
+            try:
+                model = WhisperModel(self.size, device=device, compute_type=compute)
+            except Exception as e:
+                log.warning("whisper на %s не поднялся (%s)", device, e)
+                continue
+            self.device = device
+            log.info("whisper: модель %s на %s", self.size, device)
+            return model
+        raise RuntimeError("whisper не поднялся ни на видеокарте, ни на процессоре")
+
+    def transcribe(self, wav: bytes) -> str:
+        import io
+
+        with self._lock:
+            # Замок на всё распознавание, а не только на загрузку: одна
+            # видеокарта, и две фразы разом её не поделят. Робот всё равно
+            # говорит по одной.
+            if self._model is None:
+                self._model = self._load()
+            started = time.monotonic()
+            segments, info = self._model.transcribe(
+                io.BytesIO(wav),
+                language=self.language,
+                beam_size=5,          # на видеокарте это ничего не стоит
+                vad_filter=False,     # тишину уже отрезал робот
+                condition_on_previous_text=False,
+                temperature=[0.0, 0.2],
+                no_speech_threshold=0.6,
+                log_prob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+            )
+            parts = [s.text.strip() for s in segments
+                     if getattr(s, "no_speech_prob", 0.0) <= 0.85]
+
+        text = " ".join(p for p in parts if p).strip()
+        spent = time.monotonic() - started
+        length = getattr(info, "duration", 0.0) or 0.0
+        log.info("whisper: %.2f с на %.1f с звука (×%.2f) → %r",
+                 spent, length, spent / length if length else 0, text)
+        return text
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    server_version = "kuzya-pc"
+    protocol_version = "HTTP/1.1"
+
+    # --- вспомогательное ---
+    def _json(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def log_message(self, fmt, *args):
+        # Своё логирование: стандартное пишет в stderr мимо настроек.
+        log.debug("%s %s", self.address_string(), fmt % args)
+
+    # --- маршруты ---
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path in ("/health", "/"):
+            cfg = self.server.cfg
+            models = cfg.ollama.models()
+            self._json(200, {
+                "ollama": bool(models),
+                "модель": cfg.model,
+                "модель_скачана": any(m == cfg.model or m.startswith(cfg.model + ":")
+                                      for m in models),
+                "все_модели": models,
+                "whisper": cfg.whisper.size,
+                "whisper_на": cfg.whisper.device,
+            })
+            return
+        self._json(404, {"error": "нет такого адреса"})
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path.endswith("/v1/messages") or path.endswith("/messages"):
+            self._messages()
+        elif path.endswith("/stt"):
+            self._stt()
+        else:
+            self._json(404, {"error": "нет такого адреса"})
+
+    # --- распознавание ---
+    def _stt(self) -> None:
+        wav = self._body()
+        if not wav:
+            self._json(400, {"error": "пустое тело запроса"})
+            return
+        try:
+            text = self.server.cfg.whisper.transcribe(wav)
+        except Exception as e:
+            log.exception("распознавание не вышло")
+            self._json(500, {"error": str(e)})
+            return
+        self._json(200, {"text": text})
+
+    # --- разговор ---
+    def _messages(self) -> None:
+        cfg = self.server.cfg
+        try:
+            req = json.loads(self._body().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            self._json(400, self._error("invalid_request_error", f"тело не JSON: {e}"))
+            return
+
+        messages = to_ollama_messages(req.get("system"), req.get("messages") or [])
+        tools = to_ollama_tools(req.get("tools"))
+        # Имя модели из настроек робота игнорируем намеренно: там может стоять
+        # облачное, а здесь запускается то, что реально скачано на этом ПК.
+        model = cfg.model
+        limit = int(req.get("max_tokens") or 1024)
+
+        if req.get("stream"):
+            self._stream(model, messages, tools, limit)
+        else:
+            self._whole(model, messages, tools, limit)
+
+    @staticmethod
+    def _error(kind: str, message: str) -> dict:
+        return {"type": "error", "error": {"type": kind, "message": message}}
+
+    def _collect(self, model, messages, tools, limit):
+        """Гоняет Ollama и отдаёт куски: («text», строка) и («call», имя, аргументы)."""
+        used_in = used_out = 0
+        truncated = False
+        for part in self.server.cfg.ollama.chat(model, messages, tools, limit):
+            msg = part.get("message") or {}
+            chunk = msg.get("content") or ""
+            if chunk:
+                yield ("text", chunk, None)
+            for call in msg.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                yield ("call", fn.get("name", ""), fn.get("arguments"))
+            if part.get("done"):
+                used_in = int(part.get("prompt_eval_count") or 0)
+                used_out = int(part.get("eval_count") or 0)
+                truncated = part.get("done_reason") == "length"
+        yield ("done", used_in, (used_out, truncated))
+
+    def _stream(self, model, messages, tools, limit) -> None:
+        out = AnthropicStream(model)
+        started = False
+        try:
+            for kind, a, b in self._collect(model, messages, tools, limit):
+                if not started:
+                    # Заголовки шлём только когда Ollama точно ответила: если
+                    # она молчит, клиент должен увидеть честную ошибку, а не
+                    # успешный ответ, оборванный на первом же байте.
+                    started = True
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self._write(out.start())
+                if kind == "text":
+                    self._write(out.text(a))
+                elif kind == "call":
+                    self._write(out.tool_call(a, b))
+                else:
+                    used_out, truncated = b
+                    self._write(out.finish(a, used_out, truncated))
+        except Exception as e:
+            log.exception("разговор не вышел")
+            if not started:
+                self._json(502, self._error("api_error", f"Ollama: {e}"))
+            # Начали отдавать — заголовки уже ушли, сказать об ошибке нечем.
+            # Просто закрываем: клиент увидит обрыв и уйдёт в облако.
+            self.close_connection = True
+
+    def _write(self, chunks) -> None:
+        for chunk in chunks:
+            self.wfile.write(chunk)
+        self.wfile.flush()
+
+    def _whole(self, model, messages, tools, limit) -> None:
+        """Без потока. Нужен для проверки curl-ом и для простых клиентов."""
+        blocks: list[dict] = []
+        said: list[str] = []
+        used_in = used_out = 0
+        truncated = False
+        try:
+            for kind, a, b in self._collect(model, messages, tools, limit):
+                if kind == "text":
+                    said.append(a)
+                elif kind == "call":
+                    args = b
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except ValueError:
+                            args = {}
+                    blocks.append({"type": "tool_use",
+                                   "id": f"toolu_{len(blocks)}",
+                                   "name": a, "input": args or {}})
+                else:
+                    used_in, (used_out, truncated) = a, b
+        except Exception as e:
+            log.exception("разговор не вышел")
+            self._json(502, self._error("api_error", f"Ollama: {e}"))
+            return
+
+        text = "".join(said).strip()
+        content = ([{"type": "text", "text": text}] if text else []) + blocks
+        self._json(200, {
+            "id": f"msg_{int(time.time()*1000):x}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": "tool_use" if blocks else ("max_tokens" if truncated else "end_turn"),
+            "stop_sequence": None,
+            "usage": {"input_tokens": used_in, "output_tokens": used_out},
+        })
+
+
+class Config:
+    def __init__(self, model: str, whisper: Whisper, ollama: Ollama) -> None:
+        self.model = model
+        self.whisper = whisper
+        self.ollama = ollama
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Мозг робота на домашнем ПК")
+    p.add_argument("--model", default="qwen3:4b",
+                   help="имя модели в Ollama (ollama list покажет скачанные)")
+    p.add_argument("--whisper", default="small",
+                   help="размер модели распознавания: tiny|base|small|medium|large-v3")
+    p.add_argument("--port", type=int, default=4000)
+    p.add_argument("--host", default="0.0.0.0",
+                   help="0.0.0.0 — слышно роботу по сети, 127.0.0.1 — только этой машине")
+    p.add_argument("--ollama", default=OLLAMA)
+    p.add_argument("--debug", action="store_true")
+    args = p.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname).1s %(message)s", datefmt="%H:%M:%S")
+
+    ollama = Ollama(args.ollama)
+    cfg = Config(args.model, Whisper(args.whisper), ollama)
+
+    if not ollama.alive():
+        log.warning("Ollama по адресу %s не отвечает. Запустите её и оставьте "
+                    "висеть в трее — без неё разговаривать не с чем.", args.ollama)
+    else:
+        have = ollama.models()
+        if not any(m == args.model or m.startswith(args.model + ":") for m in have):
+            log.warning("модель %s не скачана. Скачать: ollama pull %s",
+                        args.model, args.model)
+            log.warning("сейчас есть: %s", ", ".join(have) or "ничего")
+
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv.cfg = cfg
+    srv.daemon_threads = True
+    log.info("мозг на %s:%d | модель %s | распознавание %s",
+             args.host, args.port, args.model, args.whisper)
+    log.info("на роботе: ROBOT_PC_URL=http://<адрес этого ПК>:%d", args.port)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        log.info("остановлен")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

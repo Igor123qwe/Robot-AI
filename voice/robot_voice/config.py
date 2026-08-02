@@ -55,14 +55,22 @@ class Config:
     api_base: str = field(default_factory=lambda: _api_base(_env("ROBOT_API_BASE")))
     model: str = field(default_factory=lambda: _env("ROBOT_MODEL", "claude-opus-5"))
 
+    # Адрес домашнего ПК — одной строкой на всё: и разговор, и распознавание.
+    # Пусто — робот работает сам по себе, как раньше.
+    pc_url: str = field(default_factory=lambda: _api_base(_env("ROBOT_PC_URL")))
+
     # Модель на домашнем ПК — основной собеседник, когда он включён. Отвечает
     # за секунду вместо десяти и не стоит денег. Пусто — ходить только в
     # облако. Облако при этом никуда не девается: ПК выключили — разговор
     # продолжается через него, человек этого не замечает.
+    # Отдельная настройка нужна только тем, у кого разговор и распознавание
+    # разнесены по разным машинам; обычно хватает ROBOT_PC_URL.
     local_api_base: str = field(
         default_factory=lambda: _api_base(_env("ROBOT_LOCAL_API_BASE")))
+    # Куда слать звук. Тот же ПК, отдельный адрес нужен так же редко.
+    stt_url: str = field(default_factory=lambda: _env("ROBOT_STT_URL").strip())
     local_model: str = field(
-        default_factory=lambda: _env("ROBOT_LOCAL_MODEL", "ollama/qwen3:4b"))
+        default_factory=lambda: _env("ROBOT_LOCAL_MODEL", "qwen3:4b"))
     # Своя машина в своей сети пароля не спрашивает, но SDK без ключа
     # работать отказывается — поэтому любая непустая строка.
     local_api_key: str = field(
@@ -181,6 +189,13 @@ class Config:
             hour = datetime.now().hour
         # Окно почти всегда переходит через полночь, поэтому две ветки.
         return start <= hour or hour < end if start > end else start <= hour < end
+
+    def __post_init__(self) -> None:
+        # ROBOT_PC_URL — одна ручка на всё. Раздельные настройки нужны редко,
+        # но если их задали явно, они главнее: значит человек знает, зачем.
+        if self.pc_url:
+            self.local_api_base = self.local_api_base or self.pc_url
+            self.stt_url = self.stt_url or self.pc_url + "/stt"
 
     def check(self) -> None:
         # Ключ нужен только если разговаривать больше не с кем. Когда мозг —
