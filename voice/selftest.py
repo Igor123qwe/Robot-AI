@@ -20,14 +20,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# webrtcvad и sounddevice нужны только живому микрофону: на ПК их может не
-# быть, а проверять правила это не мешает.
-for missing in ("webrtcvad", "sounddevice"):
+# Тест должен запускаться чем угодно: и venv-питоном робота, и системным на
+# ноутбуке. Микрофон, звуковая карта и клиент модели ему не нужны — если их
+# нет, подставляем заглушки. Проверяются правила и логика, а не железо.
+_STUBS = {
+    "webrtcvad": lambda: types.SimpleNamespace(
+        Vad=lambda level: types.SimpleNamespace(is_speech=lambda *a: False)),
+    "sounddevice": lambda: types.SimpleNamespace(),
+    "anthropic": lambda: types.SimpleNamespace(
+        Anthropic=lambda **kw: types.SimpleNamespace(**kw),
+        BadRequestError=type("BadRequestError", (Exception,), {})),
+}
+for name, make_stub in _STUBS.items():
     try:
-        __import__(missing)
+        __import__(name)
     except ImportError:
-        sys.modules[missing] = types.SimpleNamespace(
-            Vad=lambda level: types.SimpleNamespace(is_speech=lambda *a: False))
+        sys.modules[name] = make_stub()
 
 from robot_voice import ru, weather, when                      # noqa: E402
 from robot_voice.brain import HISTORY_LIMIT, _trim    # noqa: E402
