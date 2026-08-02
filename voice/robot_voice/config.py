@@ -54,6 +54,19 @@ class Config:
     # понимающего протокол Anthropic (проверяется запросом к /v1/messages).
     api_base: str = field(default_factory=lambda: _api_base(_env("ROBOT_API_BASE")))
     model: str = field(default_factory=lambda: _env("ROBOT_MODEL", "claude-opus-5"))
+
+    # Модель на домашнем ПК — основной собеседник, когда он включён. Отвечает
+    # за секунду вместо десяти и не стоит денег. Пусто — ходить только в
+    # облако. Облако при этом никуда не девается: ПК выключили — разговор
+    # продолжается через него, человек этого не замечает.
+    local_api_base: str = field(
+        default_factory=lambda: _api_base(_env("ROBOT_LOCAL_API_BASE")))
+    local_model: str = field(
+        default_factory=lambda: _env("ROBOT_LOCAL_MODEL", "ollama/qwen3:4b"))
+    # Своя машина в своей сети пароля не спрашивает, но SDK без ключа
+    # работать отказывается — поэтому любая непустая строка.
+    local_api_key: str = field(
+        default_factory=lambda: _env("ROBOT_LOCAL_API_KEY") or "local")
     # low/medium держат ответ быстрым — для разговора это важнее глубины.
     # Пусто — не отправлять вовсе: сторонний роутер может этот параметр не знать.
     effort: str = field(default_factory=lambda: _env("ROBOT_EFFORT", "low"))

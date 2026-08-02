@@ -30,7 +30,8 @@ _STUBS = {
     "sounddevice": lambda: types.SimpleNamespace(),
     "anthropic": lambda: types.SimpleNamespace(
         Anthropic=lambda **kw: types.SimpleNamespace(**kw),
-        BadRequestError=type("BadRequestError", (Exception,), {})),
+        BadRequestError=type("BadRequestError", (Exception,), {}),
+        APIConnectionError=type("APIConnectionError", (Exception,), {})),
 }
 for name, make_stub in _STUBS.items():
     try:
@@ -39,8 +40,8 @@ for name, make_stub in _STUBS.items():
         sys.modules[name] = make_stub()
 
 from robot_voice import ru, weather, when                      # noqa: E402
-from robot_voice.brain import HISTORY_LIMIT, _trim    # noqa: E402
-from robot_voice.config import SYSTEM_PROMPT          # noqa: E402
+from robot_voice.brain import HISTORY_LIMIT, Brain, _trim  # noqa: E402
+from robot_voice.config import SYSTEM_PROMPT, Config   # noqa: E402
 from robot_voice.intents import parse                 # noqa: E402
 from robot_voice.notes import Notes                   # noqa: E402
 from robot_voice.tools import Timers, build_tools     # noqa: E402
@@ -341,6 +342,80 @@ def test_hidden() -> None:
           f"плюс {len(SYSTEM_PROMPT)} символов промпта")
 
 
+def test_endpoints() -> None:
+    """ПК основной, облако запасное: выключенный ПК не должен ломать разговор.
+
+    Это главное свойство схемы «мозг на компьютере». Проверять его руками
+    неудобно — надо выключать ПК, — а сломать легко: достаточно, чтобы
+    исключение поехало не в ту ветку, и робот замолчит навсегда.
+    """
+    section("ПК основной, облако запасное")
+
+    def answer(text: str):
+        """Ответ модели: поток кусков плюс итоговое сообщение."""
+        class Stream:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def __iter__(self):
+                yield types.SimpleNamespace(
+                    type="content_block_delta",
+                    delta=types.SimpleNamespace(type="text_delta", text=text))
+            def get_final_message(self):
+                return types.SimpleNamespace(
+                    content=[types.SimpleNamespace(type="text", text=text)],
+                    stop_reason="end_turn",
+                    usage=types.SimpleNamespace(input_tokens=100, output_tokens=10))
+        return Stream()
+
+    def client(reply: str | None):
+        """None — собеседник не отвечает: ПК выключен, интернета нет."""
+        def stream(**kw):
+            if reply is None:
+                raise _no_connection()
+            return answer(reply)
+        return types.SimpleNamespace(messages=types.SimpleNamespace(stream=stream))
+
+    def brain(pc: str | None, cloud: str | None) -> Brain:
+        cfg = Config()
+        cfg.local_api_base = "http://пк:4000"
+        cfg.api_key = cfg.local_api_key = "x"
+        b = Brain(cfg, [])
+        b.endpoints[0].client = client(pc)
+        b.endpoints[1].client = client(cloud)
+        return b
+
+    b = brain(pc="с ПК", cloud="из облака")
+    check("ПК включён — отвечает он", b.reply("привет", lambda s: None), "с ПК")
+    check("бесплатный ответ в деньги не пишем", (b.total_in, b.total_out), (0, 0))
+
+    b = brain(pc=None, cloud="из облака")
+    check("ПК выключен — отвечает облако",
+          b.reply("привет", lambda s: None), "из облака")
+    check("платный ответ посчитан", b.total_in > 0, True)
+    check("молчащий ПК отложен", b.endpoints[0].down_until > 0, True)
+    # Второй раз к ПК не ходим вовсе — иначе каждая фраза ждала бы связи.
+    check("выключенный ПК больше не дёргаем",
+          [e.name for e in b._live()], [b.endpoints[1].name])
+
+    b = brain(pc=None, cloud=None)
+    try:
+        b.reply("привет", lambda s: None)
+        check("оба молчат — ошибка наверх", "не упало", "APIConnectionError")
+    except Exception as e:
+        check("оба молчат — ошибка наверх", type(e).__name__, "APIConnectionError")
+
+
+def _no_connection() -> Exception:
+    """Обрыв связи так, как его создаёт SDK, а где нельзя — как получится."""
+    import anthropic
+    try:
+        import httpx
+        return anthropic.APIConnectionError(
+            request=httpx.Request("POST", "http://пк:4000/v1/messages"))
+    except Exception:
+        return anthropic.APIConnectionError()
+
+
 def test_history() -> None:
     section("обрезка истории диалога")
 
@@ -519,7 +594,8 @@ def test_dialogue() -> None:
 
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
-                 test_alarms, test_weather, test_notes, test_hidden, test_history,
+                 test_alarms, test_weather, test_notes, test_hidden,
+                 test_endpoints, test_history,
                  test_names, test_dialogue):
         test()
         print("   ...")

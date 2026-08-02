@@ -279,6 +279,9 @@ def main() -> None:
     log.info("модель %s через %s, effort %s, микрофон %s, динамик %s",
              cfg.model, cfg.api_base or "api.anthropic.com",
              cfg.effort or "не задан", cfg.audio_source, cfg.audio_out)
+    if cfg.local_api_base:
+        log.info("основной собеседник — ПК: %s через %s, облако остаётся про запас",
+                 cfg.local_model, cfg.local_api_base)
     # Часы робота видны сразу: от них зависят будильники, напоминания и тихие
     # часы. На свежем образе время обычно в UTC, и «разбуди в семь» окажется
     # на три часа мимо — а понять это по поведению трудно.
