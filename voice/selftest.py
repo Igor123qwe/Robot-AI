@@ -321,6 +321,39 @@ def test_history() -> None:
               True)
 
 
+def test_names() -> None:
+    """Ищет обращения к тому, что забыли импортировать.
+
+    Такое не ловится ни компиляцией, ни остальными проверками: код падает
+    только когда до строки доходит выполнение. Один раз так и вышло —
+    `datetime.now()` в стартовом логе при отсутствующем импорте, сервис
+    поднимался и падал по кругу триста раз.
+
+    Работает на stdlib: symtable знает, какое имя в функции считается
+    глобальным, а какое — локальным.
+    """
+    import builtins
+    import symtable
+
+    section("забытые импорты")
+    here = Path(__file__).resolve().parent
+    for path in sorted((here / "robot_voice").glob("*.py")) + [here / "selftest.py"]:
+        top = symtable.symtable(path.read_text(), str(path), "exec")
+        known = {s.get_name() for s in top.get_symbols()} | set(dir(builtins))
+        missing: list[str] = []
+
+        def walk(table, missing=missing, known=known):
+            for sym in table.get_symbols():
+                if sym.is_global() and sym.get_name() not in known:
+                    missing.append(f"{table.get_name()}: {sym.get_name()}")
+            for child in table.get_children():
+                walk(child)
+
+        for child in top.get_children():
+            walk(child)
+        check(f"{path.name}: всё импортировано", sorted(set(missing)), [])
+
+
 def test_dialogue() -> None:
     """Прогон главного цикла целиком: фразы на входе, реплики на выходе.
 
@@ -411,7 +444,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_weather, test_notes, test_history,
-                 test_dialogue):
+                 test_names, test_dialogue):
         test()
         print("   ...")
     if FAILED:
