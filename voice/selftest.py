@@ -31,7 +31,8 @@ _STUBS = {
     "anthropic": lambda: types.SimpleNamespace(
         Anthropic=lambda **kw: types.SimpleNamespace(**kw),
         BadRequestError=type("BadRequestError", (Exception,), {}),
-        APIConnectionError=type("APIConnectionError", (Exception,), {})),
+        APIConnectionError=type("APIConnectionError", (Exception,), {}),
+        APIStatusError=type("APIStatusError", (Exception,), {})),
 }
 for name, make_stub in _STUBS.items():
     try:
@@ -276,6 +277,65 @@ def test_alarms() -> None:
     check("обычная", (tools["volume"]({"change": "обычная"}), levels[-1])[1], 1.0)
 
 
+def test_survives_restart() -> None:
+    """Таймеры обязаны пережить остановку сервиса.
+
+    Автообновление перезапускает робота при каждой правке, то есть по
+    нескольку раз в день. Раньше обработчик выключения звал cancel_all(),
+    а тот вместе с потоками стирал и файл: таймер на духовку пропадал ровно
+    в том случае, ради которого хранилище и заведено.
+    """
+    section("таймеры переживают выключение")
+    store = Path(tempfile.mkdtemp()) / "timers.json"
+    timers = Timers(announce=lambda text, **kw: None, store=store)
+    timers.add("духовка", 600)
+    timers.add("чай", 300)
+
+    timers.stop()                       # ровно то, что делает обработчик SIGTERM
+    after = Timers(announce=lambda text, **kw: None, store=store)
+    after.restore()
+    check("пережили выключение", sorted(after.remaining()), ["духовка", "чай"])
+
+    # А вот прямая просьба человека снять всё должна стирать и файл.
+    after.cancel_all()
+    fresh = Timers(announce=lambda text, **kw: None, store=store)
+    fresh.restore()
+    check("снятые человеком не воскресают", fresh.remaining(), {})
+
+
+def test_alarm_rules() -> None:
+    """Три случая, в которых будильник вёл себя не так, как сказано вслух."""
+    section("будильник: отмена, «завтра», затирание")
+
+    # 1. «Отмени будильник» ставил новый будильник на то же время: слово
+    #    «будильник» ловилось где угодно, независимо от глагола.
+    for phrase in ["отмени будильник", "отмени будильник на семь",
+                   "убери будильник", "выключи будильник"]:
+        m = parse(phrase)
+        check(f"«{phrase}» снимает", m.tool if m else None, "cancel_timer")
+    check("«разбуди в семь» по-прежнему ставит",
+          parse("разбуди меня в семь утра").tool, "set_alarm")
+    check("перенос отдаём модели", parse("перенеси будильник на восемь"), None)
+
+    # 2. «Завтра» терялось по дороге в инструмент, и напоминание срабатывало
+    #    на сутки раньше — молча.
+    m = parse("напомни завтра в девять полить цветы")
+    at = when.moment(m.args["at"])
+    check("завтра доехало до инструмента",
+          at.date() > datetime.now().date() or at > datetime.now(), True)
+    check("время не потерялось", (at.hour, at.minute), (9, 0))
+
+    # 3. «Будильник через двадцать минут» молча стирал уже стоящий подъём.
+    store = Path(tempfile.mkdtemp()) / "timers.json"
+    timers = Timers(announce=lambda text, **kw: None, store=store)
+    ros = types.SimpleNamespace(voltage=12.4, moving=False, connected=True,
+                                drive=lambda *a, **k: None, stop_motion=lambda: None)
+    tools = {t.name: t for t in build_tools(ros, timers)}
+    tools["set_alarm"]({"at": "7:00"})
+    tools["set_timer"](parse("поставь будильник через двадцать минут").args)
+    check("подъём на семь утра уцелел", len(timers.remaining()), 2)
+
+
 def test_weather() -> None:
     section("погода: разбор ответа open-meteo")
     # Сеть в тесте не поднять, но формулировки проверить надо: именно они
@@ -401,15 +461,17 @@ def test_endpoints() -> None:
                     usage=types.SimpleNamespace(input_tokens=100, output_tokens=10))
         return Stream()
 
-    def client(reply: str | None):
-        """None — собеседник не отвечает: ПК выключен, интернета нет."""
+    def client(reply):
+        """Строка — ответ. None — молчит. Исключение — отвечает, но плохо."""
         def stream(**kw):
             if reply is None:
                 raise _no_connection()
+            if isinstance(reply, Exception):
+                raise reply
             return answer(reply)
         return types.SimpleNamespace(messages=types.SimpleNamespace(stream=stream))
 
-    def brain(pc: str | None, cloud: str | None) -> Brain:
+    def brain(pc, cloud) -> Brain:
         cfg = Config()
         cfg.local_api_base = "http://пк:4000"
         cfg.api_key = cfg.local_api_key = "x"
@@ -431,12 +493,51 @@ def test_endpoints() -> None:
     check("выключенный ПК больше не дёргаем",
           [e.name for e in b._live()], [b.endpoints[1].name])
 
+    # ПК ответил, но плохо: модель не скачана в Ollama (404), сама Ollama не
+    # запущена (500), опечатка в имени модели (400). Раньше ловился только
+    # обрыв связи, и такая ошибка убивала ход целиком — облако не пробовалось
+    # ни разу, и робот отвечал «что-то пошло не так» на каждую фразу.
+    for кто, сбой in (("модель не скачана", _http_error(404)),
+                      ("Ollama не запущена", _http_error(500)),
+                      ("опечатка в имени модели", _http_error(400))):
+        b = brain(pc=сбой, cloud="из облака")
+        check(f"{кто} — отвечает облако",
+              b.reply("привет", lambda s: None), "из облака")
+        check(f"{кто} — ПК отложен", b.endpoints[0].down_until > 0, True)
+
+    # Без облачного ключа облачного собеседника быть не должно: вместо обрыва
+    # связи оттуда прилетит отказ авторизации, и запасного пути не станет.
+    cfg = Config()
+    cfg.local_api_base = "http://пк:4000"
+    cfg.api_key = ""
+    cfg.local_api_key = "x"
+    check("без ключа облака нет", len(Brain(cfg, []).endpoints), 1)
+
     b = brain(pc=None, cloud=None)
     try:
         b.reply("привет", lambda s: None)
         check("оба молчат — ошибка наверх", "не упало", "APIConnectionError")
     except Exception as e:
         check("оба молчат — ошибка наверх", type(e).__name__, "APIConnectionError")
+
+
+def _http_error(code: int) -> Exception:
+    """Ответ с HTTP-кодом так, как его создаёт SDK."""
+    import anthropic
+    kinds = {400: "BadRequestError", 404: "NotFoundError",
+             500: "InternalServerError"}
+    cls = getattr(anthropic, kinds[code], None)
+    if cls is None:                       # заглушка вместо настоящего SDK
+        return anthropic.APIConnectionError()
+    try:
+        import httpx
+        return cls(
+            f"код {code}",
+            response=httpx.Response(
+                code, request=httpx.Request("POST", "http://пк:4000/v1/messages")),
+            body=None)
+    except Exception:
+        return cls.__new__(cls)
 
 
 def _no_connection() -> Exception:
@@ -628,7 +729,8 @@ def test_dialogue() -> None:
 
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
-                 test_alarms, test_weather, test_notes, test_hidden,
+                 test_alarms, test_survives_restart, test_alarm_rules,
+                 test_weather, test_notes, test_hidden,
                  test_thinkless, test_endpoints, test_history,
                  test_names, test_dialogue):
         test()

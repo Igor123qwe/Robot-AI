@@ -183,9 +183,14 @@ class Config:
         return start <= hour or hour < end if start > end else start <= hour < end
 
     def check(self) -> None:
-        if not self.api_key:
+        # Ключ нужен только если разговаривать больше не с кем. Когда мозг —
+        # домашний ПК, облако не обязательно, и требовать ключ бессмысленно:
+        # сервис перезапускается каждые десять секунд, в журнале одна и та же
+        # строка, а робот молчит и не объясняет почему.
+        if not self.api_key and not self.local_api_base:
             raise SystemExit(
-                "не задан ANTHROPIC_API_KEY — заполните ~/.robot-ai.env"
+                "не задан ни ANTHROPIC_API_KEY, ни ROBOT_LOCAL_API_BASE — "
+                "заполните ~/.robot-ai.env"
             )
         if self.audio_source not in ("phone", "local", "browser"):
             raise SystemExit("ROBOT_AUDIO_SOURCE должен быть phone, local или "

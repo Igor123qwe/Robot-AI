@@ -390,12 +390,34 @@ def _relative_minutes(t: str) -> float | None:
     return None
 
 
+def _cancel_alarm(t: str) -> Match | None:
+    """Снять будильник.
+
+    Перенос («перенеси будильник на восемь») правилом не разбираем: там надо
+    снять один и поставить другой, и ошибиться — значит не разбудить.
+    Отдаём модели, она переспросит.
+    """
+    if not re.match(rf"{_PREFIX}{_TIMER_CANCEL}\b", t):
+        return None
+    if not re.search(rf"\b(?:{_ALARM_NOUN}|{_WAKE_ME})", t):
+        return None
+    return Match("cancel_timer", {"label": "будильник"}, "снять будильник")
+
+
 def _alarm(t: str) -> Match | None:
     """Будильник и напоминание: «разбуди в семь», «напомни в восемь позвонить»."""
     is_alarm = re.search(rf"\b{_WAKE_ME}", t) or re.search(rf"\b{_ALARM_NOUN}", t)
     is_remind = re.search(rf"\b{_REMIND}", t)
     if not is_alarm and not is_remind:
         return None
+
+    # «отмени будильник на семь», «перенеси будильник» — это не постановка.
+    # Слово «будильник» ловилось где угодно во фразе, независимо от глагола,
+    # и снятие оборачивалось новым будильником на то же время: человек
+    # просил отменить подъём, а робот его подтверждал.
+    if re.match(rf"{_PREFIX}(?:{_TIMER_CANCEL}|перенес\w+|перевед\w+|"
+                rf"передвинь\w*|измени\w*)\b", t):
+        return _cancel_alarm(t)
 
     minutes = _relative_minutes(t)
     at = None if minutes is not None else when.at_time(t)
@@ -407,14 +429,16 @@ def _alarm(t: str) -> Match | None:
             # «поставь будильник через двадцать минут» — это тот же таймер.
             return Match("set_timer", {"minutes": minutes, "label": "будильник"},
                          "будильник через")
-        return Match("set_alarm", {"at": at.strftime("%H:%M")}, "будильник")
+        # Дата целиком, а не время суток: «завтра» правило уже учло, а по
+        # голому «07:00» инструмент разобрал бы заново и взял сегодняшнее.
+        return Match("set_alarm", {"at": at.isoformat(timespec="minutes")}, "будильник")
 
     text = _reminder_text(t)
     if not text:
         return None      # напомнить-то о чём?
     args = {"text": text}
     if at is not None:
-        args["at"] = at.strftime("%H:%M")
+        args["at"] = at.isoformat(timespec="minutes")
     else:
         args["minutes"] = minutes
     return Match("set_reminder", args, "напоминание")

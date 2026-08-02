@@ -11,11 +11,19 @@ ENVFILE="$HOME/.robot-ai.env"
 # || true обязателен: под set -e пустой grep уронил бы скрипт молча, без
 # понятного сообщения — а именно этот случай и надо объяснить человеку.
 KEY="$(grep -E '^ANTHROPIC_API_KEY=' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
+# Мозг может стоять на домашнем ПК — тогда облако не обязательно и ключ не
+# нужен. Отказывать в установке из-за его отсутствия было бы неправильно.
+PC="$(grep -E '^ROBOT_LOCAL_API_BASE=.+' "$ENVFILE" 2>/dev/null | cut -d= -f2- || true)"
 case "$KEY" in
   ""|"sk-ant-..."|*"..."*)
-    echo "!! в $ENVFILE не задан ANTHROPIC_API_KEY"
-    echo "   заполните и запустите скрипт снова: nano $ENVFILE"
-    exit 1
+    if [ -n "$PC" ]; then
+      echo "-- ANTHROPIC_API_KEY не задан: работаем только через ПК ($PC)."
+      echo "   Выключите ПК — и поговорить будет не с кем; команды продолжат работать."
+    else
+      echo "!! в $ENVFILE не задан ни ANTHROPIC_API_KEY, ни ROBOT_LOCAL_API_BASE"
+      echo "   заполните и запустите скрипт снова: nano $ENVFILE"
+      exit 1
+    fi
     ;;
 esac
 

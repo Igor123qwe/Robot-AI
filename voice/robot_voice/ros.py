@@ -75,8 +75,12 @@ class Ros:
         self._send({"op": "advertise", "topic": CMD_VEL, "type": "geometry_msgs/msg/Twist"})
         self._send({"op": "subscribe", "topic": POWER, "type": "std_msgs/msg/Float32",
                     "throttle_rate": 1000})
-        self._send({"op": "subscribe", "topic": CMD_VEL, "type": "geometry_msgs/msg/Twist",
-                    "throttle_rate": 100})
+        # Без throttle намеренно. Это единственный канал, по которому работает
+        # кнопка СТОП: rosbridge при throttle не ставит сообщения в очередь, а
+        # выбрасывает пришедшие раньше окна, и нули от кнопки терялись целиком
+        # — их перекрывало эхо собственной поездки, идущее каждые 66 мс.
+        # Разбор трёх десятков json в секунду ничего не стоит.
+        self._send({"op": "subscribe", "topic": CMD_VEL, "type": "geometry_msgs/msg/Twist"})
 
     def _on_close(self, ws, *_a) -> None:
         log.warning("rosbridge: соединение закрыто")
@@ -203,6 +207,13 @@ class Ros:
         """
         self.cancel_motion()
         self._motion_cancel.clear()
+        # Предыдущая поездка только что доложила о себе тремя нулями, и по
+        # времени они выглядят как «наши». Если их не забыть, окно в полсекунды
+        # накроет начало новой поездки, и кнопка СТОП в первые полсекунды
+        # молча не сработает — а проверять её будут на одиночной поездке, где
+        # всё хорошо.
+        with self._lock:
+            self._own_zero_at = 0.0
         self._motion = threading.Thread(
             target=self._motion_loop, args=(x, y, wz, duration), daemon=True)
         self._motion.start()

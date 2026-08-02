@@ -278,6 +278,11 @@ function makeJoystick(pad, onMove) {
   };
 
   const release = () => {
+    // Захват снимаем раньше, чем забываем pointerId: иначе отпустить будет
+    // уже нечего, и палец останется «прижатым» к пэду до конца жизни страницы.
+    if (pointerId !== null && pad.hasPointerCapture(pointerId)) {
+      pad.releasePointerCapture(pointerId);
+    }
     pointerId = null;
     place(0, 0);
     onMove(0, 0);
@@ -295,7 +300,14 @@ function makeJoystick(pad, onMove) {
   for (const t of ['pointerup', 'pointercancel', 'pointerleave']) {
     pad.addEventListener(t, ev => { if (ev.pointerId === pointerId) release(); });
   }
+  // Отдаём наружу: аварийный стоп обязан отпустить и сам джойстик. Иначе
+  // палец остаётся на пэде, и первое же его шевеление возвращает команду —
+  // робот поедет снова, хотя человек нажал СТОП.
+  joysticks.push(release);
 }
+
+// Все созданные джойстики — чтобы стоп мог отпустить их разом.
+const joysticks = [];
 
 // Левый: ход во все стороны. Вверх = вперёд (+x), вправо = вправо.
 // В ROS linear.y положительная — влево, поэтому знак инвертируем.
@@ -344,15 +356,26 @@ function setStatus(text, ok) {
 
 function connect() {
   clearTimeout(reconnectTimer);
-  setStatus('подключение к ' + ROSBRIDGE + ' …', false);
+  // Пока не доставлен стоп, шапку не трогаем: переподключение идёт каждые
+  // две секунды и затирало единственное сообщение о том, что робот не
+  // остановлен. Человек видел зелёное «подключено» и был уверен в обратном.
+  if (!stopPending) setStatus('подключение к ' + ROSBRIDGE + ' …', false);
   try { ws = new WebSocket(ROSBRIDGE); }
   catch (e) { scheduleReconnect(); return; }
 
   ws.onopen = () => {
     wsReady = true;
-    setStatus('подключено', true);
     send({ op: 'advertise', topic: '/cmd_vel', type: 'geometry_msgs/msg/Twist' });
     send({ op: 'subscribe', topic: '/PowerVoltage', type: 'std_msgs/msg/Float32', throttle_rate: 1000 });
+    if (stopPending) {
+      // Человек жал СТОП, когда связи не было. Связь появилась — досылаем,
+      // прежде чем сообщать, что всё хорошо.
+      stopPending = false;
+      for (const ms of [0, 60, 120, 180, 240]) setTimeout(sendZero, ms);
+      setStatus('связь вернулась — стоп отправлен', true);
+      return;
+    }
+    setStatus('подключено', true);
   };
 
   ws.onmessage = ev => {
@@ -363,8 +386,14 @@ function connect() {
     }
   };
 
-  ws.onclose = () => { wsReady = false; setStatus('связь потеряна', false); scheduleReconnect(); };
-  ws.onerror = () => { setStatus('ошибка соединения', false); };
+  // Про недоставленный стоп в шапке важнее, чем про состояние связи: связь
+  // человек и так видит по индикатору, а несработавшую кнопку — нет.
+  ws.onclose = () => {
+    wsReady = false;
+    if (!stopPending) setStatus('связь потеряна', false);
+    scheduleReconnect();
+  };
+  ws.onerror = () => { if (!stopPending) setStatus('ошибка соединения', false); };
 }
 
 function scheduleReconnect() {
@@ -404,21 +433,40 @@ function publishCmdVel() {
 
 // Аварийный стоп: работает, даже когда робот едет по голосовой команде и
 // физически не слышит «стоп» — пока говорит, микрофон заглушён.
+// Пока взведён — в шапке висит «СТОП НЕ УШЁЛ», и переподключение не смеет
+// написать поверх бодрое «подключено». Снимается только фактом отправки.
+let stopPending = false;
+
+function sendZero() {
+  send({
+    op: 'publish',
+    topic: '/cmd_vel',
+    msg: { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } },
+  });
+}
+
 function emergencyStop() {
   cmd.x = cmd.y = cmd.wz = 0;
   idleZeros = 0;
+  // Отпускаем и сами джойстики: палец, оставшийся на пэде, вернёт команду
+  // первым же шевелением, и робот поедет снова.
+  for (const release of joysticks) release();
+
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    // Кнопка мигнула, а робот едет дальше — молчать об этом нельзя.
+    // Кнопка мигнула, а робот едет дальше — молчать об этом нельзя. И забыть
+    // тоже нельзя: дошлём, как только связь вернётся.
+    stopPending = true;
     setStatus('СТОП НЕ УШЁЛ — нет связи с роботом', false);
     return;
   }
-  for (let i = 0; i < 5; i++) {
-    send({
-      op: 'publish',
-      topic: '/cmd_vel',
-      msg: { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } },
-    });
-  }
+  stopPending = false;
+
+  // Пять нулей, разложенных по времени. Залпом в один тик их съедала
+  // подписка робота, а эхо собственной поездки идёт каждые 66 мс и держало
+  // окно занятым — кнопка не срабатывала вовсе. Четверти секунды хватает,
+  // чтобы попасть между эхо; дольше растягивать нельзя, иначе заглушим и
+  // новую команду, отданную сразу после стопа.
+  for (const ms of [0, 60, 120, 180, 240]) setTimeout(sendZero, ms);
 }
 
 // ── Батарея ──────────────────────────────────────────────────────────────
@@ -719,11 +767,18 @@ window.addEventListener('keydown', ev => {
   if (ev.code === 'Space') { ev.preventDefault(); emergencyStop(); }
 });
 
-// Отпустили всё при уходе со страницы — робот не должен уехать.
+// Отпустили всё при уходе со страницы — робот не должен уехать. Обнулить
+// команду мало: пока пэд считает палец прижатым, он вернёт её обратно, едва
+// человек вернётся на вкладку и шевельнёт мышью.
+function releaseAll() {
+  for (const release of joysticks) release();
+  cmd.x = cmd.y = cmd.wz = 0;
+  publishCmdVel();
+}
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { cmd.x = cmd.y = cmd.wz = 0; publishCmdVel(); }
+  if (document.hidden) releaseAll();
 });
-window.addEventListener('blur', () => { cmd.x = cmd.y = cmd.wz = 0; publishCmdVel(); });
+window.addEventListener('blur', releaseAll);
 </script>
 </body>
 </html>

@@ -77,3 +77,29 @@ def _next(now: datetime, hour: int, minute: int, text: str) -> datetime:
 
 def minutes_until(when: datetime, now: datetime | None = None) -> float:
     return round(((when or datetime.now()) - (now or datetime.now())).total_seconds() / 60, 3)
+
+
+def moment(text: str, now: datetime | None = None) -> datetime | None:
+    """Момент из строки: сначала как готовая дата, потом как живая фраза.
+
+    Правила уже разобрали фразу целиком и знают точный момент — вместе с
+    «завтра». Но в инструмент едет строка, и раньше там оставалось одно
+    время суток: «напомни завтра в девять» превращалось в «в 9:00», а
+    инструмент разбирал это заново и брал БЛИЖАЙШИЕ девять часов, то есть
+    сегодняшние. Напоминание срабатывало на сутки раньше, молча.
+
+    Поэтому правила отдают дату целиком, а модель по-прежнему говорит
+    по-человечески — принимаем оба вида.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    try:
+        return datetime.fromisoformat(t)
+    except ValueError:
+        pass
+    # Числительные словами — тоже наш случай: модель пишет «семь утра», а
+    # разбор ждёт цифр. Импорт внутри функции, потому что intents сам зовёт
+    # этот модуль, и наверху получилось бы кольцо.
+    from .intents import normalize
+    return at_time(f"в {normalize(t)}", now)

@@ -259,6 +259,7 @@ class Timers:
             return dict(self._messages)
 
     def cancel_all(self) -> None:
+        """Человек попросил снять все таймеры. С диска — тоже."""
         with self._lock:
             for timer, _ in self._items.values():
                 timer.cancel()
@@ -267,6 +268,22 @@ class Timers:
             self._messages.clear()
             self._tries.clear()
             self._save()
+
+    def stop(self) -> None:
+        """Робот выключается. Таймеры при этом снимать НЕЛЬЗЯ.
+
+        Разница с cancel_all принципиальная, и раньше её не было: при
+        остановке звался cancel_all, а он вместе с потоками стирал и файл.
+        Автообновление перезапускает сервис при каждой правке, то есть
+        хранилище обнулялось по нескольку раз в день — и таймер на духовку
+        пропадал ровно в том случае, ради которого файл и заведён.
+
+        Гасить потоки строго говоря незачем, они daemon и умрут сами. Но
+        сделать это явно дешевле, чем однажды заговорить на полуслове.
+        """
+        with self._lock:
+            for timer, _ in self._items.values():
+                timer.cancel()
 
     def _fire(self, label: str) -> None:
         with self._lock:
@@ -472,12 +489,15 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         minutes = max(0.1, min(600.0, float(minutes)))
         label = label.strip() or NO_NAME
         extra = False
-        if label == NO_NAME:
-            # Второй безымянный таймер раньше молча затирал первый: имя одно,
-            # а add() заменяет по имени. Теперь второй зовётся по времени.
+        # Имена, которые робот раздаёт сам, повторяются — и add() заменяет по
+        # имени. Безымянный таймер раньше молча затирал предыдущий безымянный,
+        # а «будильник через двадцать минут» — уже стоящий подъём на семь утра,
+        # подтвердив вслух оба. Разводим имена, как это делает set_alarm.
+        if label in (NO_NAME, ALARM):
             taken = {**timers.remaining(), **timers.paused()}
-            if label in taken:
-                label = _free_label(ru.duration(minutes * 60), taken)
+            if _key(label) in {_key(name) for name in taken}:
+                base = ALARM if label == ALARM else ru.duration(minutes * 60)
+                label = _free_label(base, taken)
                 extra = True
         timers.add(label, minutes * 60)
         log.info("таймер %r на %.1f мин", label, minutes)
@@ -488,7 +508,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
     def set_alarm(at: str, label: str = "") -> str:
         """Будильник на конкретное время: «в семь утра», «на 7:30»."""
-        target = when.at_time(f"в {at.strip()}")
+        target = when.moment(at)
         if target is None:
             return f"Не понял время {at!r}. Скажи, например, в семь утра."
         minutes = when.minutes_until(target)
@@ -506,7 +526,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if not text:
             return "О чём напомнить?"
         if at.strip():
-            target = when.at_time(f"в {at.strip()}")
+            target = when.moment(at)
             if target is None:
                 return f"Не понял время {at!r}."
             minutes = when.minutes_until(target)

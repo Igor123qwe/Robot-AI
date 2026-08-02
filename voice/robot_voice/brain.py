@@ -53,14 +53,19 @@ CONNECT_SECONDS = 2.0
 DOWN_SECONDS = 60.0
 
 
-def _timeout(connect: float | None):
+# Сколько ждём соединения с облаком. Больше, чем до ПК: интернет через
+# двойной NAT отзывается не мгновенно. Но не двадцать пять: одним числом
+# httpx задаёт ВСЕ таймауты сразу, включая дозвон, а с max_retries=1 это
+# давало до пятидесяти секунд молчания при пропавшем интернете.
+CLOUD_CONNECT_SECONDS = 5.0
+
+
+def _timeout(connect: float):
     """Таймаут запроса: связь коротко, чтение долго.
 
     Без httpx (так бывает в самопроверке, где клиент модели подменён
     заглушкой) отдаём одно число — SDK его тоже понимает.
     """
-    if connect is None:
-        return TIMEOUT_SECONDS
     try:
         import httpx
     except ImportError:
@@ -169,12 +174,21 @@ class Brain:
                 paid=False,
                 use_cache=False,
             ))
-        self.endpoints.append(Endpoint(
-            name=cfg.api_base or "api.anthropic.com",
-            client=self._client(cfg.api_key, cfg.api_base, None),
-            model=cfg.model,
-            effort=cfg.effort,
-        ))
+        if cfg.api_key:
+            self.endpoints.append(Endpoint(
+                name=cfg.api_base or "api.anthropic.com",
+                client=self._client(cfg.api_key, cfg.api_base,
+                                    CLOUD_CONNECT_SECONDS),
+                model=cfg.model,
+                effort=cfg.effort,
+            ))
+        elif not self.endpoints:
+            raise SystemExit("Не задан ни ANTHROPIC_API_KEY, ни ROBOT_LOCAL_API_BASE "
+                             "— разговаривать не с кем.")
+        else:
+            # Без ключа облачный собеседник не запасной, а мина: вместо
+            # обрыва связи прилетит отказ авторизации на каждой фразе.
+            log.info("облачного ключа нет — работаю только через ПК")
 
         self.history: list[dict] = []
         # Расход с момента запуска — чтобы видеть цену вопроса, а не гадать.
@@ -282,7 +296,14 @@ class Brain:
         for ep in self._live():
             try:
                 return ep, self._ask(ep, messages, watch)
-            except anthropic.APIConnectionError as e:
+            # Две сестринские ветки, и нужны обе. APIConnectionError — ПК
+            # выключен или сети нет. APIStatusError — ответил, но плохо:
+            # модель не скачана в Ollama (404), Ollama не запущена (500),
+            # опечатка в имени модели (400). Раньше ловилась только первая,
+            # и вторая убивала ход целиком: облако не пробовалось ни разу,
+            # ПК не откладывался, и робот отвечал «что-то пошло не так» на
+            # каждую фразу при полностью живом облаке.
+            except (anthropic.APIConnectionError, anthropic.APIStatusError) as e:
                 failure = e
                 if said:
                     # Часть ответа уже прозвучала вслух. Начинать заново
