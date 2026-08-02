@@ -680,6 +680,69 @@ def test_endpoints() -> None:
         check("оба молчат — ошибка наверх", type(e).__name__, "APIConnectionError")
 
 
+def test_brain_money() -> None:
+    """Три места, где мозг терял деньги или делал работу дважды."""
+    section("мозг: история, кэш, молчание")
+    import anthropic
+    from robot_voice.brain import Endpoint
+
+    # 1. Сбой посреди хода с инструментами. Инструмент уже сработал
+    #    по-настоящему, и если ход не попал в историю, человек повторит
+    #    просьбу — и будильник поставится второй раз.
+    cfg = Config()
+    cfg.api_key = "x"
+    cfg.local_api_base = ""
+    сделано: list[str] = []
+    b = Brain(cfg, [])
+    b.tools = {"set_alarm": lambda args: (сделано.append("будильник"),
+                                          "Разбужу в семь.")[1]}
+
+    круги = iter([
+        types.SimpleNamespace(
+            content=[types.SimpleNamespace(type="tool_use", id="t1",
+                                           name="set_alarm", input={})],
+            stop_reason="tool_use", usage=None),
+    ])
+
+    def сбой(messages, on_text):
+        try:
+            return b.endpoints[0], next(круги)
+        except StopIteration:
+            raise _no_connection()
+
+    b._round = сбой
+    try:
+        b.reply("разбуди в семь", lambda s: None)
+    except Exception:
+        pass
+    check("инструмент сработал один раз", сделано, ["будильник"])
+    check("ход попал в историю, несмотря на сбой",
+          any(m.get("role") == "assistant" for m in b.history), True)
+
+    # 2. Кэш промпта выключался на ЛЮБУЮ четырёхсотую и навсегда: полторы
+    #    тысячи токенов начинали оплачиваться целиком в каждой реплике.
+    ep = Endpoint(name="тест", client=None, model="м", effort="low")
+    check("посторонняя ошибка кэш не трогает",
+          (Brain._degrade(ep, Exception("prompt is too long")), ep.use_cache),
+          (False, True))
+    check("отказ именно от кэша — отступаем",
+          (Brain._degrade(ep, Exception("cache_control not supported")),
+           ep.use_cache), (True, False))
+    check("отказ от effort — убираем",
+          (Brain._degrade(ep, Exception("unknown field output_config")), ep.effort),
+          (True, ""))
+
+    # 3. Отказ модели робот проглатывал молча: строка возвращалась, но никто
+    #    её не озвучивал.
+    сказано: list[str] = []
+    b2 = Brain(cfg, [])
+    b2._round = lambda messages, on_text: (
+        b2.endpoints[0],
+        types.SimpleNamespace(content=[], stop_reason="refusal", usage=None))
+    b2.reply("что-то нехорошее", сказано.append)
+    check("на отказ робот говорит вслух", "".join(сказано).startswith("Извини"), True)
+
+
 def _http_error(code: int) -> Exception:
     """Ответ с HTTP-кодом так, как его создаёт SDK."""
     import anthropic
@@ -892,7 +955,8 @@ def main() -> int:
                  test_weather, test_notes, test_stop_while_thinking,
                  test_speech_streams,
                  test_pc_url, test_hidden,
-                 test_thinkless, test_endpoints, test_history,
+                 test_thinkless, test_endpoints, test_brain_money,
+                 test_history,
                  test_names, test_dialogue):
         test()
         print("   ...")

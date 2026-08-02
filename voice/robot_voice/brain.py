@@ -166,7 +166,7 @@ class Brain:
             self.endpoints.append(Endpoint(
                 name=f"ПК ({cfg.local_api_base})",
                 client=self._client(cfg.local_api_key, cfg.local_api_base,
-                                    CONNECT_SECONDS),
+                                    CONNECT_SECONDS, retries=0),
                 model=cfg.local_model,
                 # Маленькая модель этого параметра не знает, и слать его
                 # незачем: первый же запрос уйдёт в отказ и потеряет секунду.
@@ -199,12 +199,16 @@ class Brain:
         self.last_talk = 0.0
 
     @staticmethod
-    def _client(key: str, base: str, connect: float | None):
+    def _client(key: str, base: str, connect: float, retries: int = 1):
         args = {
             "api_key": key,
             "timeout": _timeout(connect),
-            # Две попытки: сетевой сбой бывает, но ждать третью робот не может.
-            "max_retries": 1,
+            # Облаку — две попытки: сетевой сбой бывает, но ждать третью робот
+            # не может. Домашнему ПК — одна: за ним стоит облако, ради
+            # которого вся конструкция и написана, а повтор к выключенной
+            # машине стоил лишние две секунды плюс пауза на каждой первой
+            # фразе минуты.
+            "max_retries": retries,
         }
         if base:
             args["base_url"] = base
@@ -245,7 +249,8 @@ class Brain:
             }]
         return params
 
-    def _degrade(self, ep: Endpoint, error: Exception) -> bool:
+    @staticmethod
+    def _degrade(ep: Endpoint, error: Exception) -> bool:
         """Отключает необязательный параметр, который не понял собеседник.
 
         Ни сторонний роутер, ни модель на ПК могут не знать ни кэширования,
@@ -253,13 +258,21 @@ class Brain:
         а он запрос не делает — HTTP уходит только при входе в with. Поэтому
         отступление не срабатывало никогда, и робот отвечал «что-то пошло не
         так» на каждый разговорный вопрос до конца жизни процесса.
+
+        Причину смотрим обязательно. Раньше гасилось на ЛЮБУЮ четырёхсотую —
+        а её даёт и слишком длинный контекст, и испорченная история. Кэш при
+        этом выключался навсегда, до перезапуска процесса: полторы тысячи
+        токенов постоянной части начинали оплачиваться целиком в каждой
+        реплике вместо десяти процентов. Плюс терялся effort, то есть ответы
+        становились медленнее — ровно там, где важнее всего скорость.
         """
-        if ep.use_cache:
+        text = str(error).lower()
+        if ep.use_cache and ("cache" in text or "ephemeral" in text):
             log.warning("%s: кэширование промпта не принято (%s) — работаю без него",
                         ep.name, error)
             ep.use_cache = False
             return True
-        if ep.effort:
+        if ep.effort and ("effort" in text or "output_config" in text):
             log.warning("%s: параметр effort не принят (%s) — убираю", ep.name, error)
             ep.effort = ""
             return True
@@ -332,82 +345,106 @@ class Brain:
 
         rounds = 0
         answered: Endpoint | None = None
-        for rounds in range(1, MAX_TOOL_ROUNDS + 1):
-            answered, message = self._round(messages, collect)
+        try:
+            for rounds in range(1, MAX_TOOL_ROUNDS + 1):
+                answered, message = self._round(messages, collect)
 
-            usage = getattr(message, "usage", None)
-            if usage is not None:
-                used_in += getattr(usage, "input_tokens", 0) or 0
-                used_out += getattr(usage, "output_tokens", 0) or 0
-                cached += getattr(usage, "cache_read_input_tokens", 0) or 0
-                # Запись в кэш тоже оплачивается и в input_tokens не попадает:
-                # без неё счётчик врал в меньшую сторону каждый раз, когда
-                # промпт клался в кэш заново.
-                written += getattr(usage, "cache_creation_input_tokens", 0) or 0
+                usage = getattr(message, "usage", None)
+                if usage is not None:
+                    used_in += getattr(usage, "input_tokens", 0) or 0
+                    used_out += getattr(usage, "output_tokens", 0) or 0
+                    cached += getattr(usage, "cache_read_input_tokens", 0) or 0
+                    # Запись в кэш тоже оплачивается и в input_tokens не
+                    # попадает: без неё счётчик врал в меньшую сторону каждый
+                    # раз, когда промпт клался в кэш заново.
+                    written += getattr(usage, "cache_creation_input_tokens", 0) or 0
 
-            if message.stop_reason == "max_tokens":
-                truncated = True
-                log.warning("ответ обрезан по лимиту в %d токенов", self.cfg.max_tokens)
+                if message.stop_reason == "max_tokens":
+                    truncated = True
+                    log.warning("ответ обрезан по лимиту в %d токенов",
+                                self.cfg.max_tokens)
 
-            if message.stop_reason == "refusal":
-                log.warning("модель отказалась отвечать: %s",
-                            getattr(message, "stop_details", None))
-                return "Извини, на это я ответить не могу."
+                if message.stop_reason == "refusal":
+                    log.warning("модель отказалась отвечать: %s",
+                                getattr(message, "stop_details", None))
+                    # Именно через collect: возвращаемое значение никто не
+                    # озвучивает, и раньше робот на отказ просто молчал —
+                    # человек не понимал, услышали его вообще или нет.
+                    collect("Извини, на это я ответить не могу.")
+                    break
 
-            messages.append({"role": "assistant", "content": message.content})
+                messages.append({"role": "assistant", "content": message.content})
 
-            calls = [b for b in message.content if b.type == "tool_use"]
-            if not calls:
-                break
+                calls = [b for b in message.content if b.type == "tool_use"]
+                if not calls:
+                    break
 
-            results = []
-            for call in calls:
-                tool = self.tools.get(call.name)
-                if tool is None:
-                    log.warning("модель зовёт несуществующий инструмент %s", call.name)
-                    output = f"Инструмента {call.name} не существует."
-                else:
-                    log.info("вызываю %s(%s)", call.name, call.input)
-                    output = tool(call.input or {})
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": call.id,
-                    "content": output,
-                })
-            # Все результаты — одним сообщением, иначе модель разучится
-            # вызывать инструменты пачкой.
-            messages.append({"role": "user", "content": results})
-        else:
-            log.warning("исчерпан лимит вызовов инструментов за один ход (%d)", rounds)
+                results = []
+                for call in calls:
+                    tool = self.tools.get(call.name)
+                    if tool is None:
+                        log.warning("модель зовёт несуществующий инструмент %s",
+                                    call.name)
+                        output = f"Инструмента {call.name} не существует."
+                    else:
+                        log.info("вызываю %s(%s)", call.name, call.input)
+                        output = tool(call.input or {})
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": output,
+                    })
+                # Все результаты — одним сообщением, иначе модель разучится
+                # вызывать инструменты пачкой.
+                messages.append({"role": "user", "content": results})
+            else:
+                log.warning("исчерпан лимит вызовов инструментов за один ход (%d)",
+                            rounds)
+                if not spoken:
+                    # Шесть оплаченных кругов и ни слова вслух — худший из
+                    # исходов: человек не понимает, услышали его или нет.
+                    # Седьмой запрос делать не станем: это ещё круг с самой
+                    # длинной историей ровно там, где всё уже пошло не так.
+                    collect("Что-то я запутался, скажи иначе.")
 
-        # Придержанный хвост тегом так и не стал — договариваем его.
-        thinkless.close()
+            if truncated:
+                # Иначе робот замолкает на полуслове, и понять почему нельзя:
+                # человек думает, что он отвлёкся, и повторяет вопрос.
+                collect(" Дальше не помещаюсь, спроси покороче.")
+        finally:
+            # Всё, что ниже, должно случиться и после сбоя.
+            #
+            # История — потому что инструменты первых кругов уже выполнились
+            # по-настоящему: будильник поставлен, робот поехал, пункт записан.
+            # Раньше при обрыве это в историю не попадало, человек слышал
+            # «сейчас я без интернета», повторял просьбу — и действие
+            # делалось дважды.
+            #
+            # Расход — потому что потраченные круги оплачены независимо от
+            # того, чем ход кончился, и счётчик, который их теряет, врёт.
+            self.history = _trim(messages)
+            thinkless.close()
 
-        if answered is not None:
-            answered.spent_in += used_in + written
-            answered.spent_out += used_out
-            # В общий счёт идёт только платное. Иначе цифра «всего за сеанс»
-            # перестанет означать деньги, а ради неё она и заведена.
-            if answered.paid:
-                self.total_in += used_in + written
-                self.total_out += used_out
-        details = []
-        if cached:
-            details.append(f"из кэша {cached}")
-        if written:
-            details.append(f"в кэш {written}")
-        log.info("отвечал %s | токены: %d вход + %d выход%s | платных за сеанс %d + %d",
-                 answered.name if answered else "никто",
-                 used_in + written, used_out,
-                 f" ({', '.join(details)})" if details else "",
-                 self.total_in, self.total_out)
+            if answered is not None:
+                answered.spent_in += used_in + written
+                answered.spent_out += used_out
+                # В общий счёт идёт только платное. Иначе цифра «всего за
+                # сеанс» перестанет означать деньги, а ради неё она и заведена.
+                if answered.paid:
+                    self.total_in += used_in + written
+                    self.total_out += used_out
+            details = []
+            if cached:
+                details.append(f"из кэша {cached}")
+            if written:
+                details.append(f"в кэш {written}")
+            log.info("отвечал %s | токены: %d вход + %d выход%s | "
+                     "платных за сеанс %d + %d",
+                     answered.name if answered else "никто",
+                     used_in + written, used_out,
+                     f" ({', '.join(details)})" if details else "",
+                     self.total_in, self.total_out)
 
-        if truncated:
-            # Иначе робот замолкает на полуслове, и понять почему нельзя:
-            # человек думает, что он отвлёкся, и повторяет вопрос.
-            collect(" Дальше не помещаюсь, спроси покороче.")
-
-        self.history = _trim(messages)
         return "".join(spoken).strip()
 
     def reset(self) -> None:

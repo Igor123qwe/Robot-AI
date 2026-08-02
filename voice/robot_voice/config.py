@@ -78,7 +78,12 @@ class Config:
     # low/medium держат ответ быстрым — для разговора это важнее глубины.
     # Пусто — не отправлять вовсе: сторонний роутер может этот параметр не знать.
     effort: str = field(default_factory=lambda: _env("ROBOT_EFFORT", "low"))
-    max_tokens: int = field(default_factory=lambda: int(_num("ROBOT_MAX_TOKENS", 2048)))
+    # Не «длина ответа»: у claude-opus-5 размышления включены по умолчанию и
+    # входят в этот же лимит. Две тысячи выглядели щедро для одной-двух фраз,
+    # а на деле это весь бюджет размышления — и он выбирался, после чего робот
+    # обрывал обычный короткий ответ словами «дальше не помещаюсь». За
+    # неиспользованные токены не платят, запас бесплатный.
+    max_tokens: int = field(default_factory=lambda: int(_num("ROBOT_MAX_TOKENS", 8000)))
 
     # --- аудио ---
     # phone — Android с IP Webcam, local — микрофон в RDK X5,
