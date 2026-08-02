@@ -46,6 +46,7 @@ from robot_voice.config import SYSTEM_PROMPT, Config   # noqa: E402
 from robot_voice.intents import parse                 # noqa: E402
 from robot_voice.notes import Notes                   # noqa: E402
 from robot_voice.tools import Timers, build_tools     # noqa: E402
+from robot_voice.tts import PhraseCache, WebSpeech    # noqa: E402
 
 FAILED: list[str] = []
 
@@ -368,6 +369,65 @@ def test_notes() -> None:
     check("убрали", notes.remove("МОЛОКО"), "молоко")
     check("чужого нет", notes.remove("сыр"), None)
     check("пережил перезапуск", Notes(store).items(), ["хлеб"])
+
+
+def test_speech_streams() -> None:
+    """Первое предложение уходит в пульт, пока модель ещё договаривает.
+
+    Раньше реплика копилась целиком и синтез начинался только после
+    последнего слова: вся потоковая машинерия не давала ничего, а две-три
+    секунды синтеза честно ждали своей очереди за десятью секундами
+    генерации. Проверяется тем, что клип приходит ДО close().
+    """
+    section("речь идёт параллельно с генерацией")
+    import http.server
+    import threading as th
+
+    got: list[bytes] = []
+    first = th.Event()
+
+    class Catch(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            got.append(self.rfile.read(n))
+            first.set()
+            body = b'{"listeners": 1}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Catch)
+    th.Thread(target=srv.serve_forever, daemon=True).start()
+    endpoint = f"http://127.0.0.1:{srv.server_address[1]}/speak"
+
+    folder = Path(tempfile.mkdtemp())
+    cache = PhraseCache(folder, "тест")
+    # Кладём звук заранее — тогда piper не понадобится, и проверка поедет
+    # где угодно, хоть на сборщике без синтеза.
+    тишина = b"\x00\x00" * 2205          # 0.1 с при 22050 Гц
+    cache.put("Раз.", тишина)
+    cache.put("Два.", тишина)
+
+    speech = WebSpeech(["не-запускается"], 22050, endpoint, 1.0, cache=cache)
+    try:
+        speech.feed("Раз.")
+        check("первое предложение ушло, не дожидаясь конца",
+              first.wait(timeout=10), True)
+        speech.feed("Два.")
+        check("обе реплики доехали", (speech.close(), len(got)), (1, 2))
+        check("это WAV", got[0][:4], b"RIFF")
+
+        # Кэш переживает перезапуск — иначе он бесполезен: робот
+        # перезапускается при каждой правке.
+        check("кэш на диске", PhraseCache(folder, "тест").get("Раз."), тишина)
+        check("чужой голос не подходит",
+              PhraseCache(folder, "другой").get("Раз."), None)
+    finally:
+        srv.shutdown()
 
 
 def test_pc_url() -> None:
@@ -763,7 +823,8 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_pc_url, test_hidden,
+                 test_weather, test_notes, test_speech_streams,
+                 test_pc_url, test_hidden,
                  test_thinkless, test_endpoints, test_history,
                  test_names, test_dialogue):
         test()

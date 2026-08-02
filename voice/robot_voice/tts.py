@@ -8,16 +8,25 @@
             браузер с открытым пультом. Временно, пока своего динамика нет:
             IP Webcam умеет отдавать звук, но не принимать.
 
-В режиме browser синтез идёт целиком на реплику, а не по предложениям: иначе
-Piper пришлось бы поднимать на каждую фразу. Ответы у нас в одно-два
-предложения, так что задержка невелика.
+В режиме browser реплика синтезируется по предложениям и уходит в пульт по
+мере готовности. Раньше она копилась целиком и синтез начинался только после
+последнего слова модели — то есть вся потоковая машинерия не давала ничего, а
+две-три секунды синтеза честно ждали своей очереди за десятью секундами
+генерации. Пульт умеет очередь клипов, сервер хранит последние двенадцать.
+
+Плата за это — Piper поднимается чаще. Поэтому здесь же кэш готовых фраз:
+правила отвечают одними и теми же словами («Не расслышал.», «Остановился.»,
+«Да?»), и синтезировать их заново каждый раз — это полторы секунды на пустом
+месте, причём в самых частых ответах.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
+import queue
 import re
 import shutil
 import subprocess
@@ -55,6 +64,69 @@ def scale(raw: bytes, volume: float) -> bytes:
     volume = max(0.0, min(1.0, volume))
     samples = np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2")
     return (samples * volume).astype("<i2").tobytes()
+
+
+class PhraseCache:
+    """Готовый звук для фраз, которые робот говорит снова и снова.
+
+    Правила отвечают фиксированными словами: «Да?», «Не расслышал.»,
+    «Остановился.», рассказ про умения. Синтезировать их заново каждый раз —
+    это порядка секунды на самом частом ответе, и платится она там, где текст
+    был известен ещё до того, как человек договорил.
+
+    Кэш дисковый, потому что робот перезапускается каждые две минуты, если в
+    репозитории что-то поменялось, — память такого не переживает.
+    """
+
+    LIMIT = 200
+
+    def __init__(self, folder: Path, voice: str) -> None:
+        self.folder = folder
+        self.voice = voice
+        self._lock = threading.Lock()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.warning("кэш фраз недоступен (%s) — буду синтезировать каждый раз", e)
+            self.folder = None
+
+    def _path(self, text: str) -> Path | None:
+        if self.folder is None:
+            return None
+        key = hashlib.sha1(f"{self.voice}\n{text}".encode("utf-8")).hexdigest()[:16]
+        return self.folder / f"{key}.raw"
+
+    def get(self, text: str) -> bytes | None:
+        path = self._path(text)
+        if path is None:
+            return None
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    def put(self, text: str, raw: bytes) -> None:
+        path = self._path(text)
+        # Длинные ответы модели не повторяются, и складывать их — только
+        # засорять диск. Кэш имеет смысл ровно для коротких заготовок.
+        if path is None or not raw or len(text) > 120:
+            return
+        with self._lock:
+            try:
+                tmp = path.with_suffix(".tmp")
+                tmp.write_bytes(raw)
+                tmp.replace(path)
+                self._trim()
+            except OSError as e:
+                log.debug("не смог сохранить фразу в кэш: %s", e)
+
+    def _trim(self) -> None:
+        files = sorted(self.folder.glob("*.raw"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-self.LIMIT]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
 
 class Speech:
@@ -141,50 +213,103 @@ class Speech:
 
 
 class WebSpeech:
-    """Одна реплика робота в браузер: копим текст, в конце шлём готовый WAV."""
+    """Реплика робота в браузер: каждое предложение уходит, как только готово.
+
+    Синтез идёт в своём потоке — иначе он вставал бы поперёк чтения ответа
+    модели, и выигрыша от потоковости не было бы вовсе.
+    """
 
     def __init__(self, piper_cmd: list[str], sample_rate: int, endpoint: str,
-                 volume: float = 1.0) -> None:
+                 volume: float = 1.0, cache: "PhraseCache | None" = None) -> None:
         self.piper_cmd = piper_cmd
         self.sample_rate = sample_rate
         self.endpoint = endpoint
         self.volume = volume
-        self._sentences: list[str] = []
+        self.cache = cache
 
+        self._queue: queue.Queue = queue.Queue()
+        self._worker: threading.Thread | None = None
+        self._said: list[str] = []
+        self._listeners = 0
+        self._cancelled = False
+        # До какого момента звук будет играть в браузере. Клипы встают в
+        # очередь вкладки друг за другом, поэтому срок наращиваем, а не
+        # пересчитываем: иначе микрофон включится посреди второй фразы.
+        self._until = 0.0
+
+    # --- со стороны разговора --------------------------------------------
     def feed(self, sentence: str) -> None:
         sentence = sentence.strip()
-        if sentence:
-            self._sentences.append(sentence)
+        if not sentence or self._cancelled:
+            return
+        self._said.append(sentence)
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._run, daemon=True)
+            self._worker.start()
+        self._queue.put(sentence)
+
+    def cancel(self) -> None:
+        """«Замолчи»: не синтезировать то, что ещё не ушло."""
+        self._cancelled = True
 
     def close(self) -> int:
-        """Возвращает, сколько вкладок реально проиграют реплику."""
-        if not self._sentences:
-            return 0
-        text = " ".join(self._sentences)
-        self._sentences = []
-        try:
-            wav = self._synthesize(text)
-        except (OSError, subprocess.SubprocessError):
-            log.exception("piper не смог синтезировать реплику")
-            return 0
+        """Ждёт, пока всё сказанное действительно отзвучит.
 
-        listeners = self._post(wav, text)
-        if not listeners:
+        Возвращает, сколько вкладок реально проиграли реплику.
+        """
+        if self._worker is None:
             return 0
+        self._queue.put(None)
+        # Синтез длинной реплики небыстрый, но вечно ждать нельзя: всё это
+        # время робот глухой.
+        self._worker.join(timeout=120)
 
-        # Ждём, пока реплика действительно отзвучит. Иначе микрофон включится
-        # раньше динамика, и робот услышит сам себя: на живом роботе это дало
-        # «Водои и триданцы, точка муфе» вместо «Батарея двенадцать вольт».
-        # Аппаратного эхоподавления нет, так что полагаемся на длительность.
-        seconds = max(0.0, (len(wav) - 44) / 2 / self.sample_rate)
-        time.sleep(seconds + BROWSER_LAG)
-        return listeners
+        if self._listeners and not self._cancelled:
+            # Ждём конца звучания. Иначе микрофон включится раньше динамика, и
+            # робот услышит сам себя: на живом роботе это дало «Водои и
+            # триданцы, точка муфе» вместо «Батарея двенадцать вольт».
+            # Аппаратного эхоподавления нет, полагаемся на длительность.
+            left = self._until + BROWSER_LAG - time.monotonic()
+            if left > 0:
+                time.sleep(left)
+        return self._listeners
+
+    # --- со стороны синтеза ----------------------------------------------
+    def _run(self) -> None:
+        while True:
+            sentence = self._queue.get()
+            if sentence is None:
+                return
+            if self._cancelled:
+                continue
+            try:
+                wav = self._synthesize(sentence)
+            except (OSError, subprocess.SubprocessError):
+                log.exception("piper не смог синтезировать %r", sentence)
+                continue
+            if self._cancelled:
+                continue
+            heard = self._post(wav, sentence)
+            if heard:
+                self._listeners = max(self._listeners, heard)
+                seconds = max(0.0, (len(wav) - 44) / 2 / self.sample_rate)
+                # Клип встаёт в хвост очереди вкладки: если предыдущий ещё
+                # играет, этот начнётся после него.
+                self._until = max(self._until, time.monotonic()) + seconds
 
     def _synthesize(self, text: str) -> bytes:
-        raw = subprocess.run(
-            self.piper_cmd, input=text.encode(), stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, timeout=120, check=True,
-        ).stdout
+        raw = None
+        if self.cache is not None:
+            raw = self.cache.get(text)
+        if raw is None:
+            raw = subprocess.run(
+                self.piper_cmd, input=text.encode(), stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=120, check=True,
+            ).stdout
+            if self.cache is not None:
+                # В кэш кладём звук полной громкости: тише сделаем на выходе,
+                # иначе ночная громкость завела бы вторую копию каждой фразы.
+                self.cache.put(text, raw)
         raw = scale(raw, self.volume)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
@@ -224,10 +349,15 @@ class WebSpeech:
 class Speaker:
     def __init__(self, model_path: Path, *, audio_out: str = "local",
                  web_endpoint: str = "http://127.0.0.1:8000/speak",
-                 volume: float = 1.0) -> None:
+                 volume: float = 1.0, cache_dir: Path | None = None) -> None:
         self.model_path = model_path
         self.audio_out = audio_out
         self.web_endpoint = web_endpoint
+        self.cache = (PhraseCache(cache_dir, model_path.name)
+                      if cache_dir is not None else None)
+        # Что произносится прямо сейчас — чтобы «замолчи» успело перехватить
+        # то, что ещё не ушло в пульт.
+        self._current: WebSpeech | None = None
         self.enabled = True
         self.sample_rate = 22050
         # Громкость 0.1–1.0. Меняется голосом и на ночь.
@@ -283,6 +413,11 @@ class Speaker:
         self.last_said = ""
         if self.audio_out != "browser":
             return
+        # Сначала своё: реплика синтезируется по предложениям, и часть их ещё
+        # не ушла. Без этого пульт бросит очередь, а мы тут же дошлём хвост.
+        current = self._current
+        if current is not None:
+            current.cancel()
         req = urllib.request.Request(self.web_endpoint + "/stop", data=b"",
                                      method="POST")
         try:
@@ -300,7 +435,10 @@ class Speaker:
             return None
         volume = 1.0 if loud else self.effective_volume()
         if self.audio_out == "browser":
-            return WebSpeech(self._cmd(), self.sample_rate, self.web_endpoint, volume)
+            speech = WebSpeech(self._cmd(), self.sample_rate, self.web_endpoint,
+                               volume, cache=self.cache)
+            self._current = speech
+            return speech
         try:
             return Speech(self._cmd(), self.sample_rate, volume)
         except OSError:
