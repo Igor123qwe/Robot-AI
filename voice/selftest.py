@@ -505,6 +505,75 @@ def test_speakable() -> None:
           "Сейчас 19:12 — время ужина")
 
 
+def test_remote_voice() -> None:
+    """Голос берём с ПК, но немым от его выключения не становимся.
+
+    Синтез уехал на ПК ради двух вещей: там silero вместо piper — с
+    ударениями, омографами и вопросительной интонацией, — и там он считается
+    в разы быстрее, чем на Cortex-A55 робота. Но ПК выключают, и тогда робот
+    обязан договорить своим голосом, а не замолчать посреди фразы.
+    """
+    section("голос с ПК и отступление на свой")
+    import http.server
+    import io
+    import threading as thr
+    import wave
+
+    from robot_voice.tts import RemoteVoice, _as_wav
+
+    просили: list[dict] = []
+
+    class Ответчик(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(
+                int(self.headers.get("Content-Length") or 0)))
+            просили.append(body)
+            if body.get("text") == "молчу":
+                self.send_response(500)
+                self.end_headers()
+                return
+            wav = _as_wav(b"\x00\x01" * 240, 24000)
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(wav)))
+            self.end_headers()
+            self.wfile.write(wav)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Ответчик)
+    thr.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        store = Path(tempfile.mkdtemp())
+        voice = RemoteVoice(url, "eugene", PhraseCache(store, "пк"))
+        pcm = voice.raw("Привет!")
+        check("звук пришёл", len(pcm), 480)
+        check("частота с ПК", voice.rate, 24000)
+        check("голос попросили", просили[-1], {"text": "Привет!", "voice": "eugene"})
+
+        # Второй раз ту же фразу у ПК не спрашиваем: она уже на диске.
+        было = len(просили)
+        check("из кэша", voice.raw("Привет!"), pcm)
+        check("ПК не тревожили", len(просили), было)
+
+        # ПК ответил отказом — робот отступает и час туда не ходит, иначе
+        # каждая фраза начиналась бы с ожидания мёртвого сервера.
+        check("отказ — говорим сами", voice.raw("молчу"), None)
+        check("и больше не стучимся", voice.alive(), False)
+
+        # Выключенный ПК — то же самое, но без ответа вовсе.
+        мёртвый = RemoteVoice("http://127.0.0.1:1", "eugene")
+        check("выключенный ПК", мёртвый.raw("Привет!"), None)
+
+        # Заголовок, который мы шлём пульту, должен быть настоящим wav.
+        with wave.open(io.BytesIO(_as_wav(pcm, voice.rate))) as w:
+            check("пульту уходит верная частота", w.getframerate(), 24000)
+    finally:
+        srv.shutdown()
+
+
 def test_unsure_does_not_drive() -> None:
     """Неуверенно расслышанная фраза не должна двигать робота.
 
@@ -1277,7 +1346,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_made_up, test_speakable,
+                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,

@@ -312,7 +312,8 @@ def main() -> None:
     speaker = Speaker(cfg.piper_model_path,
                       audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint,
                       volume=float(state.get("volume", cfg.volume)),
-                      cache_dir=cfg.data_dir / "фразы")
+                      cache_dir=cfg.data_dir / "фразы",
+                      pc_url=cfg.tts_url, pc_voice=cfg.pc_voice)
     speaker.on_volume = lambda level: state.set("volume", level)
     speaker.quiet_now = cfg.is_quiet_now
     speaker.quiet_volume = cfg.quiet_volume

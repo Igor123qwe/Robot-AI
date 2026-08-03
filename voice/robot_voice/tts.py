@@ -140,6 +140,69 @@ class PhraseCache:
                 pass
 
 
+PC_CONNECT = 2.0
+PC_READ = 20.0
+PC_DOWN = 60.0
+
+
+class RemoteVoice:
+    """Голос, который синтезирует домашний ПК.
+
+    Piper на роботе крутится на Cortex-A55: каждая фраза сначала считается, и
+    только потом звучит. Голос при этом ровный, как у диктора вокзала, — точку
+    от вопроса не отличить.
+
+    На ПК стоит silero: ударения расставляет сам, различает омографы и
+    поднимает интонацию на вопросе. Считает быстрее реального времени.
+
+    Отступление обязательно. ПК выключают, и робот от этого не должен неметь:
+    не ответил — переходим на свой piper и час туда не ходим. Ровно так же
+    устроено распознавание, и по той же причине.
+    """
+
+    RATE = 24000
+
+    def __init__(self, base: str, speaker: str = "",
+                 cache: "PhraseCache | None" = None) -> None:
+        self.base = base.rstrip("/")
+        self.speaker = speaker
+        self.cache = cache
+        self.rate = self.RATE
+        self._down_until = 0.0
+
+    def alive(self) -> bool:
+        return time.monotonic() >= self._down_until
+
+    def raw(self, text: str) -> bytes | None:
+        """Сырой звук фразы. None — ПК не смог, говорим сами."""
+        if not self.alive():
+            return None
+        if self.cache is not None:
+            got = self.cache.get(text)
+            if got is not None:
+                return got
+        body = json.dumps({"text": text, "voice": self.speaker},
+                          ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            self.base + "/tts", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        started = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=PC_READ) as resp:
+                wav = resp.read()
+            with wave.open(io.BytesIO(wav)) as w:
+                self.rate = w.getframerate()
+                pcm = w.readframes(w.getnframes())
+        except (urllib.error.URLError, OSError, wave.Error, EOFError) as e:
+            self._down_until = time.monotonic() + PC_DOWN
+            log.warning("ПК не озвучил (%s) — говорю своим голосом", e)
+            return None
+        log.debug("ПК озвучил за %.2f с: %r", time.monotonic() - started, text[:60])
+        if self.cache is not None:
+            self.cache.put(text, pcm)
+        return pcm
+
+
 class Speech:
     """Одна реплика робота в динамик. Предложения докидываются по мере генерации."""
 
@@ -223,6 +286,84 @@ class Speech:
         return 1
 
 
+class RemoteSpeech:
+    """Реплика в свой динамик, но синтезированная на ПК.
+
+    Отличие от Speech только в источнике звука: там piper пишет в трубу сам,
+    здесь готовые куски приходят по сети и мы кладём их в aplay. Синтез идёт в
+    своём потоке — иначе он встал бы поперёк чтения ответа модели.
+
+    Если ПК замолчал посреди реплики, доканчиваем своим piper: человек услышит
+    смену голоса, но это несравнимо лучше оборванной на полуслове фразы.
+    """
+
+    def __init__(self, remote: RemoteVoice, fallback_cmd: list[str],
+                 volume: float = 1.0) -> None:
+        self.remote = remote
+        self.fallback_cmd = fallback_cmd
+        self.volume = volume
+        self._aplay = subprocess.Popen(
+            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1",
+             "-r", str(remote.rate), "-"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._queue: queue.Queue = queue.Queue()
+        self._cancelled = False
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def feed(self, sentence: str) -> None:
+        sentence = speakable(sentence)
+        if sentence and not self._cancelled:
+            self._queue.put(sentence)
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _run(self) -> None:
+        while True:
+            sentence = self._queue.get()
+            if sentence is None:
+                break
+            if self._cancelled:
+                continue
+            pcm = self.remote.raw(sentence)
+            if pcm is None:
+                pcm = self._own(sentence)
+            if not pcm or self._cancelled:
+                continue
+            try:
+                self._aplay.stdin.write(scale(pcm, self.volume))
+                self._aplay.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError) as e:
+                log.warning("звук до динамика не дошёл: %s", e)
+                break
+        try:
+            self._aplay.stdin.close()
+        except OSError:
+            pass
+
+    def _own(self, sentence: str) -> bytes:
+        """Запасной синтез своим piper, когда ПК недоступен."""
+        try:
+            return subprocess.run(
+                self.fallback_cmd, input=sentence.encode(), stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=120, check=True).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("и свой piper не смог (%s)", e)
+            return b""
+
+    def close(self) -> int:
+        self._queue.put(None)
+        self._worker.join(timeout=120)
+        try:
+            self._aplay.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            log.warning("aplay завис — убиваю")
+            self._aplay.kill()
+            self._aplay.wait(timeout=5)
+        return 1
+
+
 class WebSpeech:
     """Реплика робота в браузер: каждое предложение уходит, как только готово.
 
@@ -231,12 +372,15 @@ class WebSpeech:
     """
 
     def __init__(self, piper_cmd: list[str], sample_rate: int, endpoint: str,
-                 volume: float = 1.0, cache: "PhraseCache | None" = None) -> None:
+                 volume: float = 1.0, cache: "PhraseCache | None" = None,
+                 remote: "RemoteVoice | None" = None) -> None:
         self.piper_cmd = piper_cmd
         self.sample_rate = sample_rate
         self.endpoint = endpoint
         self.volume = volume
         self.cache = cache
+        # Голос с ПК, если он там поднят. Свой piper остаётся запасным.
+        self.remote = remote
 
         self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -294,21 +438,26 @@ class WebSpeech:
             if self._cancelled:
                 continue
             try:
-                wav = self._synthesize(sentence)
+                raw, rate = self._synthesize(sentence)
             except (OSError, subprocess.SubprocessError):
                 log.exception("piper не смог синтезировать %r", sentence)
                 continue
             if self._cancelled:
                 continue
-            heard = self._post(wav, sentence)
+            heard = self._post(_as_wav(raw, rate), sentence)
             if heard:
                 self._listeners = max(self._listeners, heard)
-                seconds = max(0.0, (len(wav) - 44) / 2 / self.sample_rate)
+                seconds = max(0.0, len(raw) / 2 / rate)
                 # Клип встаёт в хвост очереди вкладки: если предыдущий ещё
                 # играет, этот начнётся после него.
                 self._until = max(self._until, time.monotonic()) + seconds
 
-    def _synthesize(self, text: str) -> bytes:
+    def _synthesize(self, text: str) -> tuple[bytes, int]:
+        """Звук фразы и его частота. Сначала ПК, потом свой piper."""
+        if self.remote is not None:
+            pcm = self.remote.raw(text)
+            if pcm is not None:
+                return scale(pcm, self.volume), self.remote.rate
         raw = None
         if self.cache is not None:
             raw = self.cache.get(text)
@@ -321,14 +470,7 @@ class WebSpeech:
                 # В кэш кладём звук полной громкости: тише сделаем на выходе,
                 # иначе ночная громкость завела бы вторую копию каждой фразы.
                 self.cache.put(text, raw)
-        raw = scale(raw, self.volume)
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(self.sample_rate)
-            w.writeframes(raw)
-        return buf.getvalue()
+        return scale(raw, self.volume), self.sample_rate
 
     def _post(self, wav: bytes, text: str) -> int:
         """Отдаёт реплику пульту. Возвращает число слушающих вкладок."""
@@ -360,12 +502,22 @@ class WebSpeech:
 class Speaker:
     def __init__(self, model_path: Path, *, audio_out: str = "local",
                  web_endpoint: str = "http://127.0.0.1:8000/speak",
-                 volume: float = 1.0, cache_dir: Path | None = None) -> None:
+                 volume: float = 1.0, cache_dir: Path | None = None,
+                 pc_url: str = "", pc_voice: str = "") -> None:
         self.model_path = model_path
         self.audio_out = audio_out
         self.web_endpoint = web_endpoint
         self.cache = (PhraseCache(cache_dir, model_path.name)
                       if cache_dir is not None else None)
+        # Голос с ПК. Кэш у него свой: частота и тембр другие, и путать их
+        # звуком от piper нельзя — робот заговорил бы чужим голосом на удвоенной
+        # скорости.
+        self.remote = None
+        if pc_url:
+            self.remote = RemoteVoice(
+                pc_url, pc_voice,
+                PhraseCache(cache_dir, f"пк-{pc_voice or 'голос'}")
+                if cache_dir is not None else None)
         # Что произносится прямо сейчас — чтобы «замолчи» успело перехватить
         # то, что ещё не ушло в пульт.
         self._current: WebSpeech | None = None
@@ -447,10 +599,12 @@ class Speaker:
         volume = 1.0 if loud else self.effective_volume()
         if self.audio_out == "browser":
             speech = WebSpeech(self._cmd(), self.sample_rate, self.web_endpoint,
-                               volume, cache=self.cache)
+                               volume, cache=self.cache, remote=self.remote)
             self._current = speech
             return speech
         try:
+            if self.remote is not None and self.remote.alive():
+                return RemoteSpeech(self.remote, self._cmd(), volume)
             return Speech(self._cmd(), self.sample_rate, volume)
         except OSError:
             log.exception("не смог запустить piper/aplay")
@@ -484,6 +638,16 @@ def _find_piper() -> str | None:
     if local.exists():
         return str(local)
     return shutil.which("piper")
+
+
+def _as_wav(raw: bytes, rate: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(raw)
+    return buf.getvalue()
 
 
 def split_sentences(text: str) -> list[str]:

@@ -264,6 +264,71 @@ def test_whisper_fallback() -> None:
         pass
 
 
+def test_tts() -> None:
+    """Голос с ПК: wav наружу, а отсутствие голоса — честная ошибка.
+
+    Робот на ошибку отвечает переходом на свой piper, поэтому врать здесь
+    нельзя: молчаливый успех обернулся бы немым роботом.
+    """
+    section("голос на ПК")
+    import json
+    import urllib.error
+    import urllib.request
+
+    from kuzya_pc import _wav
+
+    # Заголовок wav собираем сами, без внешних библиотек, — проверим, что его
+    # понимает стандартный разбор. Робот читает ответ именно им.
+    import io
+    import wave
+    with wave.open(io.BytesIO(_wav(b"\x00\x01" * 100, 24000))) as w:
+        check("частота в заголовке", w.getframerate(), 24000)
+        check("моно", w.getnchannels(), 1)
+        check("два байта на отсчёт", w.getsampwidth(), 2)
+        check("длина звука", w.getnframes(), 100)
+
+    class FakeVoice:
+        ready = True
+
+        def say(self, text, speaker=""):
+            self.said = (text, speaker)
+            return _wav(b"\x00\x01" * 240, 24000)
+
+    fake = FakeOllama([])
+    srv, url = serve(fake)
+    voice = FakeVoice()
+    srv.cfg.voice = voice
+    try:
+        def ask(payload):
+            req = urllib.request.Request(
+                url + "/tts", data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"})
+            return urllib.request.urlopen(req, timeout=10)
+
+        with ask({"text": "Привет!", "voice": "baya"}) as resp:
+            body = resp.read()
+            check("отдали звук", resp.headers.get("Content-Type"), "audio/wav")
+        check("это настоящий wav", body[:4] + body[8:12], b"RIFFWAVE")
+        check("фраза и голос доехали", voice.said, ("Привет!", "baya"))
+
+        for пустое in ({"text": "   "}, {}):
+            try:
+                ask(пустое)
+                check("пустую фразу не синтезируем", "промолчал", "ошибка 400")
+            except urllib.error.HTTPError as e:
+                check("пустую фразу не синтезируем", e.code, 400)
+
+        # Голоса нет вовсе — робот должен узнать об этом, а не ждать молча.
+        srv.cfg.voice = None
+        try:
+            ask({"text": "Привет!"})
+            check("без голоса честная ошибка", "промолчал", "ошибка 503")
+        except urllib.error.HTTPError as e:
+            check("без голоса честная ошибка", e.code, 503)
+    finally:
+        srv.shutdown()
+
+
 def test_warming() -> None:
     """Пока модель едет в видеопамять, мост отвечает сам — и бесплатно.
 
@@ -526,7 +591,7 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_warming, test_think_switch,
+    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_warming, test_think_switch,
                  test_tool_call, test_broken,
                  test_unthink, test_stt_confidence, test_health):
         test()

@@ -13,7 +13,10 @@
   POST /stt           звук WAV → текст. Whisper на видеокарте разбирает
                       двухсекундную фразу примерно за треть секунды вместо
                       3.7 секунды на роботе, и заметно точнее.
-  GET  /health        что живо: Ollama, модель, Whisper, видеокарта.
+  POST /tts           текст → звук WAV. Silero вместо piper: сам ставит
+                      ударения, различает омографы и поднимает интонацию на
+                      вопросе. Робот говорит голосом, а не диктором вокзала.
+  GET  /health        что живо: Ollama, модель, Whisper, голос, видеокарта.
 
 Почему не LiteLLM. Он умеет то же самое, но это полтысячи мегабайт
 зависимостей и отдельное окно, которое надо не закрыть. Здесь один файл,
@@ -93,6 +96,11 @@ WARMING_REPLY = "Секунду, я ещё просыпаюсь."
 # глохнуть из-за чужого сайта.
 DEFAULT_WHISPER = "dvislobokov/faster-whisper-large-v3-turbo-russian"
 FALLBACK_WHISPER = "medium"
+
+# Голос. Пятая версия русской модели silero: сама ставит ударения, различает
+# омографы и поднимает интонацию на вопросе. Сто сорок мегабайт, считает на
+# процессоре быстрее реального времени.
+SILERO = "https://models.silero.ai/models/tts/ru/v5_5_ru.pt"
 
 
 # --------------------------------------------------------------------------
@@ -738,6 +746,103 @@ class Whisper:
 
 
 # --------------------------------------------------------------------------
+# Голос
+# --------------------------------------------------------------------------
+class Voice:
+    """Синтез речи на ПК.
+
+    На роботе стоит piper, и по-своему он хорош: работает без интернета и
+    почти ничего не весит. Но крутится он на Cortex-A55, то есть каждая фраза
+    сначала считается, и только потом звучит. И голос у него ровный, как у
+    диктора вокзала: точку от вопроса не отличить.
+
+    Здесь — silero. Русская модель, сто сорок мегабайт, считает на процессоре
+    быстрее реального времени. Сама расставляет ударения, различает омографы
+    («зАмок» и «замОк») и — главное для живой речи — поднимает интонацию на
+    вопросе. Робот наконец звучит как собеседник, а не как автоответчик.
+
+    Видеопамять не трогаем намеренно: там уже сидят модель разговора и
+    распознавание, и на шестигигабайтной карте свободного места нет. Процессор
+    в это время всё равно простаивает.
+    """
+
+    # Голоса модели. Первый — по умолчанию: мужской, спокойный, ровный.
+    VOICES = ("eugene", "aidar", "baya", "kseniya", "xenia")
+    RATE = 24000
+
+    def __init__(self, url: str = SILERO, speaker: str = "eugene") -> None:
+        self.url = url
+        self.speaker = speaker if speaker in self.VOICES else self.VOICES[0]
+        self._model = None
+        self._lock = threading.Lock()
+        self.ready = False
+
+    def _load(self):
+        import torch
+
+        # Пакет качаем сами, а не через torch.hub: тот тянет весь репозиторий
+        # с гитхаба, а нам нужен один файл. Кладём рядом с моделями Whisper.
+        where = Path(os.environ.get("HF_HOME", Path.home() / ".cache"))
+        where.mkdir(parents=True, exist_ok=True)
+        package = where / self.url.rsplit("/", 1)[-1]
+        if not package.exists():
+            log.info("качаю голос %s", package.name)
+            torch.hub.download_url_to_file(self.url, str(package))
+        model = torch.package.PackageImporter(
+            str(package)).load_pickle("tts_models", "model")
+        # На процессоре намеренно: см. описание класса. Потоков даём немного —
+        # синтез и так быстрее реального времени, а лишние только мешают
+        # распознаванию, которое живёт в этом же процессе.
+        model.to(torch.device("cpu"))
+        torch.set_num_threads(max(2, (os.cpu_count() or 4) // 2))
+        return model
+
+    def warm(self) -> None:
+        started = time.monotonic()
+        with self._lock:
+            if self._model is None:
+                try:
+                    self._model = self._load()
+                except Exception as e:
+                    log.warning("голос не поднялся (%s) — робот будет говорить "
+                                "своим piper", e)
+                    return
+        self.ready = True
+        log.info("голос %s готов, прогрев занял %.0f с",
+                 self.speaker, time.monotonic() - started)
+
+    def say(self, text: str, speaker: str = "") -> bytes:
+        """Синтезирует фразу и отдаёт её готовым wav-файлом."""
+        import numpy as np
+
+        with self._lock:
+            if self._model is None:
+                self._model = self._load()
+                self.ready = True
+            started = time.monotonic()
+            who = speaker if speaker in self.VOICES else self.speaker
+            audio = self._model.apply_tts(text=text, speaker=who,
+                                          sample_rate=self.RATE)
+
+        raw = (np.asarray(audio, dtype="float32").clip(-1.0, 1.0) * 32767
+               ).astype("<i2").tobytes()
+        spent = time.monotonic() - started
+        length = len(raw) / 2 / self.RATE
+        log.info("голос: %.2f с на %.1f с речи (×%.2f) → %r",
+                 spent, length, spent / length if length else 0, text[:60])
+        return _wav(raw, self.RATE)
+
+
+def _wav(raw: bytes, rate: int) -> bytes:
+    """Оборачивает сырой звук в wav-заголовок. Без внешних библиотек."""
+    import struct
+
+    header = b"RIFF" + struct.pack("<I", 36 + len(raw)) + b"WAVEfmt "
+    header += struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+    return header + b"data" + struct.pack("<I", len(raw)) + raw
+
+
+# --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -775,6 +880,9 @@ class Handler(BaseHTTPRequestHandler):
                 "все_модели": models,
                 "whisper": cfg.whisper.size,
                 "whisper_на": cfg.whisper.device,
+                # Робот спрашивает это при старте: есть голос на ПК или
+                # говорить своим piper.
+                "голос": getattr(getattr(cfg, "voice", None), "ready", False),
             })
             return
         self._json(404, {"error": "нет такого адреса"})
@@ -785,8 +893,43 @@ class Handler(BaseHTTPRequestHandler):
             self._messages()
         elif path.endswith("/stt"):
             self._stt()
+        elif path.endswith("/tts"):
+            self._tts()
         else:
             self._json(404, {"error": "нет такого адреса"})
+
+    # --- голос ---
+    def _tts(self) -> None:
+        voice = getattr(self.server.cfg, "voice", None)
+        if voice is None:
+            self._json(503, {"error": "голос на этом ПК не поднят"})
+            return
+        try:
+            req = json.loads(self._body().decode("utf-8"))
+            text = (req.get("text") or "").strip()
+        except (ValueError, UnicodeDecodeError) as e:
+            self._json(400, {"error": f"тело не JSON: {e}"})
+            return
+        if not text:
+            self._json(400, {"error": "пустая фраза"})
+            return
+        try:
+            wav = voice.say(text, req.get("voice") or "")
+        except Exception as e:
+            # Робот на это отвечает переходом на свой piper — то есть говорить
+            # он не перестанет, просто прежним голосом.
+            log.exception("синтез не вышел")
+            self._json(500, {"error": str(e)})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav)))
+        self.end_headers()
+        try:
+            self.wfile.write(wav)
+        except (ConnectionError, BrokenPipeError):
+            log.info("робот отключился, не дослушав")
+            self.close_connection = True
 
     # --- распознавание ---
     def _stt(self) -> None:
@@ -1036,10 +1179,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Config:
-    def __init__(self, model: str, whisper: Whisper, ollama: Ollama) -> None:
+    def __init__(self, model: str, whisper: Whisper, ollama: Ollama,
+                 voice: Voice | None = None) -> None:
         self.model = model
         self.whisper = whisper
         self.ollama = ollama
+        self.voice = voice
 
 
 def main() -> int:
@@ -1056,6 +1201,9 @@ def main() -> int:
     p.add_argument("--think", action="store_true",
                    help="разрешить модели размышлять вслух: точнее с "
                         "инструментами, но ответ идёт в разы дольше")
+    p.add_argument("--voice", default=Voice.VOICES[0],
+                   help="голос синтеза: " + "|".join(Voice.VOICES) +
+                        " либо «нет», чтобы робот говорил своим piper")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
@@ -1071,7 +1219,8 @@ def main() -> int:
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
     ollama = Ollama(args.ollama, think=args.think)
-    cfg = Config(args.model, Whisper(args.whisper), ollama)
+    cfg = Config(args.model, Whisper(args.whisper), ollama,
+                 None if args.voice == "нет" else Voice(speaker=args.voice))
 
     if not ollama.alive():
         log.warning("Ollama по адресу %s не отвечает. Запустите её и оставьте "
@@ -1086,9 +1235,10 @@ def main() -> int:
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.cfg = cfg
     srv.daemon_threads = True
-    log.info("мозг на %s:%d | модель %s | распознавание %s | сборка %s",
-             args.host, args.port, args.model,
-             args.whisper.rsplit("/", 1)[-1], _build())
+    log.info("мозг на %s:%d | модель %s | распознавание %s | голос %s | "
+             "сборка %s", args.host, args.port, args.model,
+             args.whisper.rsplit("/", 1)[-1],
+             args.voice if cfg.voice is not None else "робота", _build())
     log.info("на роботе: ROBOT_PC_URL=http://<адрес этого ПК>:%d", args.port)
 
     # Прогрев в своём потоке: сервер должен отвечать на /health сразу, а вот
@@ -1110,7 +1260,11 @@ def main() -> int:
         ollama.ready = True
         log.info("прогрет и готов — можно говорить")
 
-    for job in (warm_whisper, warm_model):
+    def warm_voice() -> None:
+        if cfg.voice is not None:
+            cfg.voice.warm()
+
+    for job in (warm_whisper, warm_model, warm_voice):
         threading.Thread(target=job, daemon=True).start()
     try:
         srv.serve_forever()

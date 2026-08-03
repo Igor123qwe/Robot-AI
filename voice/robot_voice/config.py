@@ -69,6 +69,10 @@ class Config:
         default_factory=lambda: _api_base(_env("ROBOT_LOCAL_API_BASE")))
     # Куда слать звук. Тот же ПК, отдельный адрес нужен так же редко.
     stt_url: str = field(default_factory=lambda: _env("ROBOT_STT_URL").strip())
+    # Синтез речи на ПК. Пусто — говорим своим piper. Голос выбирается там же
+    # на ПК; здесь можно попросить другой из тех, что у него есть.
+    tts_url: str = field(default_factory=lambda: _env("ROBOT_TTS_URL").strip())
+    pc_voice: str = field(default_factory=lambda: _env("ROBOT_PC_VOICE").strip())
     local_model: str = field(
         default_factory=lambda: _env("ROBOT_LOCAL_MODEL", "qwen3:4b"))
     # Своя машина в своей сети пароля не спрашивает, но SDK без ключа
@@ -201,6 +205,7 @@ class Config:
         if self.pc_url:
             self.local_api_base = self.local_api_base or self.pc_url
             self.stt_url = self.stt_url or self.pc_url + "/stt"
+            self.tts_url = self.tts_url or self.pc_url
 
     def check(self) -> None:
         # Ключ нужен только если разговаривать больше не с кем. Когда мозг —
