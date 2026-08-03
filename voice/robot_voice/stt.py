@@ -41,6 +41,26 @@ def _threads() -> int:
     return max(1, min(6, (os.cpu_count() or 2) - 1))
 
 
+# Заученные выдумки. Whisper учили на субтитрах с ютуба, и на тишине или шуме
+# он выдаёт оттуда самые частые концовки роликов. На живом роботе за один
+# вечер пришли «Спасибо за внимание!», «С вами был Игорь Негода» и
+# «Продолжение следует…» — робот отвечал на них вслух, разговаривая с
+# холодильником. Уверенность при этом бывает приличная (-0.73), так что
+# барьером это не ловится: модель не сомневается, она вспоминает.
+_MADE_UP = (
+    "спасибо за внимание", "с вами был", "субтитры", "продолжение следует",
+    "редактор субтитров", "корректор", "все права защищены",
+    "подписывайтесь на канал", "ставьте лайки", "до новых встреч",
+    "спасибо за просмотр", "перевод и озвучание", "фонд кино",
+)
+
+
+def made_up(text: str) -> bool:
+    """Похоже ли услышанное на заученную концовку ролика, а не на речь."""
+    bare = text.lower().replace("ё", "е").strip(" .,!?…-«»\"")
+    return any(bare.startswith(p) or bare == p for p in _MADE_UP)
+
+
 class Recognizer:
     def __init__(self, model_size: str, language: str, *, beam_size: int = 1) -> None:
         from faster_whisper import WhisperModel
@@ -77,6 +97,9 @@ class Recognizer:
 
         self.confidence = sum(scores) / len(scores) if scores else None
         text = " ".join(p for p in parts if p).strip()
+        if made_up(text):
+            log.info("whisper: выдумал концовку ролика (%r) — считаю тишиной", text)
+            text, self.confidence = "", None
         spent = time.monotonic() - started
         audio_len = getattr(info, "duration", 0.0) or 0.0
         ratio = spent / audio_len if audio_len else 0.0
@@ -160,6 +183,11 @@ class Remote:
             self._down_until = time.monotonic() + PC_DOWN
             log.warning("ПК не распознал (%s) — перехожу на свои силы", e)
             return None
+        # Фильтр выдумок нужен и здесь: на ПК своя модель, но выдумывает она
+        # то же самое и по той же причине — оба Whisper учили на субтитрах.
+        if made_up(text):
+            log.info("ПК выдумал концовку ролика (%r) — считаю тишиной", text)
+            text, self.confidence = "", None
         log.info("ПК: %.2f с | уверенность %s → %r",
                  time.monotonic() - started,
                  f"{self.confidence:.2f}" if self.confidence is not None else "—",

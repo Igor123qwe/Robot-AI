@@ -52,6 +52,17 @@ BROWSER_LAG = 0.8
 # Конец предложения: точка/вопрос/восклицание, за которыми пробел или конец строки.
 _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
+# Смайлики и прочие картинки. Модель ставит их охотно, а синтез читает их
+# вслух — на живом роботе целым предложением выходило одно «😄», и Кузя
+# честно пытался его произнести. В голосе картинке делать нечего.
+_PICTURES = re.compile(
+    "[\U0001F000-\U0001FAFF←-⇿⌀-➿️‍⬀-⯿]+")
+
+
+def speakable(text: str) -> str:
+    """Готовит текст к произнесению: убирает то, что голосом не передать."""
+    return re.sub(r"\s+", " ", _PICTURES.sub(" ", text)).strip()
+
 
 def scale(raw: bytes, volume: float) -> bytes:
     """Меняет громкость сырого звука. Piper своей регулировки не имеет.
@@ -177,7 +188,7 @@ class Speech:
                     pass
 
     def feed(self, sentence: str) -> None:
-        sentence = sentence.strip()
+        sentence = speakable(sentence)
         if not sentence or self._piper.stdin is None:
             return
         try:
@@ -239,7 +250,7 @@ class WebSpeech:
 
     # --- со стороны разговора --------------------------------------------
     def feed(self, sentence: str) -> None:
-        sentence = sentence.strip()
+        sentence = speakable(sentence)
         if not sentence or self._cancelled:
             return
         self._said.append(sentence)

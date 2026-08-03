@@ -466,6 +466,45 @@ def test_repair() -> None:
     check("пункт списка не тронут", m.args["item"] if m else None, "сгущенку")
 
 
+def test_made_up() -> None:
+    """Заученные концовки роликов — это не речь, а память Whisper.
+
+    С живого робота за один вечер: «Спасибо за внимание!», «С вами был Игорь
+    Негода», причём с приличной уверенностью -0.73 и -0.91. Робот отвечал на
+    них вслух — то есть разговаривал с холодильником. Барьером уверенности
+    такое не ловится: модель не сомневается, она вспоминает субтитры, на
+    которых её учили.
+    """
+    section("выдумки Whisper на тишине")
+    from robot_voice.stt import made_up
+
+    for phrase in ["Спасибо за внимание!", "С вами был Игорь Негода.",
+                   "Продолжение следует...", "Субтитры сделал DimaTorzok",
+                   "спасибо за внимание"]:
+        check(f"«{phrase}» — выдумка", made_up(phrase), True)
+    # А это живая речь, и глушить её нельзя.
+    for phrase in ["Спасибо!", "Спасибо, Кузя", "Продолжи таймер",
+                   "Кузя, вперёд", "с вами всё хорошо?"]:
+        check(f"«{phrase}» — речь", made_up(phrase), False)
+
+
+def test_speakable() -> None:
+    """Смайлики голосом не передать, и читать их вслух не надо.
+
+    Модель ставит их охотно. На живом роботе целым предложением вышло одно
+    «😄» — Кузя честно попытался его произнести.
+    """
+    section("картинки не звучат")
+    from robot_voice.tts import speakable
+
+    check("один смайлик", speakable("😄"), "")
+    check("смайлик в конце", speakable("Пожалуйста! 😊"), "Пожалуйста!")
+    check("смайлик посреди", speakable("Всё хорошо 👍 правда"), "Всё хорошо правда")
+    check("обычную речь не трогаем", speakable("Привет, Игорь!"), "Привет, Игорь!")
+    check("цифры и тире целы", speakable("Сейчас 19:12 — время ужина"),
+          "Сейчас 19:12 — время ужина")
+
+
 def test_unsure_does_not_drive() -> None:
     """Неуверенно расслышанная фраза не должна двигать робота.
 
@@ -1205,7 +1244,8 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_unsure_does_not_drive,
+                 test_weather, test_notes, test_repair, test_made_up, test_speakable,
+                 test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,
                  test_pc_url, test_hidden,
