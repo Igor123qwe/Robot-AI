@@ -24,6 +24,8 @@ from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
 from .config import Config
+from .music import LOUD as MUSIC_LOUD
+from .music import Player, Pult
 from .notes import Notes
 from .people import People
 from .ros import Ros
@@ -31,6 +33,7 @@ from .state import State
 from .stt import Recognizer, Remote
 from .tools import CUTOFF_VOLT, Timers, build_tools
 from .tts import SentenceBuffer, Speaker
+from .yandex import Music
 
 log = logging.getLogger("robot_voice")
 
@@ -432,24 +435,29 @@ def main() -> None:
         state.set("дом", {"город": имя, "lat": lat, "lon": lon})
         log.info("дом теперь %s (%.3f, %.3f)", имя, lat, lon)
 
-    def включить_радио(поток: str) -> bool:
-        """Просит пульт играть поток. Пустая строка — выключить."""
-        try:
-            запрос = urllib.request.Request(
-                cfg.web_endpoint.rsplit("/", 1)[0] + "/speak/radio",
-                data=поток.encode("utf-8"), method="POST",
-                headers={"Content-Type": "text/plain; charset=utf-8"})
-            urllib.request.urlopen(запрос, timeout=5).close()
-            return True
-        except Exception as e:
-            log.warning("пульт не принял радио (%s)", e)
-            return False
+    # Музыка играет в пульте — значит, и заводится она только когда пульт
+    # вообще есть. Проигрыватель один на радио и на Яндекс: «выключи музыку»
+    # и «сделай тише» человек говорит одинаково, что бы под ними ни играло.
+    player = None
+    if cfg.audio_out == "browser":
+        музыка = Music(cfg.yandex_token) if cfg.yandex_token else None
+        log.info("музыка: %s",
+                 "Яндекс и радио" if музыка is not None else "интернет-радио")
+        player = Player(
+            Pult(cfg.web_endpoint.rsplit("/", 1)[0]), музыка,
+            громкость=float(state.get("громкость музыки", MUSIC_LOUD)),
+            on_volume=lambda доля: state.set("громкость музыки", доля),
+            # Под музыку детектор речи глохнет: ровный фон он принимает за
+            # речь и режет паузы на куски, а куски возвращаются пустыми.
+            # Поэтому проигрыватель сообщает микрофону, что стало шумно.
+            on_playing=listener.background)
+        player.start()
 
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
-                        play=включить_радио if cfg.audio_out == "browser" else None)
+                        player=player)
     brain = Brain(cfg, tools)
 
     # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.
@@ -464,6 +472,8 @@ def main() -> None:
         # они должны пережить перезапуск — за этим и заведён файл.
         timers.stop()
         ros.stop_motion()
+        if player is not None:
+            player.stop()
         busy.stop()
         watch.stop()
         ros.stop()

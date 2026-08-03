@@ -338,14 +338,38 @@ class Listener:
         self.sample_rate = sample_rate
         self.vad = webrtcvad.Vad(vad_level)
         self.silence_frames = max(1, silence_ms // FRAME_MS)
-        self.min_speech_frames = max(1, min_speech_ms // FRAME_MS)
+        self._min_speech = max(1, min_speech_ms // FRAME_MS)
         self.max_speech_frames = max(1, max_speech_ms // FRAME_MS)
         # Начинаем запись только после нескольких подряд речевых кадров:
         # одиночный щелчок или стук посуды VAD принимает за речь.
-        self.start_frames = max(1, start_frames)
+        self._start = max(1, start_frames)
+        # Играет ли рядом музыка. Детектор речи её за речь и принимает: на
+        # живом роботе под включённое радио каждая пауза уезжала в
+        # распознавание отдельным куском, тот возвращался пустым, и полсекунды
+        # ПК уходило в никуда — по нескольку раз в минуту.
+        self._noisy = False
         # Небольшой предбуфер, чтобы не отрезать начало слова.
         self.preroll = deque(maxlen=max(1, 300 // FRAME_MS))
         self._muted = threading.Event()
+
+    # Во сколько раз строже отбираем звук, пока играет музыка. Двух хватает:
+    # музыка даёт ровный речеподобный фон, а человек поверх неё всё равно
+    # громче и длиннее.
+    NOISY = 2
+
+    def background(self, шумно: bool) -> None:
+        """Стало шумно или снова тихо. Зовётся, когда включают музыку."""
+        if шумно != self._noisy:
+            log.info("фон: %s", "играет музыка" if шумно else "тихо")
+        self._noisy = шумно
+
+    @property
+    def start_frames(self) -> int:
+        return self._start * self.NOISY if self._noisy else self._start
+
+    @property
+    def min_speech_frames(self) -> int:
+        return self._min_speech * self.NOISY if self._noisy else self._min_speech
 
     # Пока робот говорит — не слушаем: иначе он расслышит сам себя.
     def mute(self) -> None:

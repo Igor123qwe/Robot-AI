@@ -153,6 +153,11 @@ class Config:
     lat: float = field(default_factory=lambda: _num("ROBOT_LAT", 0.0))
     lon: float = field(default_factory=lambda: _num("ROBOT_LON", 0.0))
 
+    # Токен Яндекс.Музыки. Пусто — играет интернет-радио, и это рабочий режим,
+    # а не поломка: радио бесплатно, бессрочно и не зависит от чужой подписки.
+    # Получить токен: python voice/yandex_auth.py (см. README).
+    yandex_token: str = field(default_factory=lambda: _env("YANDEX_MUSIC_TOKEN").strip())
+
     # --- имя и режим разговора ---
     # Робот слушает всегда, но реагирует только на своё имя. После обращения
     # он остаётся «проснувшимся» и отвечает без имени, пока идёт разговор, —

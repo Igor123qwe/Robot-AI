@@ -45,11 +45,79 @@ from robot_voice import ru, weather, when                      # noqa: E402
 from robot_voice.brain import HISTORY_LIMIT, Brain, Thinkless, _trim  # noqa: E402
 from robot_voice.config import SYSTEM_PROMPT, Config   # noqa: E402
 from robot_voice.intents import parse                 # noqa: E402
+from robot_voice.music import Player, Pult            # noqa: E402
 from robot_voice.notes import Notes                   # noqa: E402
 from robot_voice.tools import Timers, build_tools     # noqa: E402
 from robot_voice.tts import PhraseCache, WebSpeech    # noqa: E402
 
 FAILED: list[str] = []
+
+
+class ГлухойПульт(Pult):
+    """Пульт, которого нет: всё принимает, ничего не играет.
+
+    Настоящий ходит по HTTP на веб-сервер робота, и в тесте это была бы
+    минута таймаутов на пустом месте.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("http://тест")
+        self.команды: list[tuple[str, str]] = []
+        self.счётчик = 0
+
+    def _post(self, путь: str, тело: str = "") -> bool:
+        self.команды.append((путь, тело))
+        return True
+
+    def сыграно(self) -> int | None:
+        return self.счётчик
+
+
+class ФальшивыйТрек:
+    """Трек Яндекса ровно в том объёме, в каком его трогает проигрыватель."""
+
+    def __init__(self, номер: int, ссылка: str = "") -> None:
+        self.title = f"Песня {номер}"
+        self.available = True
+        self.track_id = f"{номер}:1"
+        self._ссылка = ссылка or f"http://тест/{номер}.mp3"
+
+    def artists_name(self) -> list[str]:
+        return ["Кто-то"]
+
+
+class ФальшивыйЯндекс:
+    """Музыка без сети: отдаёт ссылки, считает отзывы станции."""
+
+    possible = True
+
+    def __init__(self, битые: set[str] | None = None) -> None:
+        self.битые = битые or set()
+        self.партии = 0
+        self.отзывы: list[str] = []
+
+    def link(self, track) -> str:
+        return "" if track.track_id in self.битые else track._ссылка
+
+    def wave(self, station="user:onyourwave", after=""):
+        self.партии += 1
+        начало = self.партии * 100
+        return [ФальшивыйТрек(начало + i) for i in range(3)], f"партия-{self.партии}"
+
+    def station(self, query: str) -> str:
+        return "genre:jazz" if "джаз" in query else ""
+
+    def search(self, query: str, limit: int = 15):
+        return [ФальшивыйТрек(i) for i in range(2)]
+
+    def started(self, station, batch="") -> None:
+        self.отзывы.append("начали")
+
+    def playing(self, station, track_id, batch="") -> None:
+        self.отзывы.append(f"играет {track_id}")
+
+    def played(self, station, track_id, seconds, batch="") -> None:
+        self.отзывы.append(f"доиграл {track_id}")
 
 
 def check(what: str, got, expected) -> None:
@@ -140,9 +208,17 @@ def test_rules() -> None:
         ("наш город калининград", "set_home"),
         # Курс валют и музыка: после погоды и таймера это самое частое.
         ("какой курс доллара", "rates"), ("сколько стоит доллар", "rates"),
-        ("включи музыку", "play_radio"), ("включи джаз", "play_radio"),
-        ("поставь радио рекорд", "play_radio"),
-        ("выключи музыку", "stop_radio"), ("выключи радио", "stop_radio"),
+        ("включи музыку", "play_music"), ("включи джаз", "play_music"),
+        ("поставь радио рекорд", "play_music"),
+        ("включи мою волну", "play_music"), ("поставь что-нибудь", "play_music"),
+        ("выключи музыку", "stop_music"), ("выключи радио", "stop_music"),
+        ("убавь музыку", "music_volume"), ("сделай музыку тише", "music_volume"),
+        ("можешь убавить этот звук", "music_volume"),
+        ("прибавь громкость", "music_volume"),
+        ("следующая песня", "music_next"), ("переключи", "music_next"),
+        ("поставь другую песню", "music_next"),
+        ("что сейчас играет", "what_is_playing"),
+        ("какая это песня", "what_is_playing"),
         ("курс доллара", "rates"), ("почем доллар", "rates"),
         ("какой сегодня курс евро", "rates"), ("курс валют", "rates"),
     ]
@@ -954,6 +1030,38 @@ def test_unsure_does_not_drive() -> None:
     check("стоп работает всегда", tools["stop"]({}).endswith("."), True)
 
 
+def прогон_фраз(схема, шумно: bool = False) -> list[float]:
+    """Схема — список (речь?, сколько кадров). Возвращает длины фраз.
+
+    Живой Listener без микрофона: детектор речи подменён заранее известной
+    последовательностью ответов, а кадры — тишиной нужной длины.
+    """
+    import threading as th
+    from collections import deque
+
+    import numpy as np
+
+    from robot_voice import audio
+
+    кадры, признаки = [], []
+    for речь, n in схема:
+        for _ in range(n):
+            кадры.append(np.zeros(160, dtype=np.int16))
+            признаки.append(речь)
+    подряд = iter(признаки)
+    l = audio.Listener.__new__(audio.Listener)
+    l.pump = types.SimpleNamespace(start=lambda: None,
+                                   frames=lambda: iter(кадры))
+    l.sample_rate = 16000
+    l.vad = types.SimpleNamespace(is_speech=lambda *a: next(подряд))
+    l.silence_frames, l._min_speech = 35, 15            # 700 мс, 300 мс
+    l.max_speech_frames = 1000                          # 20 с
+    l._start, l.preroll = 2, deque(maxlen=15)
+    l._noisy = шумно
+    l._muted = th.Event()
+    return [round((len(w) - 44) / 2 / 16000, 1) for w in l.utterances()]
+
+
 def test_slicing() -> None:
     """Нарезка на фразы: что уезжает в распознавание, а что нет.
 
@@ -964,31 +1072,7 @@ def test_slicing() -> None:
     минуту, потому что распознавание идёт втрое дольше самого звука.
     """
     section("нарезка на фразы")
-    import threading as th
-    from collections import deque
-
-    import numpy as np
-
-    from robot_voice import audio
-
-    def прогон(схема) -> list[float]:
-        """Схема — список (речь?, сколько кадров). Возвращает длины фраз."""
-        кадры, признаки = [], []
-        for речь, n in схема:
-            for _ in range(n):
-                кадры.append(np.zeros(160, dtype=np.int16))
-                признаки.append(речь)
-        подряд = iter(признаки)
-        l = audio.Listener.__new__(audio.Listener)
-        l.pump = types.SimpleNamespace(start=lambda: None,
-                                       frames=lambda: iter(кадры))
-        l.sample_rate = 16000
-        l.vad = types.SimpleNamespace(is_speech=lambda *a: next(подряд))
-        l.silence_frames, l.min_speech_frames = 35, 15     # 700 мс, 300 мс
-        l.max_speech_frames = 1000                          # 20 с
-        l.start_frames, l.preroll = 2, deque(maxlen=15)
-        l._muted = th.Event()
-        return [round((len(w) - 44) / 2 / 16000, 1) for w in l.utterances()]
+    прогон = прогон_фраз
 
     # Признак «микрофон на связи». Сервер робота подсыпает ровные нули, чтобы
     # соединение не уснуло, и по «кадры идут» источник выглядел живым всегда:
@@ -1161,7 +1245,7 @@ def test_hidden() -> None:
                                     set_volume=lambda v: None, hush=lambda: None)
     tools = build_tools(ros, timers, speaker=speaker,
                         notes=Notes(store / "notes.json"),
-                        set_place=lambda *a: None, play=lambda url: True)
+                        set_place=lambda *a: None, player=Player(ГлухойПульт()))
     hidden = {t.name for t in tools if t.hidden}
     phrases = [
         "приостанови таймер", "продолжи таймер", "сбрось все таймеры",
@@ -1679,6 +1763,190 @@ def test_dialogue() -> None:
     check("колёса не тронулись", moved, [])
 
 
+def test_music_queue() -> None:
+    """Очередь треков: кончился — ставим следующий, битый — пропускаем.
+
+    Обратного канала от пульта к роботу нет, есть счётчик доигранных песен.
+    Всё, что может пойти не так, идёт не так именно вокруг него: ссылка не
+    открылась, пульт сообщил «доиграл» раньше, чем мы успели запомнить, от
+    чего считать, — и музыка молча вставала на первой же песне.
+    """
+    section("очередь треков")
+    пульт, ya = ГлухойПульт(), ФальшивыйЯндекс()
+    player = Player(пульт, ya)
+
+    треки = [ФальшивыйТрек(i) for i in range(3)]
+    check("первый трек назван", player.очередь(треки, "genre:jazz", "п1"),
+          "Кто-то — Песня 0")
+    check("станции сообщили, что включились", ya.отзывы[0], "начали")
+    check("пульт получил трек",
+          [п for п, _ in пульт.команды if п == "/speak/track"], ["/speak/track"])
+
+    # Пульт доиграл песню — счётчик вырос, робот обязан поставить следующую.
+    пульт.счётчик += 1
+    player._tick()
+    check("после конца играет следующий", player.название, "Кто-то — Песня 1")
+    check("ротору сказали, что трек дослушали",
+          any(о.startswith("доиграл") for о in ya.отзывы), True)
+
+    # Битая ссылка не должна останавливать вечер.
+    плохой = ФальшивыйЯндекс(битые={"7:1"})
+    player2 = Player(ГлухойПульт(), плохой)
+    check("битый трек пропущен",
+          player2.очередь([ФальшивыйТрек(7), ФальшивыйТрек(8)]),
+          "Кто-то — Песня 8")
+
+    # Отметку счётчика надо брать ДО отправки трека: иначе мгновенная ошибка
+    # проигрывания принимается за исходное значение и следующая песня
+    # не наступает никогда.
+    п3 = ГлухойПульт()
+    п3.счётчик = 5
+    player3 = Player(п3, ФальшивыйЯндекс())
+    player3.очередь([ФальшивыйТрек(1), ФальшивыйТрек(2)])
+    п3.счётчик = 6                       # пульт сразу сказал «не пошло»
+    player3._tick()
+    check("мгновенная ошибка не останавливает очередь",
+          player3.название, "Кто-то — Песня 2")
+
+    # Станция досыпает треков, пока очередь не опустела.
+    п4 = ГлухойПульт()
+    ya4 = ФальшивыйЯндекс()
+    player4 = Player(п4, ya4)
+    player4.очередь([ФальшивыйТрек(1)], "user:onyourwave", "п1")
+    было = ya4.партии
+    for _ in range(4):          # доигрываем всё, что станция уже дала
+        п4.счётчик += 1
+        player4._tick()
+    check("станция подсыпала треков", ya4.партии > было, True)
+    check("музыка не кончилась", player4.играет, True)
+
+    # Вкладку закрыли — «доиграл» не придёт никогда. Без запаса по времени
+    # музыка встала бы намертво до следующей команды голосом.
+    п5 = ГлухойПульт()
+    player5 = Player(п5, ФальшивыйЯндекс())
+    player5.очередь([ФальшивыйТрек(1), ФальшивыйТрек(2)])
+    player5._потолок = 0.0                # как будто песня давно кончилась
+    player5._tick()
+    check("молчащий пульт не вешает музыку", player5.название, "Кто-то — Песня 2")
+
+    check("выключил — не играет", player.выключить(), "Выключил.")
+    check("выключать нечего", player.выключить(), "Музыка и так не играет.")
+
+
+def test_music_volume() -> None:
+    """Громкость музыки — отдельно от громкости голоса.
+
+    «Кузя, убавь музыку» на живом роботе кончилось тем, что он её выключил:
+    правило про громкость знало только про голос, а под «убавь» подошло
+    выключение. Теперь решает инструмент — по тому, играет ли что-нибудь.
+    """
+    section("громкость музыки")
+    store = Path(tempfile.mkdtemp())
+    timers = Timers(announce=lambda text, **kw: None, store=store / "timers.json")
+    ros = types.SimpleNamespace(voltage=12.4, moving=False, connected=True,
+                                drive=lambda *a, **k: None, stop_motion=lambda: None)
+    громкость = {"голос": 1.0}
+    speaker = types.SimpleNamespace(
+        volume=1.0, last_said="", hush=lambda: None,
+        set_volume=lambda v: громкость.__setitem__("голос", v))
+    пульт = ГлухойПульт()
+    player = Player(пульт, ФальшивыйЯндекс())
+    tools = {t.name: t for t in build_tools(ros, timers, speaker=speaker,
+                                            player=player)}
+
+    # Музыка молчит — «тише» относится к голосу робота.
+    tools["music_volume"]({"изменение": "тише"})
+    check("без музыки тише говорит робот", громкость["голос"] < 1.0, True)
+
+    # «Включи радио» — это радио, а не Яндекс. Без этого просьба про радио
+    # уезжала в «Мою волну», а «включи радио Рекорд» искало в Яндексе песни
+    # со словом «Рекорд» в названии.
+    m = parse("включи радио рекорд")
+    check("радио названо явно", m.args.get("источник"), "радио")
+    from robot_voice import radio as radio_api
+    было_find = radio_api.find
+    radio_api.find = lambda что, **kw: ("Рекорд", "http://тест/поток.mp3")
+    try:
+        check("по слову «радио» идём в радио, а не в Яндекс",
+              tools["play_music"]({"что": "рекорд", "источник": "радио"}),
+              "Включаю Рекорд.")
+        check("играет поток, а не очередь треков", player.режим, "поток")
+    finally:
+        radio_api.find = было_find
+
+    player.очередь([ФальшивыйТрек(1)])
+    было = player.громкость_
+    check("с музыкой тише становится музыка",
+          tools["music_volume"]({"изменение": "тише"}), "Сделал тише.")
+    check("голос не тронут", player.громкость_ < было, True)
+    check("пульту сказали новую громкость",
+          any(п == "/speak/volume" for п, _ in пульт.команды), True)
+
+    for _ in range(10):
+        player.тише()
+    check("тише бесконечно нельзя", player.тише(), "Тише уже некуда.")
+    for _ in range(10):
+        player.громче()
+    check("громче бесконечно нельзя", player.громче(), "Громче уже некуда.")
+
+    check("что играет", tools["what_is_playing"]({}), "Играет Кто-то — Песня 1.")
+
+
+def test_noisy_ear() -> None:
+    """Под музыку робот должен быть придирчивее к тому, что считать фразой.
+
+    На живом роботе включённое радио ломало распознавание: детектор речи
+    принимал музыку за речь, каждая пауза уезжала на ПК отдельным куском и
+    возвращалась пустой. Уверенность на настоящих фразах падала с −0.25 до
+    −0.75, и «Кузя» превращался в «Кульзу».
+    """
+    section("шум под музыку")
+    from robot_voice import audio
+
+    l = audio.Listener.__new__(audio.Listener)
+    l._start, l._min_speech, l._noisy = 2, 15, False
+    check("в тишине порог обычный",
+          (l.start_frames, l.min_speech_frames), (2, 15))
+    l.background(True)
+    check("под музыку порог выше",
+          (l.start_frames, l.min_speech_frames), (4, 30))
+    l.background(False)
+    check("музыку выключили — порог вернулся",
+          (l.start_frames, l.min_speech_frames), (2, 15))
+
+    # Короткий кусок, который в тишине проходит, под музыку отбрасывается.
+    check("короткая фраза под музыку отброшена",
+          прогон_фраз([(False, 20), (True, 20), (False, 40)], шумно=True), [])
+    check("она же в тишине проходит",
+          len(прогон_фраз([(False, 20), (True, 20), (False, 40)])), 1)
+
+
+def test_pult_and_server_agree() -> None:
+    """Сервер умеет, а страница нет — этот класс ошибок стоил целого вечера.
+
+    Радио тогда не заиграло трижды подряд: сервер уже знал про поток, пульт
+    ещё нет; потом браузер держал вчерашнюю страницу; потом кодек оказался не
+    тот. Проверка дешёвая: все события, которые сервер рассылает, должны
+    разбираться в пульте, а все адреса, куда стучится пульт, — существовать
+    на сервере.
+    """
+    import re as _re
+
+    section("пульт и сервер договорились")
+    web = Path(__file__).resolve().parent.parent / "web"
+    сервер = (web / "server.py").read_text(encoding="utf-8")
+    пульт = (web / "pult.html").read_text(encoding="utf-8")
+
+    события = set(_re.findall(r"SPEECH\.broadcast\(\{\"([^\"]+)\"", сервер))
+    незнакомые = sorted(k for k in события
+                        if f"data.{k}" not in пульт and f"data['{k}']" not in пульт)
+    check("каждое событие сервера разбирается пультом", незнакомые, [])
+
+    адреса = set(_re.findall(r"fetch\('(/[a-z/]+)'", пульт))
+    несуществующие = sorted(a for a in адреса if f'"{a}"' not in сервер)
+    check("каждый адрес пульта есть на сервере", несуществующие, [])
+
+
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
@@ -1687,6 +1955,8 @@ def main() -> int:
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,
                  test_pc_url, test_hidden,
+                 test_music_queue, test_music_volume, test_noisy_ear,
+                 test_pult_and_server_agree,
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,
                  test_history,
