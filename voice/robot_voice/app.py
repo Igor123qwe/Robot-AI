@@ -463,6 +463,45 @@ class Addressed:
         return self.by_name and self.sure
 
 
+class Turn:
+    """Секундомер одного обмена: куда именно уходит время до ответа.
+
+    «Как будто долго» — самая дорогая жалоба: чинить по ней можно что угодно
+    и промахнуться. Здесь три отрезка, и каждый лечится по-своему.
+
+    Ожидание тишины — робот не знает, что фраза кончилась, пока человек не
+    помолчит. Это не работа, это ожидание, и сократить его можно только
+    порогом silence_ms, рискуя перебивать человека на паузе.
+
+    Распознавание — дорога до ПК и сам whisper.
+
+    Ответ — модель плюс правила. У правил он нулевой, поэтому в логе видно,
+    сколько на самом деле экономит каждая регулярка.
+
+    Пишем один раз за обмен и только когда робот заговорил: молчаливые
+    отбрасывания шума лог не засоряют.
+    """
+
+    def __init__(self, silence: float) -> None:
+        self.silence = silence
+        self.at = time.monotonic()
+        self.heard = 0.0
+        self.told = False
+
+    def recognized(self) -> None:
+        self.heard = time.monotonic() - self.at
+
+    def spoke(self, how: str) -> None:
+        if self.told:
+            return
+        self.told = True
+        total = time.monotonic() - self.at
+        log.info("заговорил через %.1f с после фразы: тишина %.1f + "
+                 "распознавание %.1f + ответ %.1f (%s)",
+                 self.silence + total, self.silence, self.heard,
+                 total - self.heard, how)
+
+
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                  brain: Brain, voice: Voice, tools: list,
                  addressed: Addressed, ros=None) -> None:
@@ -487,7 +526,9 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
     undo = Undo()
 
     for wav in listener.utterances():
+        turn = Turn(cfg.silence_ms / 1000.0)
         text = recognizer.transcribe(wav)
+        turn.recognized()
         # Насколько распознавание само себе верит. Пишем в лог всегда: без
         # живых чисел порог подбирается гаданием, а цена ошибки здесь —
         # уехавший робот.
@@ -585,12 +626,13 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         elif match is not None and match.tool in by_name:
             _run_direct(by_name[match.tool], match.args, voice, pending)
             undo.remember(match.tool, match.args)
+            turn.spoke("правило")
         else:
             # Помечаем явно: по этим строкам в логе видно, каких формулировок
             # не хватает правилам. Это лучший источник для их пополнения —
             # выборка под конкретного человека, а не общий корпус.
             log.info("правилами не разобрал, спрашиваю модель")
-            _respond(command, brain, voice, recognizer, ros)
+            _respond(command, brain, voice, recognizer, ros, turn)
 
         # Окно отсчитываем от конца ответа, а не от начала: иначе длинная
         # реплика робота съедала бы всё время, отведённое на продолжение.
@@ -772,7 +814,7 @@ def _caught_stop(wav: bytes, recognizer, ros) -> bool:
 
 
 def _respond(command: str, brain: Brain, voice: Voice,
-             recognizer=None, ros=None) -> None:
+             recognizer=None, ros=None, turn=None) -> None:
     """Отвечает вслух, проговаривая предложения по мере генерации."""
     buffer = SentenceBuffer()
     # Хвост снимаем в момент, когда робот собирается заговорить: дальше в нём
@@ -804,6 +846,8 @@ def _respond(command: str, brain: Brain, voice: Voice,
             for sentence in buffer.push(chunk):
                 log.info("робот: %s", sentence)
                 start_speaking()
+                if turn is not None:
+                    turn.spoke("модель")
                 if speech:
                     speech.feed(sentence)
 
