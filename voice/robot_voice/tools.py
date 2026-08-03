@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ru, when
+from . import counting, ru, when
 from . import weather as weather_api
 
 log = logging.getLogger(__name__)
@@ -79,7 +79,9 @@ ABILITIES = (
     "стоп. Скажу, сколько заряда в батарее, который час и какое сегодня число. "
     "Ставлю таймеры и будильники, напоминаю о делах, веду список покупок. "
     "Расскажу погоду, новости и курс валют. Включу музыку — по исполнителю, "
-    "по жанру или просто твою волну. Умею говорить тише и громче. "
+    "по жанру или просто твою волну. Громкость меняю по десятибалльной: "
+    "скажи «сделай на семь». Есть секундомер, считаю проценты и деление, "
+    "брошу монетку или кубик и загадаю число. "
     "Всё остальное — просто спроси, я отвечу."
 )
 
@@ -433,6 +435,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     по имени в текущей реплике. Всё необязательно: без этого соответствующие
     инструменты не появятся, и модель о них не узнает.
     """
+    секундомер = counting.Секундомер()
 
     def name_guard() -> str | None:
         """Ехать — только по надёжной просьбе, кто бы ни просил.
@@ -559,7 +562,20 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         return next(iter(pool)) if len(pool) == 1 else None
 
     def set_timer(minutes: float, label: str = NO_NAME) -> str:
-        minutes = max(0.1, min(600.0, float(minutes)))
+        # Ноль и минус — это не «шесть секунд», а недопонятая просьба. Раньше
+        # «поставь таймер» без числа превращалось в таймер на шесть секунд,
+        # который звонил раньше, чем человек успевал договорить.
+        try:
+            minutes = float(minutes)
+        except (TypeError, ValueError):
+            minutes = 0.0
+        if minutes <= 0:
+            return "На сколько ставить таймер?"
+        if minutes > 600.0:
+            return (f"Дольше десяти часов таймер не ставлю. "
+                    f"{ru.duration(600 * 60, accusative=True).capitalize()} — "
+                    f"это предел.")
+        minutes = max(0.1, minutes)
         label = label.strip() or NO_NAME
         extra = False
         # Имена, которые робот раздаёт сам, повторяются — и add() заменяет по
@@ -691,6 +707,42 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     def abilities() -> str:
         """Ответ на «что ты умеешь» — заранее известный, платить за него незачем."""
         return ABILITIES
+
+    def calculate(выражение: str = "") -> str:
+        """Счёт разбором выражения, а не в уме модели и не через eval.
+
+        В уме модель путает проценты и деление, и ошибка звучит ровно так же
+        уверенно, как верный ответ. А eval на строке из микрофона — это запуск
+        чего угодно, что робот услышал.
+        """
+        try:
+            ответ = counting.посчитать(выражение)
+        except ValueError as e:
+            return f"Не посчитал: {e}."
+        return counting.вслух(ответ)
+
+    def stopwatch(действие: str = "сколько") -> str:
+        действие = (действие or "").strip().lower()
+        if действие in ("пуск", "старт", "начни", "засеки", "засечь"):
+            return секундомер.пуск()
+        if действие in ("стоп", "останови", "стой"):
+            return секундомер.стоп()
+        if действие in ("сброс", "сбрось", "обнули"):
+            return секундомер.сброс()
+        return секундомер.сколько()
+
+    def random_pick(вид: str = "монетка", снизу: int = 1, сверху: int = 0,
+                    из_чего: list | None = None) -> str:
+        """Настоящий бросок. Модель на «загадай число от одного до десяти»
+        отвечает семёркой заметно чаще прочего — для игры это подделка."""
+        вид = (вид or "").strip().lower()
+        if вид.startswith("монет"):
+            return counting.монетка()
+        if вид.startswith("куб"):
+            return counting.кубик(сверху or 6)
+        if вид.startswith("выбор") or из_чего:
+            return counting.выбрать(list(из_чего or []))
+        return counting.число(снизу or 1, сверху or 10)
 
     def volume(change: str = "тише", про_голос: bool = False) -> str:
         """Громкость голоса — но под музыку «сделай тише» почти всегда про неё.
@@ -1247,6 +1299,73 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                         "прошлогодний.",
             input_schema=EMPTY_SCHEMA,
             run=rates,
+        ),
+        Tool(
+            name="calculate",
+            description="Посчитать. Зови всегда, когда просят что-то "
+                        "сосчитать: проценты и деление в уме ты путаешь, а "
+                        "ошибка звучит так же уверенно, как верный ответ. "
+                        "Переведи услышанное в выражение: «пятнадцать "
+                        "процентов от двух тысяч» — это 15/100*2000.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "выражение": {
+                        "type": "string",
+                        "description": "Только числа и знаки + - * / % ** и "
+                                       "скобки. Слова не понимаю.",
+                    },
+                },
+                "required": ["выражение"],
+            },
+            run=calculate,
+        ),
+        Tool(
+            name="stopwatch",
+            description="Секундомер: пуск, стоп, сброс, «сколько прошло». "
+                        "Зови обязательно — сколько времени прошло между "
+                        "репликами, ты не знаешь, часов у тебя нет.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "действие": {
+                        "type": "string",
+                        "enum": ["пуск", "стоп", "сброс", "сколько"],
+                        "description": "Что сделать с секундомером.",
+                    },
+                },
+                "required": ["действие"],
+            },
+            run=stopwatch,
+        ),
+        Tool(
+            name="random_pick",
+            description="Жребий: монетка, кубик, случайное число, выбор из "
+                        "нескольких. Зови обязательно — сам ты случайное "
+                        "число не выдумаешь, у тебя выйдет одно и то же, а "
+                        "человек ждёт настоящего броска.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "вид": {
+                        "type": "string",
+                        "enum": ["монетка", "кубик", "число", "выбор"],
+                        "description": "Что бросаем.",
+                    },
+                    "снизу": {"type": "integer",
+                              "description": "Для «числа»: от. По умолчанию 1."},
+                    "сверху": {"type": "integer",
+                               "description": "Для «числа»: до. По умолчанию 10. "
+                                              "Для «кубика» — сколько граней."},
+                    "из_чего": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Для «выбора»: между чем выбрать.",
+                    },
+                },
+                "required": ["вид"],
+            },
+            run=random_pick,
         ),
     ]
     if player is not None:
