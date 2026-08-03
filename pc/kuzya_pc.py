@@ -38,6 +38,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 log = logging.getLogger("кузя-пк")
 
@@ -59,6 +60,21 @@ KEEP_ALIVE = -1
 # --------------------------------------------------------------------------
 # Перевод: язык Anthropic → язык Ollama
 # --------------------------------------------------------------------------
+def _build() -> str:
+    """Отпечаток этого самого файла.
+
+    Файл живёт на чужой машине и обновляется вручную, а по поведению «старая
+    версия» и «новая, но не работает» неотличимы. Восемь символов в первой же
+    строке лога снимают этот вопрос за секунду.
+    """
+    try:
+        import hashlib
+        return hashlib.sha1(
+            Path(__file__).read_bytes()).hexdigest()[:8]
+    except Exception:
+        return "неизвестна"
+
+
 def _proxy_trouble(error: Exception) -> bool:
     """Похоже ли, что виноват прокси, а не мы.
 
@@ -810,8 +826,8 @@ def main() -> int:
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.cfg = cfg
     srv.daemon_threads = True
-    log.info("мозг на %s:%d | модель %s | распознавание %s",
-             args.host, args.port, args.model, args.whisper)
+    log.info("мозг на %s:%d | модель %s | распознавание %s | сборка %s",
+             args.host, args.port, args.model, args.whisper, _build())
     log.info("на роботе: ROBOT_PC_URL=http://<адрес этого ПК>:%d", args.port)
 
     # Прогрев в своём потоке: сервер должен отвечать на /health сразу, а вот
