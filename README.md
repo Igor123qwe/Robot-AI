@@ -163,10 +163,16 @@ nano ~/.robot-ai.env
 трека. Вход разовый, паролем нигде не светим:
 
 ```
-pip3 install --user yandex-music
-python3 voice/yandex_auth.py
+voice/.venv/bin/pip install yandex-music
+voice/.venv/bin/python voice/yandex_auth.py
 sudo systemctl restart robot-voice
 ```
+
+Именно `voice/.venv/bin/pip`, а не `pip3 --user`. Служба запускается питоном из
+venv (`ExecStart=…/voice/.venv/bin/python -m robot_voice`), и библиотека,
+поставленная системному питону, ей не видна: робот получит токен, отрапортует,
+что всё хорошо, и будет отвечать «не нашёл» на любую просьбу. Проверено на
+живом роботе, потерян круг отладки.
 
 Скрипт покажет код и адрес страницы Яндекса, дождётся подтверждения и запишет
 токен в `~/.robot-ai.env` — на экран токен не печатается и в историю команд не

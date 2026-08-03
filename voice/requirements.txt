@@ -15,5 +15,7 @@ websocket-client>=1.7
 # Яндекс.Музыка. Без неё играет интернет-радио — это рабочий режим, а не
 # поломка, поэтому библиотека и не в обязательных. Ставить только вместе с
 # активной подпиской Плюс:
-#     pip3 install --user yandex-music
-#     python3 voice/yandex_auth.py
+# Ставить именно pip'ом из venv: этим же питоном запускается служба, и
+# библиотека, поставленная системному, ей не видна.
+#     voice/.venv/bin/pip install yandex-music
+#     voice/.venv/bin/python voice/yandex_auth.py

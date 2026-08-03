@@ -3,7 +3,11 @@
 
 Запускать на роботе, один раз:
 
-    python3 voice/yandex_auth.py
+    voice/.venv/bin/python voice/yandex_auth.py
+
+Именно питоном из venv: этим же питоном запускается служба, и библиотека,
+поставленная системному, ей не видна. Скрипт это проверяет и не даст записать
+токен туда, откуда его некому будет прочитать.
 
 Скрипт покажет короткий код и адрес страницы Яндекса. Открываешь страницу на
 телефоне или компьютере, вводишь код, подтверждаешь — и всё, токен записан.
@@ -33,6 +37,27 @@ KEY = "YANDEX_MUSIC_TOKEN"
 DEVICE = "Кузя, домашний робот"
 
 
+VENV = Path(__file__).resolve().parent / ".venv"
+
+
+def _venv_pip() -> str:
+    """Команда установки — та, что и правда сработает на этом роботе."""
+    pip = VENV / "bin" / "pip"
+    return str(pip) if pip.exists() else "pip3"
+
+
+def _wrong_python() -> str:
+    """Питон службы, если запустились не им. Пусто — всё правильно."""
+    служебный = VENV / "bin" / "python"
+    if not служебный.exists():
+        return ""                       # venv нет, значит и путать не с чем
+    try:
+        свой = Path(sys.executable).resolve()
+    except OSError:
+        return ""
+    return "" if свой == служебный.resolve() else str(служебный)
+
+
 def показать(code) -> None:
     print()
     print("  Открой:", code.verification_url)
@@ -56,9 +81,23 @@ def main() -> int:
     try:
         from yandex_music import Client
     except ImportError:
-        print("Нет библиотеки. Поставь её:", file=sys.stderr)
-        print("    pip3 install --user yandex-music", file=sys.stderr)
+        print("Нет библиотеки. Поставь её тем же питоном, каким запускается",
+              file=sys.stderr)
+        print("служба, — иначе она её не увидит:", file=sys.stderr)
+        print(f"    {_venv_pip()} install yandex-music", file=sys.stderr)
         return 1
+
+    # Библиотека есть, но у ТОГО ли питона. Токен, записанный из системного
+    # питона, служба прочитает, а библиотеку — нет: она живёт в venv. На живом
+    # роботе это выглядело как «токен получен, робот говорит, что Яндекс
+    # подключён, и не находит ничего».
+    чужой = _wrong_python()
+    if чужой:
+        print(f"\nОсторожно: ты запустил это {sys.executable},", file=sys.stderr)
+        print(f"а служба работает {чужой}.", file=sys.stderr)
+        print("Токен-то запишется, но библиотеку служба не увидит. Поставь её",
+              file=sys.stderr)
+        print(f"и туда:\n    {_venv_pip()} install yandex-music", file=sys.stderr)
 
     print("Вход в Яндекс.Музыку для робота.")
     print("Нужна активная подписка Плюс: без неё Яндекс отдаёт только")
