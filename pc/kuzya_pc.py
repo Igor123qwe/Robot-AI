@@ -56,6 +56,11 @@ OLLAMA_READ = 300.0
 # ПК как неотвечающий на минуту вперёд. -1 — не выгружать вовсе.
 KEEP_ALIVE = -1
 
+# Как часто подавать знак жизни, пока сказать нечего. У робота таймаут чтения
+# двадцать пять секунд, а размышления модели наружу не выходят — без пинга он
+# считает молчащий ПК мёртвым и уходит в платное облако прямо посреди ответа.
+PING_SECONDS = 5.0
+
 
 # --------------------------------------------------------------------------
 # Перевод: язык Anthropic → язык Ollama
@@ -167,12 +172,27 @@ def to_ollama_messages(system, messages: list) -> list[dict]:
 
 
 def _no_think(messages: list[dict]) -> list[dict]:
-    """Дописывает мягкий выключатель размышлений к системному сообщению."""
+    """Дописывает мягкий выключатель размышлений к последней реплике человека.
+
+    Место важное. Сначала строка стояла в системном сообщении — и Qwen3 её
+    проигнорировал: на живом роботе он думал по восемьсот токенов на «привет».
+    Выключатель у Qwen3 разбирает шаблон разговора, и смотрит он на ПОСЛЕДНЮЮ
+    реплику пользователя: в длинной беседе побеждает та, что ближе к концу.
+    Системное сообщение до неё не дотягивается.
+
+    Если последней идёт не реплика человека, а результат инструмента, дописать
+    некуда — там строгая структура, и лишний текст ломает разбор. Тогда
+    оставляем как есть: круг с инструментом всё равно идёт следом за обычным,
+    где выключатель уже сработал.
+    """
     out = list(messages)
-    if out and out[0].get("role") == "system":
-        out[0] = {**out[0], "content": out[0].get("content", "") + "\n/no_think"}
-    else:
-        out.insert(0, {"role": "system", "content": "/no_think"})
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") != "user":
+            continue
+        content = out[i].get("content")
+        if isinstance(content, str):
+            out[i] = {**out[i], "content": content + " /no_think"}
+        break
     return out
 
 
@@ -194,6 +214,10 @@ def to_ollama_tools(tools: list | None) -> list[dict]:
 def _sse(event: str, data: dict) -> bytes:
     return (f"event: {event}\n"
             f"data: {json.dumps(data, ensure_ascii=False)}\n\n").encode("utf-8")
+
+
+class RobotGone(Exception):
+    """Робот закрыл соединение, не дослушав ответ."""
 
 
 class Unthink:
@@ -230,7 +254,15 @@ class Unthink:
         self.holding = self.habit.get(key) is not False
 
     def _learn(self, thinks: bool) -> None:
-        if self.habit.get(self.key) is thinks:
+        was = self.habit.get(self.key)
+        if was is thinks:
+            return
+        # Учимся несимметрично. «Думает» — доказанный факт: тег видели своими
+        # глазами. «Не думает» — всего лишь отсутствие улики, и принимаем его
+        # только пока ничего не знаем. Иначе один оборванный ответ без тега
+        # переубеждает фильтр, он перестаёт держать начало — и следующие
+        # размышления едут прямиком в речь.
+        if not thinks and was is not None:
             return
         log.info("модель %s вслух", "думает" if thinks else "не думает")
         self.habit[self.key] = thinks
@@ -251,9 +283,14 @@ class Unthink:
         self._learn(True)
         return out[at + len(self.CLOSE):].lstrip()
 
-    def close(self) -> str:
-        """Хвост, который так и не оказался размышлением."""
-        if self.holding:
+    def close(self, complete: bool = True) -> str:
+        """Хвост, который так и не оказался размышлением.
+
+        complete=False — ответ оборвался (клиент ушёл, кончился лимит длины).
+        Из такого ответа нельзя заключить, что модель не думает: тег мог быть
+        в той части, которая не сгенерировалась.
+        """
+        if self.holding and complete:
             self._learn(False)
         out, self.buf, self.holding = self.buf, "", False
         return out
@@ -288,6 +325,17 @@ class AnthropicStream:
                 "usage": {"input_tokens": 0, "output_tokens": 0},
             },
         })
+
+    def ping(self):
+        """Знак жизни, пока сказать нечего.
+
+        Размышления модели наружу не выходят, и на всё это время поток
+        замолкает — на живом роботе на двадцать пять секунд, после чего у него
+        срабатывал таймаут чтения, он бросал бесплатный ПК и уходил в платное
+        облако. Пинг — часть протокола: клиент его молча съедает, а соединение
+        считается живым.
+        """
+        yield _sse("ping", {"type": "ping"})
 
     def text(self, chunk: str):
         if not chunk:
@@ -690,13 +738,20 @@ class Handler(BaseHTTPRequestHandler):
         truncated = False
         ollama = self.server.cfg.ollama
         unthink = Unthink(getattr(ollama, "habit", None), model)
+        alive = time.monotonic()
         for part in ollama.chat(model, messages, tools, limit):
             msg = part.get("message") or {}
             chunk = msg.get("content") or ""
             if chunk:
                 clean = unthink.feed(chunk)
                 if clean:
+                    alive = time.monotonic()
                     yield ("text", clean, None)
+                elif time.monotonic() - alive > PING_SECONDS:
+                    # Модель думает, а наружу мы это не пускаем. Молчать нельзя:
+                    # у робота таймаут чтения, и он уйдёт в платное облако.
+                    alive = time.monotonic()
+                    yield ("ping", None, None)
             for call in msg.get("tool_calls") or []:
                 # Придержанный текст выпускаем ПЕРЕД вызовом инструмента:
                 # иначе «сейчас гляну» уедет за спину действия, и робот
@@ -712,7 +767,12 @@ class Handler(BaseHTTPRequestHandler):
                 used_in = int(part.get("prompt_eval_count") or 0)
                 used_out = int(part.get("eval_count") or 0)
                 truncated = part.get("done_reason") == "length"
-        tail = unthink.close()
+        if unthink.holding:
+            log.warning("ответ кончился, а размышления не закрылись — "
+                        "%d символов придержано, %d токенов выхода%s",
+                        len(unthink.buf), used_out,
+                        ", ответ обрезан по лимиту длины" if truncated else "")
+        tail = unthink.close(not truncated)
         if tail:
             yield ("text", tail, None)
         yield ("done", used_in, (used_out, truncated))
@@ -735,11 +795,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._write(out.start())
                 if kind == "text":
                     self._write(out.text(a))
+                elif kind == "ping":
+                    self._write(out.ping())
                 elif kind == "call":
                     self._write(out.tool_call(a, b))
                 else:
                     used_out, truncated = b
                     self._write(out.finish(a, used_out, truncated))
+        except RobotGone as e:
+            # Робот ушёл: не дождался, передумал, потерял сеть. Это будни, а не
+            # авария — трассировка на полэкрана тут только мешает читать лог.
+            log.info("робот отключился посреди ответа (%s)", e)
+            self.close_connection = True
         except Exception as e:
             log.exception("разговор не вышел")
             if not started:
@@ -749,9 +816,19 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _write(self, chunks) -> None:
-        for chunk in chunks:
-            self.wfile.write(chunk)
-        self.wfile.flush()
+        """Отдаёт кусок потока роботу.
+
+        Обрыв здесь и обрыв связи с Ollama — разные беды с одним и тем же
+        именем ConnectionError, а лечатся они противоположно: про мёртвую
+        Ollama роботу надо честно сказать 502, а про ушедшего робота говорить
+        уже некому. Поэтому свой тип: ловить по месту, а не по имени.
+        """
+        try:
+            for chunk in chunks:
+                self.wfile.write(chunk)
+            self.wfile.flush()
+        except (ConnectionError, BrokenPipeError) as e:
+            raise RobotGone(type(e).__name__) from e
 
     def _whole(self, model, messages, tools, limit) -> None:
         """Без потока. Нужен для проверки curl-ом и для простых клиентов."""
@@ -773,8 +850,9 @@ class Handler(BaseHTTPRequestHandler):
                     blocks.append({"type": "tool_use",
                                    "id": f"toolu_{len(blocks)}",
                                    "name": a, "input": args or {}})
-                else:
+                elif kind == "done":
                     used_in, (used_out, truncated) = a, b
+                # «ping» держит живым поток; здесь потока нет и держать нечего.
         except Exception as e:
             log.exception("разговор не вышел")
             self._json(502, self._error("api_error", f"Ollama: {e}"))

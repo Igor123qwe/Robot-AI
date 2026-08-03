@@ -121,7 +121,17 @@ class Thinkless:
         self.holding = getattr(habit, "thinks", None) is not False
 
     def _learn(self, thinks: bool) -> None:
-        if self.habit is None or getattr(self.habit, "thinks", None) is thinks:
+        if self.habit is None:
+            return
+        was = getattr(self.habit, "thinks", None)
+        if was is thinks:
+            return
+        # Учимся несимметрично. «Думает» — доказанный факт: тег видели своими
+        # глазами. «Не думает» — всего лишь отсутствие улики, и принимаем его
+        # только пока ничего не знаем. Иначе один короткий ответ без тега
+        # переубеждает фильтр, тот перестаёт держать начало — и следующие
+        # размышления едут прямиком в речь.
+        if not thinks and was is not None:
             return
         log.info("%s: модель %s вслух",
                  getattr(self.habit, "name", "собеседник"),

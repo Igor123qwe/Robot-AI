@@ -171,6 +171,92 @@ def test_stream() -> None:
         srv.shutdown()
 
 
+def test_ping() -> None:
+    """Пока модель думает, поток должен подавать знаки жизни.
+
+    Размышления наружу не выходят, и на всё это время мост замолкает. На живом
+    роботе это вышло в двадцать пять секунд тишины — ровно его таймаут чтения:
+    он решил, что бесплатный ПК умер, и ушёл в платное облако прямо посреди
+    ответа. Три с половиной тысячи оплаченных токенов за «сколько времени».
+
+    Заодно проверяем, что клиент anthropic такие пинги принимает молча: они
+    часть его же протокола, но приходят там, где он ждёт текст.
+    """
+    section("знаки жизни, пока модель думает")
+    import anthropic
+
+    было, kuzya_pc.PING_SECONDS = kuzya_pc.PING_SECONDS, -1.0
+    try:
+        # Модель думает вслух, потом отвечает. Всё до </think> придерживается,
+        # то есть наружу в это время не идёт ничего, кроме пингов.
+        fake = FakeOllama(["Надо подумать. " * 20, "Ещё подумать.",
+                           "</think>", "Привет!"])
+        srv, url = serve(fake)
+        try:
+            client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0)
+            pieces: list[str] = []
+            events: list[str] = []
+            with client.messages.stream(
+                model="неважно", max_tokens=64,
+                messages=[{"role": "user", "content": "привет"}],
+            ) as stream:
+                for event in stream:
+                    events.append(event.type)
+                    if (event.type == "content_block_delta"
+                            and getattr(event.delta, "type", "") == "text_delta"):
+                        pieces.append(event.delta.text)
+                stream.get_final_message()
+            check("вслух только ответ", "".join(pieces), "Привет!")
+            # Клиент пинги проглатывает молча — до событий они не доходят, и
+            # проверять их наличие надо в сыром потоке, ниже.
+            check("клиент на пингах не спотыкается", "message_stop" in events, True)
+
+            import json
+            import urllib.request
+            req = urllib.request.Request(
+                url + "/v1/messages",
+                data=json.dumps({"model": "неважно", "max_tokens": 64,
+                                 "stream": True,
+                                 "messages": [{"role": "user", "content": "привет"}]}
+                                ).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                сырое = resp.read().decode("utf-8")
+            check("знаки жизни ушли в поток", "event: ping" in сырое, True)
+            # И — главное — размышления в сыром потоке тоже отсутствуют.
+            check("размышления не ушли даже сырыми", "Надо подумать" in сырое, False)
+        finally:
+            srv.shutdown()
+    finally:
+        kuzya_pc.PING_SECONDS = было
+
+
+def test_no_think() -> None:
+    """Мягкий выключатель размышлений должен стоять там, где Qwen его читает.
+
+    Сначала он стоял в системном сообщении — и Qwen3 его проигнорировал: на
+    живом роботе восемьсот токенов размышлений на «привет». Выключатель
+    разбирает шаблон разговора, и смотрит он на последнюю реплику человека.
+    """
+    section("выключатель размышлений на своём месте")
+    from kuzya_pc import _no_think
+
+    out = _no_think([
+        {"role": "system", "content": "ты робот"},
+        {"role": "user", "content": "привет"},
+        {"role": "assistant", "content": "здравствуй"},
+        {"role": "user", "content": "как дела"},
+    ])
+    check("дописан к последней реплике человека", out[3]["content"], "как дела /no_think")
+    check("системное сообщение не тронуто", out[0]["content"], "ты робот")
+    check("ранняя реплика не тронута", out[1]["content"], "привет")
+
+    # Круг с результатом инструмента: дописывать некуда, структура строгая.
+    жёсткое = [{"role": "user", "content": [{"type": "tool_result", "content": "12.4"}]}]
+    check("результат инструмента не портим", _no_think(жёсткое), жёсткое)
+    check("без реплик человека не падаем", _no_think([]), [])
+
+
 def test_tool_call() -> None:
     section("вызов инструмента через мост")
     import anthropic
@@ -254,6 +340,13 @@ def test_unthink() -> None:
     check("короткий ответ без размышлений доходит целиком",
           через(["Привет", ", Игорь!"]), "Привет, Игорь!")
     check("длинный ответ не теряется", через(["а" * 500]), "а" * 500)
+    # Оборванный ответ ничего не доказывает: тег мог быть в той части, которая
+    # не сгенерировалась. Раньше такой ответ переубеждал фильтр — и следующие
+    # размышления ехали прямиком в речь.
+    f = Unthink({"м": True}, "м")
+    f.feed("думаю без конца")
+    check("оборванный ответ не переубеждает", f.close(complete=False), "думаю без конца")
+    check("привычка устояла", f.habit.get("м"), True)
     # Порога, после которого фильтр отпускает начало, быть не должно: на живом
     # роботе размышления оказались в пять раз длиннее любого разумного порога.
     ворох = "Надо ответить коротко. Хотя лучше переспросить. " * 30
@@ -269,6 +362,11 @@ def test_unthink() -> None:
     check("молчун запомнен", привычка.get("м"), False)
     f = Unthink(привычка, "м")
     check("молчуна не придерживаем", f.feed("Привет"), "Привет")
+    # Учимся несимметрично: «думает» — доказанный факт, «не думает» — всего
+    # лишь отсутствие улики. Один ответ без тега не отменяет увиденного.
+    привычка = {"м": True}
+    через(["Привет!"], привычка)
+    check("один ответ без тега не отменяет доказанного", привычка.get("м"), True)
 
 
 def test_stt_confidence() -> None:
@@ -331,7 +429,8 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_tool_call, test_broken,
+    for test in (test_messages, test_stream, test_ping, test_no_think,
+                 test_tool_call, test_broken,
                  test_unthink, test_stt_confidence, test_health):
         test()
         print("   ...")
