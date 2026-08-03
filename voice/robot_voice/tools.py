@@ -1116,8 +1116,9 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="rates",
-            hidden=True,
-            description="Курс доллара и евро по Центробанку.",
+            description="Курс доллара и евро по Центробанку. Зови всегда, "
+                        "когда спрашивают про курс: по памяти ты назовёшь "
+                        "прошлогодний.",
             input_schema=EMPTY_SCHEMA,
             run=rates,
         ),
@@ -1140,8 +1141,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="stop_radio",
-                hidden=True,
-                description="Выключить музыку.",
+                description="Выключить музыку или радио.",
                 input_schema=EMPTY_SCHEMA,
                 run=stop_radio,
             ),
