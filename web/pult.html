@@ -921,8 +921,16 @@ const FLOOR_UP = 0.01, FLOOR_DOWN = 0.08;
 const FLOOR_FAST = 0.25, FLOOR_LEARN = 1500;
 // Во сколько раз громче фона — это уже человек, а не комната. И нижняя
 // граница, чтобы в полной тишине не приглушать музыку от скрипа стула.
-const VOICE_OVER = 2.5, VOICE_MIN = 0.045;
-const DUCK_HOLD = 2000;   // мс: столько держим музыку тихой после последнего слова
+const VOICE_OVER = 3.5, VOICE_MIN = 0.07;
+const DUCK_HOLD = 1500;   // мс: столько держим музыку тихой после последнего слова
+// Сколько блоков подряд должно быть громко, чтобы это считалось речью. Блок —
+// около 85 мс, так что четыре это треть секунды непрерывного звука. Звон
+// посуды, хлопок двери и скрип стула в это не укладываются, а слово — да.
+// Без счётчика музыка приглушалась на каждый шорох в комнате: на живом роботе
+// это выглядело как «при каждом звуке уменьшает громкость», и правильно
+// выглядело — приглушал я, а не Яндекс.
+const VOICE_RUN = 4;
+let loudRun = 0;
 
 // Видимый уровень: без него «робот меня не слышит» проверяется только
 // командами на роботе. Кнопка краснеет, когда в микрофон реально говорят.
@@ -934,9 +942,9 @@ function micLevel(peak) {
   const учимся = Date.now() < learnUntil;
   const вверх = учимся ? FLOOR_FAST : FLOOR_UP;
   micFloor += (peak - micFloor) * (peak > micFloor ? вверх : FLOOR_DOWN);
-  if (!учимся && peak > Math.max(VOICE_MIN, micFloor * VOICE_OVER)) {
-    duckUntil = Date.now() + DUCK_HOLD;
-  }
+  const громко = peak > Math.max(VOICE_MIN, micFloor * VOICE_OVER);
+  loudRun = громко && !учимся ? loudRun + 1 : 0;
+  if (loudRun >= VOICE_RUN) duckUntil = Date.now() + DUCK_HOLD;
   setRadioVolume();
 
   if (micPeak > 0.02) {
