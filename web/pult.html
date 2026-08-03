@@ -612,6 +612,12 @@ function playNext() {
 }
 player.addEventListener('ended', () => { playing = false; playNext(); });
 player.addEventListener('error', () => { playing = false; playNext(); });
+// Поток может не пойти уже после запуска: кодек не тот, станция легла,
+// адрес переехал. Молчать об этом нельзя — робот-то отрапортовал «включаю»,
+// и человек будет думать, что оглох он, а не радио.
+radio.addEventListener('error', () => {
+  if (radio.getAttribute('src')) showCaption('Радио не играет — станция молчит');
+});
 
 function showCaption(text, mine) {
   if (!text) return;
@@ -649,7 +655,10 @@ function listen() {
       radio.volume = RADIO_LOUD;
       // Автовоспроизведение без жеста браузер запрещает. Звук в пульте
       // включают кнопкой — этот жест и разрешает поток.
-      radio.play().catch(() => showCaption('Нажмите 🔈, чтобы включить звук'));
+      radio.play().catch(err => showCaption(
+        err && err.name === 'NotAllowedError'
+          ? 'Нажмите 🔈, чтобы включить звук'
+          : 'Поток не пошёл: ' + (err && err.message || 'неизвестно')));
       return;
     }
     if (data.heard !== undefined) {   // что робот расслышал

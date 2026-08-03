@@ -37,6 +37,12 @@ ASK = 20
 # Ниже этого битрейта звук уже неприятный: шипение вместо музыки.
 DECENT = 64
 
+# Браузер играет не всё. MP3 понимают все и всегда; AAC+ (в каталоге это
+# codec=AAC+ и адреса вида .aacp) Chrome тянет через раз, а Firefox не тянет
+# вовсе. На живом роботе именно на этом всё и встало: станция нашлась, адрес
+# уехал в пульт, робот отрапортовал «музыка включена» — и тишина.
+PLAYABLE = ("MP3",)
+
 
 def _search(**params) -> list[dict]:
     query = urllib.parse.urlencode({
@@ -53,16 +59,29 @@ def _search(**params) -> list[dict]:
     return found if isinstance(found, list) else []
 
 
+def _playable(station: dict) -> bool:
+    """Сможет ли браузер это проиграть."""
+    codec = (station.get("codec") or "").upper()
+    адрес = (station.get("url_resolved") or station.get("url") or "").lower()
+    if codec and codec not in PLAYABLE:
+        return False
+    # Кодек в каталоге проставлен не у всех, поэтому смотрим и на адрес.
+    return not адрес.split("?")[0].endswith((".aacp", ".aac", ".m3u8", ".ogg"))
+
+
 def _best(stations: list[dict]) -> dict | None:
-    """Лучшая из найденных: живая, не тихая, с приличным звуком."""
+    """Лучшая из найденных: живая, играбельная, с приличным звуком."""
     годные = [s for s in stations
               if (s.get("url_resolved") or s.get("url"))
-              and int(s.get("lastcheckok") or 0) == 1]
+              and int(s.get("lastcheckok") or 0) == 1
+              and _playable(s)]
     if not годные:
         return None
     # Сначала приличный битрейт, потом популярность. Каталог уже отсортирован
     # по числу включений, поэтому достаточно устойчивой сортировки по звуку.
-    годные.sort(key=lambda s: int(s.get("bitrate") or 0) >= DECENT, reverse=True)
+    # Нулевой битрейт в каталоге значит «неизвестно», а не «плохо».
+    годные.sort(key=lambda s: int(s.get("bitrate") or DECENT) >= DECENT,
+                reverse=True)
     return годные[0]
 
 
@@ -78,18 +97,22 @@ def find(what: str, language: str = "russian") -> tuple[str, str] | None:
     what = " ".join(what.split())
     if not what:
         return None
+    # codec=MP3 просим прямо у каталога: так меньше шансов, что все двадцать
+    # найденных окажутся в AAC и выбирать будет не из чего.
     попытки = (
+        {"name": what, "codec": "MP3"},
+        {"tag": what, "language": language, "codec": "MP3"},
+        {"tag": what, "codec": "MP3"},
         {"name": what},
-        {"tag": what, "language": language},
         {"tag": what},
-        {"name": what, "language": language},
     )
     for params in попытки:
         станция = _best(_search(**params))
         if станция:
             имя = " ".join((станция.get("name") or "радио").split())
             поток = станция.get("url_resolved") or станция.get("url")
-            log.info("радио: %s (%s кбит) → %s", имя,
+            log.info("радио: %s (%s, %s кбит) → %s", имя,
+                     станция.get("codec") or "кодек неизвестен",
                      станция.get("bitrate"), поток)
             return имя, поток
     return None
