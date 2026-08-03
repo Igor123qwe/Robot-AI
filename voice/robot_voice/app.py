@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from .brain import Brain
 from .busyflag import BusyFlag
 from .config import Config
 from .notes import Notes
+from .people import People
 from .ros import Ros
 from .state import State
 from .stt import Recognizer, Remote
@@ -369,7 +371,11 @@ def main() -> None:
     timers = Timers(announce=voice.say, store=cfg.data_dir / "timers.json")
     notes = Notes(cfg.data_dir / "notes.json")
     addressed = Addressed()
+    people = People(cfg.data_dir / "люди.json")
+    # Кто говорит — узнаётся заново на каждой фразе, поэтому инструменту
+    # передаётся не имя, а способ его спросить.
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
+                        people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed)
     brain = Brain(cfg, tools)
 
@@ -412,7 +418,7 @@ def main() -> None:
     while True:
         try:
             _listen_loop(cfg, listener, recognizer, brain, voice, tools,
-                         addressed, ros)
+                         addressed, ros, people)
         except KeyboardInterrupt:
             shutdown(None, None)
         except Exception:
@@ -476,6 +482,160 @@ class Addressed:
         return self.by_name and self.sure
 
 
+class Enrolling:
+    """Знакомство: несколько фраз подряд уходят в слепок голоса.
+
+    По одной фразе голос не запомнить — в ней слишком мало тембра и слишком
+    много случайного: простуда, зевок, шум холодильника. Поэтому просим три и
+    усредняем; каждая следующая уточняет слепок, а не заменяет его.
+
+    Имя человек называет голосом, а не набирает: клавиатуры у робота нет.
+    Поэтому знакомство идёт двумя шагами — сначала имя, потом фразы.
+    """
+
+    NEED = 3
+
+    def __init__(self, pc_url: str) -> None:
+        self.pc_url = pc_url.rstrip("/")
+        self.name = ""
+        self.left = 0
+        self.asking_name = False
+
+    def busy(self) -> bool:
+        return self.asking_name or self.left > 0
+
+    def start(self, voice, known: str = "") -> None:
+        """Начинает знакомство. Если человек уже узнан — просто уточняем слепок."""
+        if not self.pc_url:
+            voice.say("Голоса я не запоминаю: для этого нужен компьютер.")
+            return
+        if known:
+            self.name, self.left, self.asking_name = known, self.NEED, False
+            voice.say(f"Хорошо, {known}. Скажи три любые фразы, я послушаю.")
+            return
+        self.name, self.left, self.asking_name = "", 0, True
+        voice.say("Давай знакомиться. Как тебя зовут?")
+
+    def stop(self) -> None:
+        self.name, self.left, self.asking_name = "", 0, False
+
+    def take(self, wav: bytes, who: str, voice, people) -> bool:
+        """Забирает фразу себе, если идёт знакомство. True — забрала."""
+        if not self.busy():
+            return False
+        if self.asking_name:
+            # Имя разбирается из уже распознанного текста, а не отсюда: здесь
+            # только звук. Ждём, пока главный цикл позовёт name_is().
+            return False
+        wav_left = self.left
+        try:
+            resp = _post(f"{self.pc_url}/voice/enroll?имя="
+                         + urllib.parse.quote(self.name), wav)
+            фраз = int((resp or {}).get("фраз") or 0)
+        except Exception as e:
+            log.warning("не смог запомнить голос (%s)", e)
+            self.stop()
+            voice.say("Не вышло запомнить голос. Попробуем позже.")
+            return True
+        self.left -= 1
+        log.info("знакомство с %s: фраз в слепке %d, осталось сказать %d",
+                 self.name, фраз, self.left)
+        if self.left > 0:
+            voice.say("Ещё.")
+            return True
+        people.met(self.name)
+        self.stop()
+        voice.say(f"Запомнил твой голос, {self.name}. Теперь узнаю.")
+        return wav_left > 0
+
+    def name_is(self, text: str, voice) -> bool:
+        """Приняли имя в ответ на «как тебя зовут». True — приняли."""
+        if not self.asking_name:
+            return False
+        name = _person_name(text)
+        if not name:
+            voice.say("Не разобрал имя. Скажи его одним словом.")
+            return True
+        self.name, self.left, self.asking_name = name, self.NEED, False
+        voice.say(f"Очень приятно, {name}. Скажи три любые фразы, я послушаю.")
+        return True
+
+
+# Разговор про самих людей: знакомство, память, забвение. Правилами, а не
+# моделью, — это команды роботу, а не тема для беседы, и ошибаться тут нельзя:
+# «забудь про меня» должно стирать дело, а не отвечать «хорошо, забыл».
+_KNOW_ME = re.compile(
+    r"^(запомни|запоминай)\s+(мой\s+голос|меня)$|^познакомимся$|^давай\s+знакомиться$")
+_WHO_AM_I = re.compile(r"^(кто\s+я|ты\s+знаешь,?\s+кто\s+я|узнаешь\s+меня)\??$")
+_WHAT_ABOUT_ME = re.compile(
+    r"^что\s+ты\s+(обо?\s+мне\s+)?(знаешь|помнишь)(\s+обо?\s+мне)?\??$")
+_FORGET_ME = re.compile(r"^забудь\s+(про\s+меня|меня|мой\s+голос|обо\s+мне)$")
+_REMEMBER = re.compile(r"^запомни,?\s+(?:что\s+)?(.{3,})$")
+
+
+def _about_people(command: str, who: str, voice, people, enrolling, cfg) -> bool:
+    """Разговор о самих людях. True — разобрались, модель звать не надо."""
+    bare = command.strip().lower().replace("ё", "е").rstrip(".!")
+
+    if _KNOW_ME.match(bare):
+        enrolling.start(voice, who)
+        return True
+    if _WHO_AM_I.match(bare):
+        voice.say(f"Ты {who}." if who else
+                  "Пока не узнаю тебя по голосу. Скажи «запомни мой голос».")
+        return True
+    if _WHAT_ABOUT_ME.match(bare):
+        voice.say(people.tell(who))
+        return True
+    if _FORGET_ME.match(bare):
+        said = people.forget(who)
+        if who and cfg.tts_url:
+            # Слепок голоса живёт на ПК, дело — на роботе. Стираем оба: иначе
+            # робот «забыл» человека, но продолжает его узнавать.
+            try:
+                _post(f"{(cfg.tts_url or cfg.pc_url).rstrip('/')}/voice/forget?имя="
+                      + urllib.parse.quote(who), b"")
+            except Exception as e:
+                log.warning("слепок голоса на ПК стереть не вышло (%s)", e)
+        voice.say(said)
+        return True
+    m = _REMEMBER.match(bare)
+    if m:
+        voice.say(people.remember(who, m.group(1)))
+        return True
+    return False
+
+
+# Служебные слова, которые в позиции имени встречаются, а именами не бывают.
+_NOT_A_WORD = {"не", "мне", "тебе", "меня", "тебя", "имя", "зовут", "это",
+               "скажу", "буду", "хочу", "знаю", "помню", "думаю"}
+
+
+def _person_name(text: str) -> str:
+    """Имя из фразы «меня зовут Игорь», «я Игорь» или просто «Игорь»."""
+    bare = text.strip().strip(".!?,")
+    # Длинную фразу именем не считаем вовсе: «а я не скажу тебе имя» — это не
+    # знакомство. Границы слов обязательны: без них «меНЯ зовут» давало «Зовут».
+    if len(bare.split()) > 4:
+        return ""
+    m = re.search(r"\b(?:зовут|это|я)\s+([А-ЯЁA-Za-zа-яё-]{2,20})", bare, re.I)
+    # Без «меня зовут» берём первое слово: «Игорь Петрович» — тоже имя, а звать
+    # человека двойным именем в каждой реплике незачем.
+    word = m.group(1) if m else bare.split()[0] if bare.split() else ""
+    word = word.strip("-").capitalize()
+    if len(word) < 2 or word.lower() in _NOT_A_NAME or word.lower() in _NOT_A_WORD:
+        return ""
+    return word
+
+
+def _post(url: str, data: bytes) -> dict:
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "audio/wav"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        import json as _json
+        return _json.loads(resp.read() or b"{}")
+
+
 class Turn:
     """Секундомер одного обмена: куда именно уходит время до ответа.
 
@@ -517,8 +677,10 @@ class Turn:
 
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                  brain: Brain, voice: Voice, tools: list,
-                 addressed: Addressed, ros=None) -> None:
+                 addressed: Addressed, ros=None, people: People | None = None) -> None:
     by_name = {t.name: t for t in tools}
+    if people is None:
+        people = People(cfg.data_dir / "люди.json")
     name = cfg.wake_words[0].capitalize() if cfg.wake_words else "робот"
     log.info("слушаю, имя — %s, разговор держится %.0f с после ответа",
              name, cfg.session_seconds)
@@ -527,6 +689,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
     # в разговоре и отвечает без имени, пока не замолчат.
     awake_until = 0.0
 
+    enrolling = Enrolling(cfg.tts_url or cfg.pc_url)
     debug_audio = os.environ.get("ROBOT_DEBUG_AUDIO") == "1"
     if debug_audio:
         log.info("записи услышанного складываю в /tmp/robot-audio")
@@ -542,6 +705,14 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         turn = Turn(cfg.silence_ms / 1000.0)
         text = recognizer.transcribe(wav)
         turn.recognized()
+        # Кто это сказал. Пусто — ПК не узнал голос, выключен или узнавание
+        # не поднято; тогда робот разговаривает, никого не различая.
+        who = getattr(recognizer, "speaker", "")
+        if enrolling.take(wav, who, voice, people):
+            continue
+        brain.about = people.brief(who)
+        if who:
+            people.met(who)
         # Насколько распознавание само себе верит. Пишем в лог всегда: без
         # живых чисел порог подбирается гаданием, а цена ошибки здесь —
         # уехавший робот.
@@ -609,6 +780,16 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             continue
 
         log.info("человек: %s", command)
+
+        # Знакомство идёт своим порядком и главнее правил: пока робот ждёт
+        # имя, «Игорь» — это ответ ему, а не команда.
+        if enrolling.name_is(command, voice):
+            awake_until = time.monotonic() + cfg.session_seconds
+            continue
+        if _about_people(command, who, voice, people, enrolling, cfg):
+            awake_until = time.monotonic() + cfg.session_seconds
+            last_talk = brain.last_talk = time.monotonic()
+            continue
 
         # Простые команды разбираем правилами: мгновенно, бесплатно и без
         # риска, что модель поймёт «влево» как «вправо». Всё остальное — модели.

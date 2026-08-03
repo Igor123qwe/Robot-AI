@@ -247,6 +247,10 @@ class Brain:
         # список, громкость и прочее — модели эти схемы возить незачем.
         self.specs = [t.spec() for t in tools if not t.hidden]
 
+        # Кто сейчас говорит и что робот о нём помнит. Ставится главным циклом
+        # перед каждой репликой; пусто — человек не узнан.
+        self.about = ""
+
         self.endpoints: list[Endpoint] = []
         if cfg.local_api_base:
             # Основной. Ключ тут формальность: своя машина в своей сети пароля
@@ -319,7 +323,7 @@ class Brain:
         return live or self.endpoints[-1:]
 
     # --- параметры запроса ----------------------------------------------
-    def _params(self, ep: Endpoint, messages: list[dict]) -> dict:
+    def _params(self, ep: Endpoint, messages: list[dict]) -> dict:  # noqa: C901
         params = dict(
             model=ep.model,
             max_tokens=self.cfg.max_tokens,
@@ -342,6 +346,14 @@ class Brain:
                 "text": SYSTEM_PROMPT,
                 "cache_control": {"type": "ephemeral"},
             }]
+        if self.about:
+            # Справка о том, кто сейчас говорит, — отдельным блоком и ПОСЛЕ
+            # кэшируемого. Она меняется от человека к человеку, и если
+            # подмешать её в основной промпт, кэш перестанет совпадать: полторы
+            # тысячи токенов начнут оплачиваться заново в каждой реплике.
+            after = [{"type": "text", "text": self.about}]
+            params["system"] = (params["system"] if isinstance(params["system"], list)
+                                else [{"type": "text", "text": params["system"]}]) + after
         return params
 
     @staticmethod

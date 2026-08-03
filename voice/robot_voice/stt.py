@@ -78,6 +78,11 @@ class Recognizer:
         # отдельным полем, а не в возвращаемом значении: слушатель один, а
         # менять форму ответа ради этого пришлось бы во всех вызовах.
         self.confidence: float | None = None
+        # Кого узнал ПК по голосу и насколько похоже. Своего узнавания у
+        # робота нет: модель для этого нужна отдельная, а видеокарты у него
+        # нет вовсе.
+        self.speaker = ""
+        self.similarity = 0.0
         log.info("whisper: готов")
 
     def transcribe(self, wav_bytes: bytes) -> str:
@@ -157,6 +162,9 @@ class Remote:
         self._said_local = False
         # Уверенность последнего распознавания — см. Recognizer.confidence.
         self.confidence: float | None = None
+        # Кого узнал ПК по голосу и насколько похоже.
+        self.speaker = ""
+        self.similarity = 0.0
 
     def transcribe(self, wav_bytes: bytes) -> str:
         if time.monotonic() >= self._down_until:
@@ -179,6 +187,10 @@ class Remote:
             body = resp.json()
             text = (body.get("text") or "").strip()
             self.confidence = body.get("sure")
+            # Кто это сказал. Пусто — ПК не узнал голос или узнавание
+            # выключено; робот тогда разговаривает, никого не различая.
+            self.speaker = (body.get("кто") or "").strip()
+            self.similarity = float(body.get("похожесть") or 0.0)
         except Exception as e:
             self._down_until = time.monotonic() + PC_DOWN
             log.warning("ПК не распознал (%s) — перехожу на свои силы", e)
@@ -188,14 +200,20 @@ class Remote:
         if made_up(text):
             log.info("ПК выдумал концовку ролика (%r) — считаю тишиной", text)
             text, self.confidence = "", None
-        log.info("ПК: %.2f с | уверенность %s → %r",
+        log.info("ПК: %.2f с | уверенность %s | %s → %r",
                  time.monotonic() - started,
                  f"{self.confidence:.2f}" if self.confidence is not None else "—",
+                 f"{self.speaker} {self.similarity:.2f}" if self.speaker
+                 else f"не узнал {self.similarity:.2f}",
                  text)
         self._said_local = False
         return text
 
     def _fallback(self, wav_bytes: bytes) -> str:
+        # Узнавание по голосу живёт на ПК. Раз мы сюда попали, ПК недоступен —
+        # и тащить в разговор имя от прошлой фразы нельзя: робот показал бы
+        # одному человеку записи про другого.
+        self.speaker, self.similarity = "", 0.0
         if self._local is None:
             log.info("поднимаю распознавание на роботе — это займёт время")
             self._local = self._make_local()

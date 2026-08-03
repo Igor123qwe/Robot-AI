@@ -418,7 +418,8 @@ class Timers:
 
 def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 place: tuple[float, float] | None = None,
-                addressed: Callable[[], bool] | None = None) -> list[Tool]:
+                addressed: Callable[[], bool] | None = None,
+                people=None, who: Callable[[], str] | None = None) -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
     speaker нужен для громкости и «повтори», notes — для списка покупок,
@@ -1015,6 +1016,30 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 description="Повторить последнюю сказанную фразу.",
                 input_schema=EMPTY_SCHEMA,
                 run=repeat,
+            ),
+        ]
+
+    if people is not None and who is not None:
+        def remember_person(факт: str) -> str:
+            return people.remember(who(), факт)
+
+        tools += [
+            Tool(
+                name="remember_person",
+                description=(
+                    "Запомнить факт о том, кто сейчас говорит: что любит, чем "
+                    "занят, о чём просил не забыть. Зови, когда человек сказал "
+                    "о себе что-то, что стоит помнить в следующий раз."),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "факт": {"type": "string",
+                                 "description": "Коротко, одной фразой: "
+                                                "«любит крепкий чай», «работает по ночам»."},
+                    },
+                    "required": ["факт"],
+                },
+                run=remember_person,
             ),
         ]
 

@@ -16,7 +16,11 @@
   POST /tts           текст → звук WAV. Silero вместо piper: сам ставит
                       ударения, различает омографы и поднимает интонацию на
                       вопросе. Робот говорит голосом, а не диктором вокзала.
-  GET  /health        что живо: Ollama, модель, Whisper, голос, видеокарта.
+  POST /voice/enroll  запомнить голос человека (имя в запросе, wav в теле).
+                      Робот шлёт сюда несколько фраз подряд, и слепок
+                      уточняется каждой.
+  POST /voice/forget  забыть голос.
+  GET  /health        что живо: Ollama, модель, Whisper, голос, кого узнаём.
 
 Почему не LiteLLM. Он умеет то же самое, но это полтысячи мегабайт
 зависимостей и отдельное окно, которое надо не закрыть. Здесь один файл,
@@ -746,6 +750,169 @@ class Whisper:
 
 
 # --------------------------------------------------------------------------
+# Кто говорит
+# --------------------------------------------------------------------------
+class Voiceprints:
+    """Узнаёт человека по голосу.
+
+    Работает не на словах, а на тембре: ECAPA-TDNN сворачивает любую фразу в
+    вектор из двух сотен чисел, и у одного человека эти векторы лежат кучно, а
+    у разных людей — врозь. Сравнение — косинус между векторами.
+
+    Зачем это роботу. Во-первых, чтобы не отвечать телевизору: голос диктора
+    не совпадёт ни с чьим слепком. Во-вторых, чтобы знать, с кем разговаривает,
+    и держать на каждого своё личное дело.
+
+    Слепки лежат здесь, на ПК, — там же, где считаются. Личные дела живут на
+    роботе: они нужны ему для разговора и тогда, когда ПК выключен.
+
+    Порог намеренно строгий. Ошибиться в сторону «не узнал» дёшево: робот
+    переспросит. Ошибиться в другую — значит показать одному человеку записи
+    про другого.
+    """
+
+    # Косинус между слепками. У ECAPA свой человек обычно даёт 0.7 и выше,
+    # чужой — 0.3 и ниже. Настоящее число подберём по живому логу: похожесть
+    # пишется в каждый ответ ровно ради этого.
+    SAME = 0.62
+    RATE = 16000
+    MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+
+    def __init__(self, store: Path) -> None:
+        self.store = store
+        self._model = None
+        self._lock = threading.Lock()
+        self.people: dict[str, dict] = {}
+        self.ready = False
+        self._read()
+
+    # --- хранение --------------------------------------------------------
+    def _read(self) -> None:
+        try:
+            self.people = json.loads(self.store.read_text("utf-8"))
+        except (OSError, ValueError):
+            self.people = {}
+
+    def _write(self) -> None:
+        try:
+            self.store.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.store.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.people, ensure_ascii=False), "utf-8")
+            tmp.replace(self.store)
+        except OSError as e:
+            log.warning("не сохранил слепки голосов (%s)", e)
+
+    # --- модель ----------------------------------------------------------
+    def _load(self):
+        from speechbrain.inference.speaker import EncoderClassifier
+
+        where = Path(os.environ.get("HF_HOME", Path.home() / ".cache")) / "ecapa"
+        return EncoderClassifier.from_hparams(
+            source=self.MODEL, savedir=str(where), run_opts={"device": "cpu"})
+
+    def warm(self) -> None:
+        started = time.monotonic()
+        with self._lock:
+            if self._model is None:
+                try:
+                    self._model = self._load()
+                except Exception as e:
+                    log.warning("узнавание по голосу не поднялось (%s) — робот "
+                                "будет считать всех одним человеком", e)
+                    return
+        self.ready = True
+        log.info("узнаю по голосу %d: %s, прогрев занял %.0f с",
+                 len(self.people), ", ".join(self.people) or "никого",
+                 time.monotonic() - started)
+
+    def _vector(self, wav: bytes):
+        """Слепок голоса из wav. None — фраза слишком коротка или модели нет."""
+        import io
+        import wave as wavelib
+
+        import numpy as np
+        import torch
+
+        with wavelib.open(io.BytesIO(wav)) as w:
+            rate = w.getframerate()
+            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+        if w.getnchannels() > 1:
+            pcm = pcm[::w.getnchannels()]
+        # Меньше секунды — на таком тембр не разобрать, и слепок выйдет
+        # случайным. Лучше честно не узнать, чем узнать не того.
+        if len(pcm) < rate:
+            return None
+        signal = pcm.astype("float32") / 32768.0
+        if rate != self.RATE:
+            # Простое прореживание по времени. Модель ждёт шестнадцать
+            # килогерц, а робот может прислать что угодно.
+            index = np.linspace(0, len(signal) - 1, int(len(signal) * self.RATE / rate))
+            signal = np.interp(index, np.arange(len(signal)), signal).astype("float32")
+
+        with self._lock:
+            if self._model is None:
+                self._model = self._load()
+                self.ready = True
+            vector = self._model.encode_batch(torch.from_numpy(signal).unsqueeze(0))
+        vector = vector.squeeze().detach().numpy()
+        return vector / (float(np.linalg.norm(vector)) or 1.0)
+
+    # --- работа ----------------------------------------------------------
+    def identify(self, wav: bytes) -> tuple[str, float]:
+        """Кто это сказал и насколько похоже. Пустое имя — не узнал."""
+        if not self.people:
+            return "", 0.0
+        try:
+            mine = self._vector(wav)
+        except Exception as e:
+            log.warning("не смог снять слепок голоса (%s)", e)
+            return "", 0.0
+        if mine is None:
+            return "", 0.0
+
+        import numpy as np
+
+        best, score = "", -1.0
+        for name, card in self.people.items():
+            near = float(np.dot(mine, np.asarray(card["вектор"], dtype="float32")))
+            if near > score:
+                best, score = name, near
+        if score < self.SAME:
+            log.info("голос не опознан (ближе всех %s: %.2f)", best, score)
+            return "", score
+        return best, score
+
+    def enroll(self, name: str, wav: bytes) -> int:
+        """Добавляет фразу к слепку человека. Возвращает, сколько их всего."""
+        mine = self._vector(wav)
+        if mine is None:
+            raise ValueError("фраза короче секунды — по такой голос не запомнить")
+
+        import numpy as np
+
+        card = self.people.get(name) or {"вектор": [0.0] * len(mine), "фраз": 0}
+        было = np.asarray(card["вектор"], dtype="float32") * card["фраз"]
+        # Скользящее среднее: каждая новая фраза уточняет слепок, а не
+        # заменяет его. Один зевок или кашель тогда не портит всё.
+        средний = (было + mine) / (card["фраз"] + 1)
+        средний = средний / (float(np.linalg.norm(средний)) or 1.0)
+        self.people[name] = {"вектор": [float(x) for x in средний],
+                             "фраз": card["фраз"] + 1}
+        self._write()
+        log.info("голос %s запомнен, фраз в слепке: %d",
+                 name, self.people[name]["фраз"])
+        return self.people[name]["фраз"]
+
+    def forget(self, name: str) -> bool:
+        if name not in self.people:
+            return False
+        del self.people[name]
+        self._write()
+        log.info("слепок голоса %s забыт", name)
+        return True
+
+
+# --------------------------------------------------------------------------
 # Голос
 # --------------------------------------------------------------------------
 class Voice:
@@ -883,6 +1050,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Робот спрашивает это при старте: есть голос на ПК или
                 # говорить своим piper.
                 "голос": getattr(getattr(cfg, "voice", None), "ready", False),
+                "узнаю_по_голосу": sorted(
+                    getattr(getattr(cfg, "who", None), "people", {})),
             })
             return
         self._json(404, {"error": "нет такого адреса"})
@@ -895,8 +1064,50 @@ class Handler(BaseHTTPRequestHandler):
             self._stt()
         elif path.endswith("/tts"):
             self._tts()
+        elif path.endswith("/voice/enroll"):
+            self._enroll()
+        elif path.endswith("/voice/forget"):
+            self._forget()
         else:
             self._json(404, {"error": "нет такого адреса"})
+
+    # --- кто говорит ---
+    def _who(self):
+        return getattr(self.server.cfg, "who", None)
+
+    def _name_asked(self) -> str:
+        from urllib.parse import parse_qs, urlparse
+        return (parse_qs(urlparse(self.path).query).get("имя", [""])[0]
+                or parse_qs(urlparse(self.path).query).get("name", [""])[0]).strip()
+
+    def _enroll(self) -> None:
+        who = self._who()
+        if who is None:
+            self._json(503, {"error": "узнавание по голосу не поднято"})
+            return
+        name = self._name_asked()
+        wav = self._body()
+        if not name or not wav:
+            self._json(400, {"error": "нужны имя в запросе и wav в теле"})
+            return
+        try:
+            фраз = who.enroll(name, wav)
+        except ValueError as e:
+            self._json(400, {"error": str(e)})
+            return
+        except Exception as e:
+            log.exception("не смог запомнить голос")
+            self._json(500, {"error": str(e)})
+            return
+        self._json(200, {"кто": name, "фраз": фраз})
+
+    def _forget(self) -> None:
+        who = self._who()
+        if who is None:
+            self._json(503, {"error": "узнавание по голосу не поднято"})
+            return
+        name = self._name_asked()
+        self._json(200, {"кто": name, "забыт": bool(name) and who.forget(name)})
 
     # --- голос ---
     def _tts(self) -> None:
@@ -946,7 +1157,14 @@ class Handler(BaseHTTPRequestHandler):
         # Уверенность едет вместе с текстом: по ней робот решает, выполнять
         # услышанное или переспросить. Так делают все, у кого команда может
         # что-то сдвинуть с места.
-        self._json(200, {"text": text, "sure": sure})
+        # Кто это сказал. Робот по этому решает, с кем разговаривает, и не
+        # отвечает ли он телевизору.
+        кто, похожесть = "", 0.0
+        who = self._who()
+        if who is not None and text:
+            кто, похожесть = who.identify(wav)
+        self._json(200, {"text": text, "sure": sure,
+                         "кто": кто, "похожесть": round(похожесть, 3)})
 
     # --- разговор ---
     def _messages(self) -> None:
@@ -1180,11 +1398,13 @@ class Handler(BaseHTTPRequestHandler):
 
 class Config:
     def __init__(self, model: str, whisper: Whisper, ollama: Ollama,
-                 voice: Voice | None = None) -> None:
+                 voice: Voice | None = None,
+                 who: Voiceprints | None = None) -> None:
         self.model = model
         self.whisper = whisper
         self.ollama = ollama
         self.voice = voice
+        self.who = who
 
 
 def main() -> int:
@@ -1204,6 +1424,8 @@ def main() -> int:
     p.add_argument("--voice", default=Voice.VOICES[0],
                    help="голос синтеза: " + "|".join(Voice.VOICES) +
                         " либо «нет», чтобы робот говорил своим piper")
+    p.add_argument("--no-voiceprints", action="store_true",
+                   help="не узнавать людей по голосу")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
@@ -1219,8 +1441,10 @@ def main() -> int:
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
     ollama = Ollama(args.ollama, think=args.think)
+    рядом = Path(os.environ.get("HF_HOME", Path.home() / ".cache")) / "кузя"
     cfg = Config(args.model, Whisper(args.whisper), ollama,
-                 None if args.voice == "нет" else Voice(speaker=args.voice))
+                 None if args.voice == "нет" else Voice(speaker=args.voice),
+                 None if args.no_voiceprints else Voiceprints(рядом / "голоса.json"))
 
     if not ollama.alive():
         log.warning("Ollama по адресу %s не отвечает. Запустите её и оставьте "
@@ -1264,7 +1488,11 @@ def main() -> int:
         if cfg.voice is not None:
             cfg.voice.warm()
 
-    for job in (warm_whisper, warm_model, warm_voice):
+    def warm_who() -> None:
+        if cfg.who is not None:
+            cfg.who.warm()
+
+    for job in (warm_whisper, warm_model, warm_voice, warm_who):
         threading.Thread(target=job, daemon=True).start()
     try:
         srv.serve_forever()

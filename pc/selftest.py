@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import threading
 import types
 from http.server import ThreadingHTTPServer
@@ -329,6 +330,61 @@ def test_tts() -> None:
         srv.shutdown()
 
 
+def test_voiceprints() -> None:
+    """Узнавание по голосу: слепки, порог и честное «не узнал».
+
+    Саму модель здесь не поднимаем — она весит восемьдесят мегабайт и тянет
+    torch. Проверяем то, что ломается на самом деле: усреднение слепка,
+    порог похожести и то, что чужой голос не выдаётся за своего.
+    """
+    section("узнавание по голосу")
+    from kuzya_pc import Voiceprints
+
+    store = Path(tempfile.mkdtemp()) / "голоса.json"
+    who = Voiceprints(store)
+
+    # Вместо модели — заранее заданные векторы: так проверяется арифметика,
+    # а не веса нейросети.
+    векторы = {}
+
+    def fake(wav):
+        import numpy as np
+        v = np.asarray(векторы[wav], dtype="float32")
+        return v / (float(np.linalg.norm(v)) or 1.0)
+
+    who._vector = fake
+    свой, ещё, чужой = b"one", b"two", b"other"
+    векторы[свой] = [1.0, 0.0, 0.0]
+    векторы[ещё] = [0.9, 0.1, 0.0]
+    векторы[чужой] = [0.0, 1.0, 0.0]
+
+    check("никого не знаем — никого и не узнаём", who.identify(свой), ("", 0.0))
+    check("первая фраза", who.enroll("Игорь", свой), 1)
+    check("вторая уточняет", who.enroll("Игорь", ещё), 2)
+
+    name, near = who.identify(свой)
+    check("своего узнали", name, "Игорь")
+    check("и уверенно", near > Voiceprints.SAME, True)
+
+    name, near = who.identify(чужой)
+    check("чужого не выдали за своего", name, "")
+    check("похожесть честная", near < Voiceprints.SAME, True)
+
+    # Короткая фраза слепка не даёт: по полсекунде тембр не разобрать, и
+    # запомнить такое — значит потом узнавать не того.
+    who._vector = lambda wav: None
+    try:
+        who.enroll("Игорь", b"short")
+        check("короткую фразу не запоминаем", "промолчал", "ошибка")
+    except ValueError:
+        pass
+
+    check("слепки пережили перезапуск", Voiceprints(store).people["Игорь"]["фраз"], 2)
+    check("забыли", who.forget("Игорь"), True)
+    check("и правда забыли", Voiceprints(store).people, {})
+    check("чужого забыть нельзя", who.forget("Никто"), False)
+
+
 def test_warming() -> None:
     """Пока модель едет в видеопамять, мост отвечает сам — и бесплатно.
 
@@ -591,7 +647,7 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_warming, test_think_switch,
+    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch,
                  test_tool_call, test_broken,
                  test_unthink, test_stt_confidence, test_health):
         test()

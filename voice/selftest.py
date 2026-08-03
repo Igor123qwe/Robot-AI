@@ -505,6 +505,75 @@ def test_speakable() -> None:
           "Сейчас 19:12 — время ужина")
 
 
+def test_people() -> None:
+    """Личное дело: робот должен помнить, с кем говорит, и уметь забыть.
+
+    Разделение труда с ПК: слепки голосов там, где считаются, — на
+    компьютере. Дела здесь, потому что нужны в разговоре и тогда, когда
+    компьютер выключен.
+    """
+    section("личные дела")
+    from robot_voice.people import FACTS_LIMIT, People
+
+    store = Path(tempfile.mkdtemp()) / "люди.json"
+    people = People(store)
+
+    check("не узнан — запоминать некому", people.remember("", "любит чай"),
+          "Я пока не знаю, кто ты. Скажи «запомни мой голос».")
+    check("запомнили", people.remember("Игорь", "любит крепкий чай"), "Запомнил.")
+    check("дубль не копим", people.remember("Игорь", "Любит крепкий чай"),
+          "Это я уже про тебя знаю.")
+    people.met("Игорь")
+    check("встречу отметили", people.card("Игорь")["разговоров"], 1)
+
+    check("справка для модели", people.brief("Игорь"),
+          "Сейчас с тобой говорит Игорь. Что ты о нём знаешь: любит крепкий чай.")
+    check("незнакомцу справки нет", people.brief(""), "")
+    check("вслух", people.tell("Игорь"),
+          "Про тебя знаю вот что. Любит крепкий чай.")
+
+    # Дело не должно расти без предела: оно уезжает в каждый запрос.
+    for i in range(FACTS_LIMIT + 5):
+        people.remember("Игорь", f"факт номер {i}")
+    check("дело не растёт без предела",
+          len(people.card("Игорь")["факты"]), FACTS_LIMIT)
+
+    check("пережило перезапуск", People(store).card("Игорь")["разговоров"], 1)
+    check("стёрли", people.forget("Игорь"), "Всё стёр.")
+    check("и правда стёрли", People(store).known(), [])
+
+
+def test_meeting() -> None:
+    """Знакомство голосом: имя со слуха и разбор команд про самого человека."""
+    section("знакомство")
+    from robot_voice.app import _person_name
+
+    for phrase, name in [("меня зовут Игорь", "Игорь"), ("я Игорь", "Игорь"),
+                         ("Игорь", "Игорь"), ("это Настя", "Настя"),
+                         ("Игорь Петрович", "Игорь")]:
+        check(f"«{phrase}»", _person_name(phrase), name)
+    # А это не имена. «меНЯ зовут» когда-то давало «Зовут» — границы слов важны.
+    for phrase in ["ладно", "не скажу", "а я не скажу тебе имя вовсе никогда", ""]:
+        check(f"«{phrase}» — не имя", _person_name(phrase), "")
+
+    # Команды про самого человека разбираются правилами, а не моделью: «забудь
+    # про меня» должно стирать дело, а не отвечать «хорошо, забыл».
+    from robot_voice.app import (_FORGET_ME, _KNOW_ME, _REMEMBER, _WHAT_ABOUT_ME,
+                                 _WHO_AM_I)
+    check("запомни мой голос", bool(_KNOW_ME.match("запомни мой голос")), True)
+    check("давай знакомиться", bool(_KNOW_ME.match("давай знакомиться")), True)
+    check("кто я", bool(_WHO_AM_I.match("кто я")), True)
+    check("что ты обо мне знаешь",
+          bool(_WHAT_ABOUT_ME.match("что ты обо мне знаешь")), True)
+    check("что ты помнишь", bool(_WHAT_ABOUT_ME.match("что ты помнишь")), True)
+    check("забудь про меня", bool(_FORGET_ME.match("забудь про меня")), True)
+    check("запомни, что я люблю чай",
+          _REMEMBER.match("запомни, что я люблю чай").group(1), "я люблю чай")
+    # И чего эти правила ловить не должны.
+    check("«забудь» одно — это не про меня", bool(_FORGET_ME.match("забудь")), False)
+    check("«кто ты» — не «кто я»", bool(_WHO_AM_I.match("кто ты")), False)
+
+
 def test_not_for_me() -> None:
     """В открытом окне робот не должен вступать в чужой разговор.
 
@@ -1372,7 +1441,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_not_for_me, test_remote_voice,
+                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_meeting, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,
