@@ -622,7 +622,10 @@ _REMEMBER = re.compile(r"^запомни,?\s+(?:что\s+)?(.{3,})$")
 
 def _about_people(command: str, who: str, voice, people, enrolling, cfg) -> bool:
     """Разговор о самих людях. True — разобрались, модель звать не надо."""
-    bare = command.strip().lower().replace("ё", "е").rstrip(".!")
+    # Whisper охотно ставит в начале тире и кавычки — «— Кто я?». Правила
+    # про самого человека на этом спотыкались, и «кто я» уходило модели,
+    # которая отвечала по системному промпту, а не по личному делу.
+    bare = command.strip(" —–-«»\"'").lower().replace("ё", "е").rstrip(".!")
 
     if _KNOW_ME.match(bare):
         enrolling.start(voice, who)
@@ -872,9 +875,8 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         if answered:
             pass                    # это был ответ на вопрос робота
         elif match is not None and match.tool in by_name:
-            _run_direct(by_name[match.tool], match.args, voice, pending)
+            _run_direct(by_name[match.tool], match.args, voice, pending, turn)
             undo.remember(match.tool, match.args)
-            turn.spoke("правило")
         else:
             # Помечаем явно: по этим строкам в логе видно, каких формулировок
             # не хватает правилам. Это лучший источник для их пополнения —
@@ -1002,7 +1004,8 @@ class Pending:
 _ASKS_LABEL = ("Какой снять?", "Какой поставить на паузу?", "Какой продолжить?")
 
 
-def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None) -> None:
+def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None,
+                turn=None) -> None:
     """Выполняет команду, разобранную правилом, минуя модель."""
     # Инструмент вызываем до заглушения микрофона: движение стартует сразу, и
     # эти доли секунды робот ещё слышит комнату.
@@ -1012,6 +1015,11 @@ def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None) 
     elif (pending is not None and answer.endswith("?")
             and "confirmed" in tool.input_schema.get("properties", {})):
         pending.ask(tool, confirm=True, args={**args, "confirmed": True})
+    # Отметку ставим ДО say: он ждёт, пока реплика отзвучит, а секундомер
+    # меряет, когда робот ЗАГОВОРИЛ. Иначе рассказ про умения показывал
+    # «ответ 16.5 с» — это не задержка, это длина самого рассказа.
+    if turn is not None:
+        turn.spoke("правило")
     voice.say(answer)   # say сам пишет реплику в лог
 
 

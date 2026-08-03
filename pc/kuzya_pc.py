@@ -974,6 +974,16 @@ class Voice:
                     log.warning("голос не поднялся (%s) — робот будет говорить "
                                 "своим piper", e)
                     return
+        # Первая настоящая фраза иначе идёт вдесятеро дольше остальных: модель
+        # загружена, но графы вычислений строятся при первом же проходе. На
+        # живом роботе это дало 1.3 секунды на «Кузя на связи» против сотых
+        # долей потом. Прогреваем настоящим синтезом, звук выбрасываем.
+        try:
+            self._model.apply_tts(text="раз два три", speaker=self.speaker,
+                                  sample_rate=self.RATE)
+        except Exception as e:
+            log.warning("голос загрузился, но не синтезирует (%s)", e)
+            return
         self.ready = True
         log.info("голос %s готов, прогрев занял %.0f с",
                  self.speaker, time.monotonic() - started)
