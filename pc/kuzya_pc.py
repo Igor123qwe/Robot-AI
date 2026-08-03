@@ -829,7 +829,11 @@ class Handler(BaseHTTPRequestHandler):
                 used_in = int(part.get("prompt_eval_count") or 0)
                 used_out = int(part.get("eval_count") or 0)
                 truncated = part.get("done_reason") == "length"
-        if unthink.holding:
+        # Придержанное начало на конце ответа — это норма: пока про модель
+        # ничего не известно, мы держим всё. Тревожно другое — когда держали
+        # долго и много: значит либо модель думает без закрывающего тега, либо
+        # ответ обрезали посреди размышлений.
+        if unthink.holding and (truncated or len(unthink.buf) > 400):
             log.warning("ответ кончился, а размышления не закрылись — "
                         "%d символов придержано, %d токенов выхода%s",
                         len(unthink.buf), used_out,
