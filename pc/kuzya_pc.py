@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -58,6 +59,16 @@ KEEP_ALIVE = -1
 # --------------------------------------------------------------------------
 # Перевод: язык Anthropic → язык Ollama
 # --------------------------------------------------------------------------
+def _proxy_trouble(error: Exception) -> bool:
+    """Похоже ли, что виноват прокси, а не мы.
+
+    Отличать важно: на прокси стоит один раз попробовать обойти, а на
+    настоящую ошибку — нет, иначе она спрячется за повторной попыткой.
+    """
+    text = str(error).lower()
+    return "proxy" in text or "socks" in text
+
+
 def _text_of(content) -> str:
     """Текст из того, что Anthropic кладёт в поле content.
 
@@ -366,8 +377,23 @@ class Whisper:
             try:
                 model = WhisperModel(self.size, device=device, compute_type=compute)
             except Exception as e:
-                log.warning("whisper на %s не поднялся (%s)", device, e)
-                continue
+                if _proxy_trouble(e):
+                    # VPN-клиент прописывает системный прокси схемы socks4,
+                    # которую библиотека скачивания не понимает, и падает ещё
+                    # до выбора устройства. Нам прокси не нужен: модель берётся
+                    # с HuggingFace напрямую, а Ollama живёт на этой же машине.
+                    log.warning("мешает системный прокси (%s) — обхожу и пробую снова", e)
+                    os.environ["NO_PROXY"] = "*"
+                    os.environ["no_proxy"] = "*"
+                    try:
+                        model = WhisperModel(self.size, device=device,
+                                             compute_type=compute)
+                    except Exception as again:
+                        log.warning("whisper на %s не поднялся (%s)", device, again)
+                        continue
+                else:
+                    log.warning("whisper на %s не поднялся (%s)", device, e)
+                    continue
             self.device = device
             log.info("whisper: модель %s на %s", self.size, device)
             return model
@@ -626,6 +652,13 @@ def main() -> int:
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname).1s %(message)s", datefmt="%H:%M:%S")
+    # Библиотеки скачивания и HTTP на уровне INFO пишут по строке на каждый
+    # запрос, и наши сообщения в этом тонут — а окно сервера человек читает
+    # именно чтобы понять, что происходит. С --debug всё возвращается.
+    if not args.debug:
+        for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub",
+                      "filelock", "faster_whisper"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
     ollama = Ollama(args.ollama)
     cfg = Config(args.model, Whisper(args.whisper), ollama)
