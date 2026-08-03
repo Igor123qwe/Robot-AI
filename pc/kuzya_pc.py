@@ -71,6 +71,23 @@ WARMING_GRACE = 240.0
 # честнее молчания: человек слышит, что его услышали.
 WARMING_REPLY = "Секунду, я ещё просыпаюсь."
 
+# Распознавание по умолчанию — русское дообучение turbo-версии Whisper.
+#
+# Почему не стандартная. Whisper учили на всех языках сразу, и русский в нём
+# идёт довеском: отсюда «водильник» вместо будильника и «Пусть за» вместо
+# «Кузя». Дообученные на русском веса грузятся тем же самым вызовом — для кода
+# это просто другое имя, — а слов путают заметно меньше.
+#
+# Почему turbo. У неё урезан декодер: четыре слоя вместо тридцати двух. Качество
+# как у large, а по скорости она обгоняет medium — то есть мы берём модель
+# лучше и быстрее одновременно. Видеопамяти ей нужно около двух гигабайт: на
+# шестигигабайтной карте это влезает вместе с четырёхмиллиардной моделью.
+#
+# Если склад с ней недоступен, поднимется FALLBACK_WHISPER — робот не должен
+# глохнуть из-за чужого сайта.
+DEFAULT_WHISPER = "dvislobokov/faster-whisper-large-v3-turbo-russian"
+FALLBACK_WHISPER = "medium"
+
 
 # --------------------------------------------------------------------------
 # Перевод: язык Anthropic → язык Ollama
@@ -604,6 +621,26 @@ class Whisper:
         self._lock = threading.Lock()
 
     def _load(self):
+        """Грузит запрошенную модель, а если её нет — запасную.
+
+        Модель может быть не только «small» или «medium», но и чужим складом
+        на HuggingFace: русские дообучения Whisper там лежат и грузятся тем же
+        вызовом. Дело хорошее, но чужой склад может переехать или закрыться, а
+        робот от этого глохнуть не должен — поэтому под ним подстелена обычная
+        modelка из стандартного набора.
+        """
+        try:
+            return self._try(self.size)
+        except Exception as e:
+            if self.size == FALLBACK_WHISPER:
+                raise
+            log.warning("модель распознавания %r не поднялась (%s) — беру %s",
+                        self.size, e, FALLBACK_WHISPER)
+            model = self._try(FALLBACK_WHISPER)
+            self.size = FALLBACK_WHISPER
+            return model
+
+    def _try(self, size: str):
         from faster_whisper import WhisperModel
 
         # Сначала видеокарта: ради неё всё и затевалось. Если CUDA нет или
@@ -611,7 +648,7 @@ class Whisper:
         # настольной машине быстрее, чем Cortex-A55 на роботе.
         for device, compute in (("cuda", "float16"), ("cpu", "int8")):
             try:
-                model = WhisperModel(self.size, device=device, compute_type=compute)
+                model = WhisperModel(size, device=device, compute_type=compute)
             except Exception as e:
                 if _proxy_trouble(e):
                     # VPN-клиент прописывает системный прокси схемы socks4,
@@ -622,7 +659,7 @@ class Whisper:
                     os.environ["NO_PROXY"] = "*"
                     os.environ["no_proxy"] = "*"
                     try:
-                        model = WhisperModel(self.size, device=device,
+                        model = WhisperModel(size, device=device,
                                              compute_type=compute)
                     except Exception as again:
                         log.warning("whisper на %s не поднялся (%s)", device, again)
@@ -631,7 +668,7 @@ class Whisper:
                     log.warning("whisper на %s не поднялся (%s)", device, e)
                     continue
             self.device = device
-            log.info("whisper: модель %s на %s", self.size, device)
+            log.info("whisper: модель %s на %s", size, device)
             return model
         raise RuntimeError("whisper не поднялся ни на видеокарте, ни на процессоре")
 
@@ -1003,15 +1040,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Мозг робота на домашнем ПК")
     p.add_argument("--model", default="qwen3:4b",
                    help="имя модели в Ollama (ollama list покажет скачанные)")
-    # medium, а не small. На видеокарте small тратил пятую долю длительности
-    # записи — то есть запас был десятикратный, а платили мы за него разбором
-    # русского: «Кузя, сколько времени» превращалось в «Пусть за сколько
-    # времени», «анекдот» в «негдот». Medium весит полтора гигабайта
-    # видеопамяти и укладывается в полсекунды — на слух разницы нет, а слов он
-    # путает заметно меньше. Меньше брать имеет смысл только если видеопамять
-    # кончилась: тогда --whisper small.
-    p.add_argument("--whisper", default="medium",
-                   help="размер модели распознавания: tiny|base|small|medium|large-v3")
+    p.add_argument("--whisper", default=DEFAULT_WHISPER,
+                   help="модель распознавания: имя размера (tiny|base|small|"
+                        "medium|large-v3) или склад на HuggingFace")
     p.add_argument("--port", type=int, default=4000)
     p.add_argument("--host", default="0.0.0.0",
                    help="0.0.0.0 — слышно роботу по сети, 127.0.0.1 — только этой машине")
@@ -1050,7 +1081,8 @@ def main() -> int:
     srv.cfg = cfg
     srv.daemon_threads = True
     log.info("мозг на %s:%d | модель %s | распознавание %s | сборка %s",
-             args.host, args.port, args.model, args.whisper, _build())
+             args.host, args.port, args.model,
+             args.whisper.rsplit("/", 1)[-1], _build())
     log.info("на роботе: ROBOT_PC_URL=http://<адрес этого ПК>:%d", args.port)
 
     # Прогрев в своём потоке: сервер должен отвечать на /health сразу, а вот

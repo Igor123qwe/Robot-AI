@@ -231,6 +231,39 @@ def test_ping() -> None:
         kuzya_pc.PING_SECONDS = было
 
 
+def test_whisper_fallback() -> None:
+    """Чужой склад с моделью может переехать — робот от этого не глохнет.
+
+    По умолчанию распознавание берётся русским дообучением с HuggingFace: оно
+    заметно точнее стандартного, но живёт на чужом сайте. Если склад
+    недоступен, обязана подняться обычная модель из стандартного набора.
+    """
+    section("запасная модель распознавания")
+    w = Whisper("такой-модели-нет/вообще")
+    tried: list[str] = []
+
+    def fake(size):
+        tried.append(size)
+        if size != kuzya_pc.FALLBACK_WHISPER:
+            raise OSError("склад не отвечает")
+        return "модель"
+
+    w._try = fake
+    check("поднялась запасная", w._load(), "модель")
+    check("сначала пробовали заказанную", tried,
+          ["такой-модели-нет/вообще", kuzya_pc.FALLBACK_WHISPER])
+    check("имя обновлено — /health не соврёт", w.size, kuzya_pc.FALLBACK_WHISPER)
+
+    # А если и запасная не поднялась — врать нельзя, пусть падает.
+    w = Whisper(kuzya_pc.FALLBACK_WHISPER)
+    w._try = lambda size: (_ for _ in ()).throw(OSError("нет и её"))
+    try:
+        w._load()
+        check("падение запасной", "промолчал", "исключение")
+    except OSError:
+        pass
+
+
 def test_warming() -> None:
     """Пока модель едет в видеопамять, мост отвечает сам — и бесплатно.
 
@@ -493,7 +526,7 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_ping, test_warming, test_think_switch,
+    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_warming, test_think_switch,
                  test_tool_call, test_broken,
                  test_unthink, test_stt_confidence, test_health):
         test()
