@@ -50,8 +50,13 @@ def это_вебсокет(headers) -> bool:
     return апгрейд == "websocket" and "upgrade" in коннекшн
 
 
-def _рукопожатие_с_ros(канал: socket.socket) -> bool:
-    """Здороваемся с rosbridge как обычный браузер."""
+def _рукопожатие_с_ros(канал: socket.socket) -> bytes | None:
+    """Здороваемся с rosbridge как обычный браузер.
+
+    None — не вышло. Иначе байты, которые rosbridge успел сказать сразу за
+    рукопожатием, в том же пакете: чаще всего пусто, но если там что-то есть,
+    потерять это нельзя — первым сообщением он представляется.
+    """
     ключ = base64.b64encode(os.urandom(16)).decode("ascii")
     запрос = (
         f"GET / HTTP/1.1\r\n"
@@ -67,17 +72,14 @@ def _рукопожатие_с_ros(канал: socket.socket) -> bool:
     while b"\r\n\r\n" not in ответ:
         кусок = канал.recv(БУФЕР)
         if not кусок:
-            return False
+            return None
         ответ += кусок
         if len(ответ) > 16384:            # столько заголовков не бывает
-            return False
+            return None
     голова, _, хвост = ответ.partition(b"\r\n\r\n")
     if b"101" not in голова.split(b"\r\n")[0]:
-        return False
-    if хвост:
-        # rosbridge успел заговорить в том же пакете — не теряем.
-        return хвост
-    return True
+        return None
+    return хвост
 
 
 def проводить(браузер: socket.socket, headers) -> None:
@@ -103,7 +105,7 @@ def проводить(браузер: socket.socket, headers) -> None:
         браузер.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         ros.close()
         return
-    if not начало:
+    if начало is None:
         браузер.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         ros.close()
         return
@@ -115,14 +117,25 @@ def проводить(браузер: socket.socket, headers) -> None:
         f"Sec-WebSocket-Accept: {_подпись(ключ)}\r\n\r\n"
     ).encode("ascii")
     браузер.sendall(ответ)
-    if isinstance(начало, bytes) and начало:
+    if начало:
         браузер.sendall(начало)
 
     _перелить(браузер, ros)
 
 
 def _перелить(один: socket.socket, другой: socket.socket) -> None:
-    """Байты туда-сюда, пока кто-нибудь не закроется."""
+    """Байты туда-сюда, пока кто-нибудь не закроется.
+
+    Ждём без срока: вебсокет тем и живёт, что молчит, пока нечего сказать.
+    Конец приходит сам — закрыли вкладку, упал rosbridge, — и тогда recv
+    возвращает пусто. Своего таймаута здесь быть не должно: он рвал бы
+    исправное соединение просто за тишину.
+
+    Оба направления обслуживает один поток, и медленный получатель на время
+    задерживает встречный поток. Для rosbridge на этой же машине и коротких
+    json-сообщений это незаметно; будь между ними сеть, понадобилась бы
+    очередь на каждую сторону.
+    """
     for канал in (один, другой):
         канал.settimeout(None)
     выбор = selectors.DefaultSelector()
@@ -130,21 +143,15 @@ def _перелить(один: socket.socket, другой: socket.socket) -> N
     выбор.register(другой, selectors.EVENT_READ, один)
     try:
         while True:
-            for ключ, _ in выбор.select(timeout=300):
+            for ключ, _ in выбор.select():
                 откуда: socket.socket = ключ.fileobj        # type: ignore[assignment]
                 куда: socket.socket = ключ.data
                 try:
                     кусок = откуда.recv(БУФЕР)
-                except OSError:
-                    return
-                if not кусок:
-                    return
-                try:
+                    if not кусок:
+                        return
                     куда.sendall(кусок)
                 except OSError:
-                    return
-            else:
-                if not выбор.get_map():
                     return
     finally:
         выбор.close()

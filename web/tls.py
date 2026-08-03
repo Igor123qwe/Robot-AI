@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import datetime
 import socket
 import subprocess
 from pathlib import Path
@@ -103,29 +102,7 @@ def выписать(куда: Path | None = None) -> tuple[Path, Path] | None:
     return СЕРТ, КЛЮЧ
 
 
-def годен_до() -> str:
-    """Для строчки в логе. Пусто, если спросить не у кого."""
-    try:
-        готово = subprocess.run(
-            ["openssl", "x509", "-in", str(СЕРТ), "-noout", "-enddate"],
-            capture_output=True, text=True, timeout=10)
-        if готово.returncode == 0:
-            return готово.stdout.strip().split("=", 1)[-1]
-    except (OSError, subprocess.SubprocessError, IndexError):
-        pass
-    return ""
-
-
-def свежий_ли(дней: int = 30) -> bool:
-    """Не пора ли перевыпускать. Отдельно от _годен: тот про адреса."""
-    хвост = годен_до()
-    if not хвост:
-        return True
-    for образец in ("%b %d %H:%M:%S %Y %Z", "%b %d %H:%M:%S %Y"):
-        try:
-            конец = datetime.datetime.strptime(хвост.replace("GMT", "").strip(),
-                                               образец.replace(" %Z", ""))
-        except ValueError:
-            continue
-        return (конец - datetime.datetime.now()).days > дней
-    return True
+# Проверки срока годности здесь намеренно нет. Сертификат выписывается на десять
+# лет — столько этот робот не проживёт, а мёртвая проверка, которую никто не
+# зовёт, хуже отсутствующей: её однажды почините и решите, что она работала.
+# Перевыпуск нужен по другой причине — сменился адрес, — и за это отвечает _годен.

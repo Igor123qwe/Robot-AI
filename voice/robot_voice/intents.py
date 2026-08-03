@@ -1155,7 +1155,8 @@ def _мера_известна(слово: str) -> bool:
     from . import counting
     from . import lookup
 
-    return counting._найти(слово) is not None or lookup._валюта(слово) is not None
+    return (counting.найти_меру(слово) is not None
+            or lookup.валюта(слово) is not None)
 
 
 def _counting(t: str) -> Match | None:
