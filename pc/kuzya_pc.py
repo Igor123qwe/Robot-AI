@@ -778,12 +778,18 @@ class Voiceprints:
     RATE = 16000
     MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 
+    # Сколько не трогать модель после неудачной загрузки. Без этого каждая
+    # фраза заново лезла на HuggingFace, падала и стоила восьми секунд — то
+    # есть сломанное узнавание делало медленным ВСЁ распознавание.
+    RETRY_AFTER = 600.0
+
     def __init__(self, store: Path) -> None:
         self.store = store
         self._model = None
         self._lock = threading.Lock()
         self.people: dict[str, dict] = {}
         self.ready = False
+        self._broken_until = 0.0
         self._read()
 
     # --- хранение --------------------------------------------------------
@@ -807,8 +813,18 @@ class Voiceprints:
         from speechbrain.inference.speaker import EncoderClassifier
 
         where = Path(os.environ.get("HF_HOME", Path.home() / ".cache")) / "ecapa"
-        return EncoderClassifier.from_hparams(
-            source=self.MODEL, savedir=str(where), run_opts={"device": "cpu"})
+        common = dict(source=self.MODEL, savedir=str(where),
+                      run_opts={"device": "cpu"})
+        # На Windows библиотека раскладывает файлы модели символьными ссылками,
+        # а прав на них у обычного пользователя нет: «Клиент не обладает
+        # требуемыми правами». Просим копировать. Параметр появился не во всех
+        # версиях, поэтому при отказе пробуем по-старому.
+        try:
+            from speechbrain.utils.fetching import LocalStrategy
+            return EncoderClassifier.from_hparams(
+                local_strategy=LocalStrategy.COPY, **common)
+        except (ImportError, TypeError, AttributeError):
+            return EncoderClassifier.from_hparams(**common)
 
     def warm(self) -> None:
         started = time.monotonic()
@@ -817,6 +833,7 @@ class Voiceprints:
                 try:
                     self._model = self._load()
                 except Exception as e:
+                    self._broken_until = time.monotonic() + self.RETRY_AFTER
                     log.warning("узнавание по голосу не поднялось (%s) — робот "
                                 "будет считать всех одним человеком", e)
                     return
@@ -851,7 +868,17 @@ class Voiceprints:
 
         with self._lock:
             if self._model is None:
-                self._model = self._load()
+                # Модель уже не поднялась и повторять рано. Раньше повторяли на
+                # КАЖДОЙ фразе: попытка лезла на HuggingFace, падала и стоила
+                # восьми секунд, то есть сломанное узнавание делало медленным
+                # всё распознавание разом.
+                if time.monotonic() < self._broken_until:
+                    return None
+                try:
+                    self._model = self._load()
+                except Exception:
+                    self._broken_until = time.monotonic() + self.RETRY_AFTER
+                    raise
                 self.ready = True
             vector = self._model.encode_batch(torch.from_numpy(signal).unsqueeze(0))
         vector = vector.squeeze().detach().numpy()
