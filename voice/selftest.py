@@ -505,6 +505,32 @@ def test_speakable() -> None:
           "Сейчас 19:12 — время ужина")
 
 
+def test_not_for_me() -> None:
+    """В открытом окне робот не должен вступать в чужой разговор.
+
+    С живого робота: после «Кузя, привет» окно оставалось открытым двадцать
+    секунд, и в него попало «Иди уже, Рома! Рома, пиши!» и «Виктор, как дела
+    у тебя?» — телевизор и разговор с другим человеком. Робот честно ответил
+    обоим. Отличить чужую речь от своей по звуку мы не умеем, но обращение по
+    чужому имени — признак надёжный и дешёвый.
+    """
+    section("зовут не меня")
+    from robot_voice.app import _NOT_A_NAME, _VOCATIVE, _clean_token
+
+    def чужое(text: str) -> bool:
+        m = _VOCATIVE.match(text.strip())
+        return bool(m) and _clean_token(m.group(1)) not in _NOT_A_NAME
+
+    for phrase in ["Виктор, как дела у тебя?", "Рома, пиши!",
+                   "Наташа, ты идёшь?", "Серёжа, где ключи"]:
+        check(f"«{phrase}» — не мне", чужое(phrase), True)
+    # А это фразы, которые начинаются похоже, но обращены к роботу.
+    for phrase in ["Ладно, поехали", "Хорошо, поставь таймер", "Так, что там",
+                   "Стоп, стоп", "Погоди, не надо", "Спасибо, всё",
+                   "поставь таймер на пять минут", "Сколько времени?"]:
+        check(f"«{phrase}» — мне", чужое(phrase), False)
+
+
 def test_remote_voice() -> None:
     """Голос берём с ПК, но немым от его выключения не становимся.
 
@@ -1346,7 +1372,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_remote_voice,
+                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,
