@@ -44,7 +44,7 @@ for name, make_stub in _STUBS.items():
 from robot_voice import ru, weather, when                      # noqa: E402
 from robot_voice.brain import HISTORY_LIMIT, Brain, Thinkless, _trim  # noqa: E402
 from robot_voice.config import SYSTEM_PROMPT, Config   # noqa: E402
-from robot_voice.intents import parse                 # noqa: E402
+from robot_voice.intents import numerals_to_digits, parse  # noqa: E402
 from robot_voice.music import Player, Pult            # noqa: E402
 from robot_voice.notes import Notes                   # noqa: E402
 from robot_voice.tools import Timers, build_tools     # noqa: E402
@@ -217,6 +217,9 @@ def test_rules() -> None:
         ("прибавь громкость", "music_volume"),
         ("следующая песня", "music_next"), ("переключи", "music_next"),
         ("поставь другую песню", "music_next"),
+        # Голое слово, без существительного — так говорят, когда музыка играет.
+        ("следующая", "music_next"), ("следующую", "music_next"),
+        ("дальше", "music_next"), ("давай следующую", "music_next"),
         ("что сейчас играет", "what_is_playing"),
         ("какая это песня", "what_is_playing"),
         ("курс доллара", "rates"), ("почем доллар", "rates"),
@@ -292,6 +295,27 @@ def test_numbers() -> None:
     check("date(01.08.2026)", ru.date(datetime(2026, 8, 1)), "суббота, первое августа")
     check("date(31.12.2026)", ru.date(datetime(2026, 12, 31)),
           "четверг, тридцать первое декабря")
+
+    # Числительные из речи в цифры. Косвенные падежи здесь не прихоть: люди
+    # говорят «от одного до десяти» и «от двух тысяч», а не «от один до десять».
+    вцифры = numerals_to_digits
+    check("сорок пять", вцифры("сорок пять минут"), "45 минут")
+    check("родительный", вцифры("от одного до десяти"), "от 1 до 10")
+    check("сорока", вцифры("около сорока минут"), "около 40 минут")
+    check("ста", вцифры("больше ста рублей"), "больше 100 рублей")
+    check("тысяча", вцифры("тысяча"), "1000")
+    check("две тысячи", вцифры("две тысячи"), "2000")
+    check("тысячи с хвостом", вцифры("две тысячи триста"), "2300")
+    check("полторы тысячи", вцифры("полторы тысячи"), "1500")
+    check("год словами", вцифры("тысяча девятьсот девяносто пять"), "1995")
+    check("проценты от тысяч", вцифры("пятнадцать процентов от двух тысяч"),
+          "15 процентов от 2000")
+    # Миллион через %g выходил как «1e+06», и такое не разбирает ни одно
+    # правило: команда молча уходила модели.
+    check("миллион без степеней", вцифры("два миллиона"), "2000000")
+    check("два числа подряд не слипаются", вцифры("пять пять"), "5 5")
+    # «семью» — это ещё и семья в винительном. В словаре его нет намеренно.
+    check("семью не число", вцифры("покажи семью"), "покажи семью")
 
 
 def test_when() -> None:
