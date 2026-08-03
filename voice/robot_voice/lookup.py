@@ -26,7 +26,11 @@ import urllib.request
 log = logging.getLogger(__name__)
 
 TIMEOUT = 8.0
-AGENT = "kuzya-robot/1.0 (домашний робот)"
+# Только латиница. Заголовки HTTP кодируются в latin-1, и кириллица в них
+# роняет запрос ещё до отправки — ровно как раньше уронила имя человека в
+# адресе. Ошибка при этом выглядит как «сервис не ответил», хотя до сервиса
+# дело не дошло вовсе.
+AGENT = "kuzya-robot/1.0 (home robot)"
 
 WIKI = "https://ru.wikipedia.org/w/api.php"
 DDG = "https://api.duckduckgo.com/"

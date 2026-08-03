@@ -726,6 +726,71 @@ def test_auto_meeting() -> None:
           Meeting("").time_to_ask("Настя", people), False)
 
 
+def test_ascii_out() -> None:
+    """В заголовках и адресах запросов не должно быть кириллицы.
+
+    Дважды на одни грабли. Сначала имя человека в адресе — «?имя=Игорь», — и
+    знакомство падало молча: робот говорил «не вышло запомнить голос», а
+    запрос не уходил вовсе. Потом кириллица в User-Agent, и курс валют
+    отвечал «сервис не ответил», хотя до сервиса дело не доходило.
+
+    Причина одна: строку запроса и заголовки HTTP кодирует в latin-1, и любая
+    русская буква роняет отправку. Ошибка при этом маскируется под отказ
+    чужого сервиса — то есть ищут её не там.
+    """
+    section("наружу — только латиница")
+    import ast
+    import re
+
+    here = Path(__file__).resolve().parent
+    files = sorted((here / "robot_voice").glob("*.py"))
+    плохие: list[str] = []
+    for path in files:
+        дерево = ast.parse(path.read_text(), str(path))
+        # Постоянные модуля: значение заголовка чаще пишут через имя, а не
+        # строкой на месте. Ровно так и было с User-Agent, из-за чего первая
+        # версия этой проверки ничего не нашла.
+        постоянные = {
+            цель.id: узел.value.value
+            for узел in дерево.body
+            if isinstance(узел, ast.Assign) and isinstance(узел.value, ast.Constant)
+            and isinstance(узел.value.value, str)
+            for цель in узел.targets if isinstance(цель, ast.Name)
+        }
+
+        def строкой(узел):
+            """Значение узла, если это строка или имя известной постоянной."""
+            if isinstance(узел, ast.Constant) and isinstance(узел.value, str):
+                return узел.value
+            if isinstance(узел, ast.Name):
+                return постоянные.get(узел.id)
+            return None
+
+        for узел in ast.walk(дерево):
+            # Заголовки: {"User-Agent": ...} и любые другие пары в headers.
+            if isinstance(узел, ast.Dict):
+                for ключ, значение in zip(узел.keys, узел.values):
+                    имя = строкой(ключ)
+                    если = строкой(значение)
+                    if имя is None or если is None:
+                        continue
+                    if "-" not in имя or " " in имя:
+                        continue        # это не заголовок, а обычный словарь
+                    пара = f"{имя}: {если}"
+                    if not пара.isascii():
+                        плохие.append(f"{path.name}: заголовок {пара!r}")
+            # Куски адресов: «?имя=» и «&name=». Регулярки и строки документации
+            # сюда попадать не должны, поэтому требуем именно вид параметра
+            # сразу за знаком вопроса и запрещаем всё, чем пишут шаблоны.
+            if isinstance(узел, ast.Constant) and isinstance(узел.value, str):
+                текст = узел.value
+                похоже = re.search(r"[?&][^\s?&=]+=", текст)
+                шаблон = "(?" in текст or "\\" in текст or len(текст) > 200
+                if похоже and not шаблон and not текст.isascii():
+                    плохие.append(f"{path.name}: адрес {текст!r}")
+    check("кириллицы в заголовках и адресах нет", sorted(set(плохие)), [])
+
+
 def test_wake_word() -> None:
     """Имя робота Whisper пишет как попало — ловить надо все варианты.
 
@@ -1617,7 +1682,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_wake_word, test_not_for_me, test_remote_voice,
+                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,
