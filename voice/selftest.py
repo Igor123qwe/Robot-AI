@@ -532,15 +532,79 @@ def test_people() -> None:
     check("вслух", people.tell("Игорь"),
           "Про тебя знаю вот что. Любит крепкий чай.")
 
-    # Дело не должно расти без предела: оно уезжает в каждый запрос.
-    for i in range(FACTS_LIMIT + 5):
-        people.remember("Игорь", f"факт номер {i}")
-    check("дело не растёт без предела",
-          len(people.card("Игорь")["факты"]), FACTS_LIMIT)
-
     check("пережило перезапуск", People(store).card("Игорь")["разговоров"], 1)
     check("стёрли", people.forget("Игорь"), "Всё стёр.")
     check("и правда стёрли", People(store).known(), [])
+
+
+def test_notes_about_people() -> None:
+    """Конспект: робот дописывает дело сам, но поручения этим не вытесняет.
+
+    Человек не диктует роботу анкету — он просто разговаривает. Значит,
+    подмечать надо самому. Но у таких заметок два свойства: они врут чаще и
+    накапливаются быстрее, поэтому вытесняться должны первыми, а объявлять о
+    них вслух не надо вовсе — иначе каждая реплика кончается «записал».
+    """
+    section("робот ведёт конспект сам")
+    from robot_voice.people import FACTS_LIMIT, People
+
+    store = Path(tempfile.mkdtemp()) / "люди.json"
+    people = People(store)
+
+    check("подмеченное не объявляется вслух",
+          people.remember("Игорь", "работает по ночам", asked=False),
+          "Записал в память, вслух не говори.")
+    check("по просьбе — объявляется",
+          people.remember("Игорь", "любит крепкий чай"), "Запомнил.")
+    check("обрывок не записываем",
+          people.remember("Игорь", "ага", asked=False), "Слишком коротко, не записал.")
+    check("незнакомца не записываем",
+          people.remember("", "что-то важное", asked=False),
+          "Не знаю, кто говорит — записывать некуда.")
+
+    # Повтор своими словами — не новая запись. Но если формулировка подробнее,
+    # берём её: робот вернулся к теме и уточнил.
+    check("тот же факт другими словами",
+          people.remember("Игорь", "чай крепкий любит", asked=False),
+          "Это я уже про тебя знаю.")
+    check("подробность дописалась",
+          people.remember("Игорь", "любит крепкий чай по утрам", asked=False),
+          "Это я уже про тебя знаю.")
+    check("и заменила прежнее", "любит крепкий чай по утрам" in people.facts("Игорь"),
+          True)
+    # А вот это — РАЗНОЕ, хоть и похоже на восемьдесят процентов букв. Слить их
+    # в одну запись значит потерять то, ради чего дело и заводилось.
+    people.remember("Игорь", "любит кофе", asked=False)
+    check("похожее, но другое — отдельно", len(people.facts("Игорь")), 3)
+
+    # Просьба запомнить то, что робот уже подметил сам, превращает заметку в
+    # поручение: вытеснять её больше нельзя.
+    people.remember("Игорь", "работает по ночам")
+    подмеченных = [f for f in people.card("Игорь")["факты"] if f.get("сам")]
+    check("просьба закрепила заметку",
+          any(f["что"] == "работает по ночам" for f in подмеченных), False)
+
+    # Дело не растёт без предела — оно уезжает в каждый запрос. И вытесняется
+    # сначала подмеченное, а не то, что человек просил запомнить.
+    for i in range(FACTS_LIMIT + 5):
+        people.remember("Игорь", f"подметил мелочь про случай {i}", asked=False)
+    check("дело не растёт без предела",
+          len(people.card("Игорь")["факты"]), FACTS_LIMIT)
+    check("поручение уцелело", "работает по ночам" in people.facts("Игорь"), True)
+    check("и уточнённое поручение тоже",
+          "любит крепкий чай по утрам" in people.facts("Игорь"), True)
+    # А подмеченное «любит кофе» вытеснено — и правильно: это была догадка
+    # робота, а не просьба человека.
+    check("догадка уступила место", "любит кофе" in people.facts("Игорь"), False)
+
+    # Старый формат — простые строки. Дело человека терять из-за смены формата
+    # нельзя: там записи, которые он роботу диктовал.
+    store.write_text('{"Настя": {"факты": ["любит гулять"], "разговоров": 3}}', "utf-8")
+    старое = People(store)
+    check("старое дело читается", старое.facts("Настя"), ["любит гулять"])
+    старое.remember("Настя", "учится в институте", asked=False)
+    check("и дополняется", старое.facts("Настя"),
+          ["любит гулять", "учится в институте"])
 
 
 def test_meeting() -> None:
@@ -1441,7 +1505,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_meeting, test_not_for_me, test_remote_voice,
+                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,
