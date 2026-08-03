@@ -205,42 +205,56 @@ class Unthink:
     пропускает целиком — на живом роботе он зачитал вслух полторы страницы
     рассуждений про то, каким должен быть ответ.
 
-    Поэтому начало ответа придерживаем. Увидели </think> — всё, что было до
-    него, выбрасываем. Не увидели за LIMIT символов — значит размышлений нет,
-    отдаём как есть и дальше не держим.
+    Поэтому начало ответа придерживаем: увидели </think> — всё, что было до
+    него, выбрасываем.
 
-    Порог небольшой намеренно: платим им один раз в начале ответа, а
-    размышления Qwen3 начинаются с первого же токена, так что если их нет в
-    первых четырёх сотнях символов — их нет вовсе.
+    Первая версия отпускала начало через четыреста символов — мол, если
+    размышлений нет в начале, их нет вовсе. На живом роботе размышления
+    оказались в пять раз длиннее, и он зачитал их вслух до последнего слова.
+    Порога, отличающего «размышлений нет» от «размышления длинные», не бывает:
+    и то и другое выглядит как текст без тега.
+
+    Значит, порога нет, а есть привычка. Думает модель вслух или нет —
+    свойство модели, а не отдельного ответа: выясняется по первому же ответу и
+    запоминается в habit на весь запуск сервера. Известного молчуна дальше
+    отдаём сразу, без задержки; про известного болтуна ждём тег сколько нужно.
     """
 
-    LIMIT = 400
     OPEN = "<think>"
     CLOSE = "</think>"
 
-    def __init__(self) -> None:
+    def __init__(self, habit: dict | None = None, key: str = "") -> None:
+        self.habit = habit if habit is not None else {}
+        self.key = key
         self.buf = ""
-        self.holding = True
+        self.holding = self.habit.get(key) is not False
+
+    def _learn(self, thinks: bool) -> None:
+        if self.habit.get(self.key) is thinks:
+            return
+        log.info("модель %s вслух", "думает" if thinks else "не думает")
+        self.habit[self.key] = thinks
 
     def feed(self, chunk: str) -> str:
         if not self.holding:
             return chunk
         self.buf += chunk
         at = self.buf.find(self.CLOSE)
-        if at >= 0:
-            out = self.buf[at + len(self.CLOSE):]
-            self.buf, self.holding = "", False
-            return out.lstrip()
-        if len(self.buf) > self.LIMIT:
-            out = self.buf
-            self.buf, self.holding = "", False
-            # Открывающий тег всё-таки может прийти — тогда это обычная пара,
-            # и её разберёт фильтр на стороне робота.
+        if at < 0:
+            return ""
+        opened = self.buf.find(self.OPEN)
+        out, self.buf, self.holding = self.buf, "", False
+        if 0 <= opened < at:
+            # Обычная пара тегов: начало ответа — настоящий текст. Отдаём как
+            # есть, разберёт фильтр на стороне робота.
             return out
-        return ""
+        self._learn(True)
+        return out[at + len(self.CLOSE):].lstrip()
 
     def close(self) -> str:
         """Хвост, который так и не оказался размышлением."""
+        if self.holding:
+            self._learn(False)
         out, self.buf, self.holding = self.buf, "", False
         return out
 
@@ -354,6 +368,9 @@ class Ollama:
         # Некоторые сборки параметр не знают. Узнаём об этом по первому
         # отказу и дальше не шлём.
         self._think_known = True
+        # Что выяснилось на деле: думает ли модель вслух, несмотря на всё
+        # вышесказанное. Ключ — имя модели, значение ставит Unthink.
+        self.habit: dict[str, bool] = {}
 
     def _post(self, path: str, payload: dict, *, stream: bool):
         req = urllib.request.Request(
@@ -671,8 +688,9 @@ class Handler(BaseHTTPRequestHandler):
         """Гоняет Ollama и отдаёт куски: («text», строка) и («call», имя, аргументы)."""
         used_in = used_out = 0
         truncated = False
-        unthink = Unthink()
-        for part in self.server.cfg.ollama.chat(model, messages, tools, limit):
+        ollama = self.server.cfg.ollama
+        unthink = Unthink(getattr(ollama, "habit", None), model)
+        for part in ollama.chat(model, messages, tools, limit):
             msg = part.get("message") or {}
             chunk = msg.get("content") or ""
             if chunk:

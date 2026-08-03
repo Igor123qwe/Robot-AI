@@ -73,18 +73,6 @@ def _timeout(connect: float):
     return httpx.Timeout(TIMEOUT_SECONDS, connect=connect)
 
 
-# Сколько символов начала ответа придержать, выясняя, не размышления ли это.
-# Qwen3 не пишет открывающий <think>: тег уже стоит в шаблоне запроса, поэтому
-# генерация начинается сразу ВНУТРИ рассуждений, и наружу выходит только
-# закрывающий. Узнать об этом можно, только дождавшись его.
-#
-# Платим этим один раз в начале ответа. Ответ робота — одна-две фразы, то есть
-# обычно он весь помещается в эти три сотни символов и произносится целиком по
-# готовности. Для локальной модели это секунда-полторы; альтернатива —
-# полторы страницы рассуждений вслух, как случилось на живом роботе.
-HEAD_HOLD = 300
-
-
 class Thinkless:
     """Не даёт роботу зачитать вслух ход мысли модели.
 
@@ -95,52 +83,70 @@ class Thinkless:
     одном, «nk>» в другом.
 
     Вторая — закрывающий тег БЕЗ открывающего. Так делает Qwen3: открывающий
-    уже стоит в шаблоне запроса, поэтому ответ начинается сразу внутри
-    размышлений. Фильтр, знающий только про пары, пропускает такое целиком —
-    на живом роботе он зачитал вслух полторы страницы рассуждений о том, каким
-    должен быть ответ. Поэтому начало ответа придерживается: увидели </think>
-    — всё, что до него, выбрасываем; не увидели за HEAD_HOLD символов —
-    значит размышлений нет, отпускаем и дальше не держим.
+    уже стоит в шаблоне запроса, поэтому ответ начинается сразу ВНУТРИ
+    размышлений, а наружу выходит только закрывающий. Фильтр, знающий только
+    про пары, пропускает такое целиком — на живом роботе он зачитал вслух
+    полторы страницы рассуждений о том, каким должен быть ответ.
 
-    В облаке размышления едут отдельным блоком и в текст не попадают, так что
-    там фильтр только придерживает начало и ничего не режет.
+    Значит, пока не увидели </think>, про начало ответа ничего не известно, и
+    говорить нельзя. Первая версия придерживала начало на триста символов и
+    отпускала: мол, размышлений нет. На живом роботе размышления оказались в
+    пять раз длиннее — и он снова зачитал их вслух, до последнего слова.
+    Порога, который отличает «размышлений нет» от «размышления длинные», не
+    существует: и то и другое выглядит как текст без тега.
+
+    Поэтому порога нет. Зато есть привычка: думает модель вслух или нет —
+    свойство модели, а не отдельной реплики. Выясняется по первому же ответу и
+    запоминается в собеседнике (Endpoint.thinks) на весь запуск:
+
+      неизвестно — держим до </think> или до конца ответа, что раньше;
+      думает     — держим до </think>, сколько бы его ни ждать;
+      не думает  — отдаём сразу, с первого куска, потоком.
+
+    Платим одним нестримленным ответом на собеседника за запуск. Ответ робота —
+    одна-две фразы, так что цена этому — доли секунды, а не полторы страницы
+    рассуждений вслух.
     """
 
     OPEN = "<think>"
     CLOSE = "</think>"
 
-    def __init__(self, emit: Callable[[str], None]) -> None:
+    def __init__(self, emit: Callable[[str], None], habit=None) -> None:
         self.emit = emit
+        self.habit = habit
         self.buf = ""
         self.inside = False
-        # Начало ответа ещё не выяснено: вдруг это размышления без открывающего
-        # тега. Пока держим.
         self.head = ""
-        self.holding = True
+        # Известного молчуна не придерживаем совсем: он уже доказал делом.
+        self.holding = getattr(habit, "thinks", None) is not False
+
+    def _learn(self, thinks: bool) -> None:
+        if self.habit is None or getattr(self.habit, "thinks", None) is thinks:
+            return
+        log.info("%s: модель %s вслух",
+                 getattr(self.habit, "name", "собеседник"),
+                 "думает" if thinks else "не думает")
+        self.habit.thinks = thinks
 
     def feed(self, chunk: str) -> None:
         if self.holding:
             self.head += chunk
             at = self.head.find(self.CLOSE)
-            if at >= 0:
-                opened = self.head.find(self.OPEN)
-                if 0 <= opened < at:
-                    # Обычная пара: начало ответа — настоящий текст, а
-                    # размышления идут после него. Отдаём как есть, разберёт
-                    # разбор пар.
-                    rest, self.head, self.holding = self.head, "", False
-                    self._pairs(rest)
-                    return
-                # Закрывающий без открывающего: всё до него было размышлением.
-                rest = self.head[at + len(self.CLOSE):].lstrip()
-                self.head, self.holding = "", False
-                if rest:
-                    self._pairs(rest)
+            if at < 0:
                 return
-            if len(self.head) <= HEAD_HOLD:
+            opened = self.head.find(self.OPEN)
+            if 0 <= opened < at:
+                # Обычная пара: начало ответа — настоящий текст, а размышления
+                # идут после него. Отдаём как есть, разберёт разбор пар.
+                rest, self.head, self.holding = self.head, "", False
+                self._pairs(rest)
                 return
-            rest, self.head, self.holding = self.head, "", False
-            self._pairs(rest)
+            # Закрывающий без открывающего: всё до него было размышлением.
+            self._learn(True)
+            rest = self.head[at + len(self.CLOSE):].lstrip()
+            self.head, self.holding = "", False
+            if rest:
+                self._pairs(rest)
             return
         self._pairs(chunk)
 
@@ -150,6 +156,17 @@ class Thinkless:
         while self.buf:
             tag = self.CLOSE if self.inside else self.OPEN
             at = self.buf.find(tag)
+            if not self.inside:
+                # Одинокий закрывающий может прийти и сюда — если модель
+                # раньше не думала, мы ей поверили и отпустили поток. Тогда
+                # это ошибка привычки: запоминаем правду и бросаем всё, что
+                # успело накопиться. Сказанное вслух уже не вернуть, но
+                # остаток размышлений хотя бы не прозвучит.
+                lone = self.buf.find(self.CLOSE)
+                if lone >= 0 and (at < 0 or lone < at):
+                    self._learn(True)
+                    self.buf = self.buf[lone + len(self.CLOSE):].lstrip()
+                    continue
             if at >= 0:
                 if not self.inside and at:
                     self.emit(self.buf[:at])
@@ -158,7 +175,7 @@ class Thinkless:
                 continue
             # Тега нет. Оставляем в буфере хвост, которым тег мог бы начаться,
             # а остальное отдаём — иначе речь пойдёт рывками по одному куску.
-            keep = _tail_of(self.buf, tag)
+            keep = max(_tail_of(self.buf, self.OPEN), _tail_of(self.buf, self.CLOSE))
             if not self.inside and len(self.buf) > keep:
                 self.emit(self.buf[:len(self.buf) - keep])
             self.buf = self.buf[len(self.buf) - keep:]
@@ -167,6 +184,9 @@ class Thinkless:
     def close(self) -> None:
         """Ответ кончился: придержанное так и не оказалось размышлением."""
         if self.holding:
+            # Ответ дошёл до конца, а закрывающего тега не было ни разу.
+            # Значит эта модель вслух не думает, и держать её впредь незачем.
+            self._learn(False)
             rest, self.head, self.holding = self.head, "", False
             if rest:
                 self._pairs(rest)
@@ -199,6 +219,10 @@ class Endpoint:
     use_cache: bool = True
     # До какого момента не беспокоить: он только что не отозвался.
     down_until: float = 0.0
+    # Думает ли эта модель вслух, вписывая рассуждения прямо в текст ответа.
+    # Свойство модели, а не реплики: выясняется по первому же ответу (см.
+    # Thinkless) и дальше экономит задержку на всех остальных.
+    thinks: bool | None = None
     # Свой счётчик расхода — чтобы видеть, сколько разговора ушло мимо кассы.
     spent_in: int = 0
     spent_out: int = 0
@@ -333,14 +357,23 @@ class Brain:
         return False
 
     def _ask(self, ep: Endpoint, messages: list[dict], on_text: Callable[[str], None]):
-        """Один запрос к одному собеседнику."""
+        """Один запрос к одному собеседнику.
+
+        Размышления режем здесь, а не выше по течению: думает модель вслух или
+        нет — свойство собеседника, и фильтру нужно знать, к кому он приставлен.
+        """
         while True:
             try:
+                # Заводим на каждую попытку заново: отступление (_degrade)
+                # роняет запрос до первого куска текста, и нести в новый
+                # запрос полбуфера от старого нельзя.
+                thinkless = Thinkless(on_text, ep)
                 with ep.client.messages.stream(**self._params(ep, messages)) as stream:
                     for event in stream:
                         if (event.type == "content_block_delta"
                                 and getattr(event.delta, "type", "") == "text_delta"):
-                            on_text(event.delta.text)
+                            thinkless.feed(event.delta.text)
+                    thinkless.close()
                     return stream.get_final_message()
             except anthropic.BadRequestError as e:
                 if not self._degrade(ep, e):
@@ -392,16 +425,11 @@ class Brain:
             spoken.append(chunk)
             on_text(chunk)
 
-        # Размышления модели до речи не доходят: робот должен отвечать, а не
-        # читать вслух, как он к ответу шёл.
-        thinkless = Thinkless(emit)
-        collect = thinkless.feed
-
         rounds = 0
         answered: Endpoint | None = None
         try:
             for rounds in range(1, MAX_TOOL_ROUNDS + 1):
-                answered, message = self._round(messages, collect)
+                answered, message = self._round(messages, emit)
 
                 usage = getattr(message, "usage", None)
                 if usage is not None:
@@ -421,10 +449,10 @@ class Brain:
                 if message.stop_reason == "refusal":
                     log.warning("модель отказалась отвечать: %s",
                                 getattr(message, "stop_details", None))
-                    # Именно через collect: возвращаемое значение никто не
+                    # Именно вслух: возвращаемое значение никто не
                     # озвучивает, и раньше робот на отказ просто молчал —
                     # человек не понимал, услышали его вообще или нет.
-                    collect("Извини, на это я ответить не могу.")
+                    emit("Извини, на это я ответить не могу.")
                     break
 
                 messages.append({"role": "assistant", "content": message.content})
@@ -459,12 +487,12 @@ class Brain:
                     # исходов: человек не понимает, услышали его или нет.
                     # Седьмой запрос делать не станем: это ещё круг с самой
                     # длинной историей ровно там, где всё уже пошло не так.
-                    collect("Что-то я запутался, скажи иначе.")
+                    emit("Что-то я запутался, скажи иначе.")
 
             if truncated:
                 # Иначе робот замолкает на полуслове, и понять почему нельзя:
                 # человек думает, что он отвлёкся, и повторяет вопрос.
-                collect(" Дальше не помещаюсь, спроси покороче.")
+                emit(" Дальше не помещаюсь, спроси покороче.")
         finally:
             # Всё, что ниже, должно случиться и после сбоя.
             #
@@ -477,7 +505,6 @@ class Brain:
             # Расход — потому что потраченные круги оплачены независимо от
             # того, чем ход кончился, и счётчик, который их теряет, врёт.
             self.history = _trim(messages)
-            thinkless.close()
 
             if answered is not None:
                 answered.spent_in += used_in + written
