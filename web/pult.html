@@ -566,6 +566,10 @@ camBtn.click();
 // присылает по SSE ссылку на реплику, мы её проигрываем. Браузеры не дают
 // запускать звук без действия пользователя — отсюда кнопка.
 const sndBtn = $('sndBtn'), caption = $('caption');
+// Своё имя вкладки. Микрофон может быть только один: две открытые вкладки
+// шлют звук в общий буфер, куски перемешиваются, и робот перестаёт разбирать
+// речь. Сервер по этому имени решает, чья очередь.
+const MIC_ID = Math.random().toString(36).slice(2, 10);
 const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=';
 const player = new Audio();
 // Радио — отдельный проигрыватель: реплики робота идут очередью и кончаются, а
@@ -781,7 +785,17 @@ async function micStart() {
     while (micBuf.length >= MIC_CHUNK) {
       const part = micBuf.slice(0, MIC_CHUNK);
       micBuf = micBuf.slice(MIC_CHUNK);
-      fetch('/listen', { method: 'POST', body: part.buffer }).catch(() => {});
+      fetch('/listen', {
+        method: 'POST', body: part.buffer, headers: { 'X-Mic-Id': MIC_ID },
+      }).then(r => {
+        // 409 — микрофоном занята другая вкладка. Замолкаем и говорим об этом:
+        // молча слать звук в никуда хуже всего, человек будет думать, что
+        // робот оглох, и повторять всё громче.
+        if (r.status === 409 && micOn) {
+          micStop();
+          setNote('микрофон занят другой вкладкой пульта — закрой лишнюю');
+        }
+      }).catch(() => {});
     }
   };
 

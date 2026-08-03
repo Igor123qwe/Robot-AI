@@ -152,6 +152,31 @@ class MicRelay:
         self._lock = threading.Lock()
         self._listeners: set[queue.Queue] = set()
         self._last_chunk = 0.0
+        # Чья сейчас очередь говорить в микрофон и кому мы уже отказали:
+        # второе — только чтобы не писать одну и ту же строку в лог сто раз
+        # в секунду.
+        self._owner = ""
+        self._refused = ""
+
+    # Сколько ждать молчания прежней вкладки, прежде чем отдать микрофон
+    # новой. Вкладку закрывают, обновляют, переоткрывают — и если держаться за
+    # ушедшую, робот оглохнет до перезапуска сервера.
+    HANDOVER = 3.0
+
+    def take(self, кто: str) -> bool:
+        """Занимает микрофон. False — им уже пользуется другая вкладка."""
+        with self._lock:
+            свежо = time.monotonic() - self._last_chunk < self.HANDOVER
+            if self._owner and self._owner != кто and свежо:
+                if кто != self._refused:
+                    self._refused = кто
+                    print(f"микрофон занят вкладкой {self._owner[:8]} — "
+                          f"отказал {кто[:8]}", flush=True)
+                return False
+            if self._owner != кто:
+                print(f"микрофон теперь у вкладки {кто[:8]}", flush=True)
+                self._owner = кто
+            return True
 
     def push(self, data: bytes) -> None:
         with self._lock:
@@ -286,7 +311,18 @@ class Handler(SimpleHTTPRequestHandler):
                 self.close_connection = True
                 self.fail(400, "пустой или слишком большой кусок звука")
                 return
-            MIC.push(self.rfile.read(length))
+            кусок = self.rfile.read(length)
+            # Микрофон может быть только один. Две открытые вкладки шлют звук
+            # в один буфер, куски перемешиваются, и распознавание выдаёт
+            # «Кукузи — это что-то заразило» вместо «Кузя, включи музыку». На
+            # живом доме на это ушёл вечер: в логе всё исправно, а робот
+            # оглох. Кто пришёл раньше — тот и микрофон; остальным честный
+            # отказ, и они перестают слушать.
+            кто = self.headers.get("X-Mic-Id") or self.client_address[0]
+            if not MIC.take(кто):
+                self.fail(409, "микрофоном уже занята другая вкладка")
+                return
+            MIC.push(кусок)
             self.send_json({"ok": True})
             return
 
