@@ -268,8 +268,17 @@ class AnthropicStream:
 # Ollama
 # --------------------------------------------------------------------------
 class Ollama:
-    def __init__(self, base: str = OLLAMA) -> None:
+    def __init__(self, base: str = OLLAMA, *, think: bool = False) -> None:
         self.base = base.rstrip("/")
+        # Размышления вслух. Qwen3 и родня по умолчанию сначала пишут ход
+        # мысли и только потом ответ. В переписке это полезно, для голоса —
+        # разорительно: на живом роботе «Да, я здесь!» стоило 695 токенов
+        # вывода и девяти секунд, из которых восемь ушли на текст, который
+        # никто никогда не увидит — его вырезает фильтр по дороге к речи.
+        self.think = think
+        # Некоторые сборки параметр не знают. Узнаём об этом по первому
+        # отказу и дальше не шлём.
+        self._think_known = True
 
     def _post(self, path: str, payload: dict, *, stream: bool):
         req = urllib.request.Request(
@@ -282,8 +291,8 @@ class Ollama:
         # дозвон до localhost и так падает мгновенно.
         return urllib.request.urlopen(req, timeout=OLLAMA_READ if stream else 10)
 
-    def chat(self, model: str, messages: list, tools: list, max_tokens: int):
-        """Поток ответов Ollama, разобранный по строкам."""
+    def _payload(self, model: str, messages: list, tools: list,
+                 max_tokens: int) -> dict:
         payload = {
             "model": model,
             "messages": messages,
@@ -293,7 +302,35 @@ class Ollama:
         }
         if tools:
             payload["tools"] = tools
-        with self._post("/api/chat", payload, stream=True) as resp:
+        if self._think_known:
+            payload["think"] = self.think
+        return payload
+
+    def chat(self, model: str, messages: list, tools: list, max_tokens: int):
+        """Поток ответов Ollama, разобранный по строкам."""
+        # Соединение открываем до первой выдачи: тогда отказ можно исправить и
+        # повторить, не показав наружу половину ответа.
+        resp = None
+        for _ in range(2):
+            try:
+                resp = self._post("/api/chat",
+                                  self._payload(model, messages, tools, max_tokens),
+                                  stream=True)
+                break
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", "replace")
+                except Exception:
+                    pass
+                if self._think_known and "think" in body.lower():
+                    log.warning("эта сборка Ollama не знает параметр think — "
+                                "работаю без него (%s)", body[:200])
+                    self._think_known = False
+                    continue
+                raise
+
+        with resp:
             for line in resp:
                 line = line.strip()
                 if not line:
@@ -317,6 +354,7 @@ class Ollama:
             "messages": [{"role": "user", "content": "привет"}],
             "stream": False,
             "keep_alive": KEEP_ALIVE,
+            "think": self.think,
             "options": {"num_predict": 1},
         }
         started = time.monotonic()
@@ -646,6 +684,9 @@ def main() -> int:
     p.add_argument("--host", default="0.0.0.0",
                    help="0.0.0.0 — слышно роботу по сети, 127.0.0.1 — только этой машине")
     p.add_argument("--ollama", default=OLLAMA)
+    p.add_argument("--think", action="store_true",
+                   help="разрешить модели размышлять вслух: точнее с "
+                        "инструментами, но ответ идёт в разы дольше")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
@@ -660,7 +701,7 @@ def main() -> int:
                       "filelock", "faster_whisper"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    ollama = Ollama(args.ollama)
+    ollama = Ollama(args.ollama, think=args.think)
     cfg = Config(args.model, Whisper(args.whisper), ollama)
 
     if not ollama.alive():
