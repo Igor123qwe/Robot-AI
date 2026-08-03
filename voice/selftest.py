@@ -426,6 +426,51 @@ def test_notes() -> None:
     check("пережил перезапуск", Notes(store).items(), ["хлеб"])
 
 
+def test_unsure_does_not_drive() -> None:
+    """Неуверенно расслышанная фраза не должна двигать робота.
+
+    На живом роботе whisper услышал «Кузяка идла», модель домыслила из этого
+    «влево», и робот поехал. Имя при этом совпало, так что проверка «звали ли
+    по имени» не спасла — нужна вторая, про уверенность распознавания.
+
+    Так устроено у всех, у кого команда может что-то сдвинуть: Home Assistant
+    не пускает в модель то, что разобрал сам, а Алиса перед разговорной веткой
+    прогоняет реплику через отдельный классификатор.
+    """
+    section("неуверенное распознавание не двигает робота")
+    from robot_voice.app import Addressed
+
+    store = Path(tempfile.mkdtemp())
+    ros = types.SimpleNamespace(voltage=12.4, moving=False, busy=False,
+                                connected=True, drive=lambda *a, **k: None,
+                                stop_motion=lambda: None)
+    addressed = Addressed()
+    tools = {t.name: t for t in build_tools(
+        ros, Timers(lambda *a, **k: None, store=store / "t.json"),
+        addressed=addressed)}
+
+    addressed.by_name, addressed.sure = True, True
+    check("уверенно и по имени — едем",
+          tools["drive"]({"direction": "вперёд"}).startswith("Еду"), True)
+
+    addressed.sure = False
+    check("расслышали плохо — не едем",
+          tools["drive"]({"direction": "вперёд"}),
+          "Не уверен, что расслышал. Повтори, пожалуйста.")
+    check("и разворот тоже",
+          tools["turn"]({"direction": "влево"}),
+          "Не уверен, что расслышал. Повтори, пожалуйста.")
+
+    addressed.by_name, addressed.sure = False, True
+    check("без имени — прежний ответ",
+          tools["drive"]({"direction": "вперёд"}),
+          "Для поездки позови меня по имени.")
+
+    # «Стоп» не должен ни от чего зависеть: он останавливает, а не запускает.
+    addressed.by_name = addressed.sure = False
+    check("стоп работает всегда", tools["stop"]({}).endswith("."), True)
+
+
 def test_slicing() -> None:
     """Нарезка на фразы: что уезжает в распознавание, а что нет.
 
@@ -1047,7 +1092,8 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_slicing, test_stop_while_thinking,
+                 test_weather, test_notes, test_unsure_does_not_drive,
+                 test_slicing, test_stop_while_thinking,
                  test_speech_streams,
                  test_pc_url, test_hidden,
                  test_thinkless, test_endpoints, test_brain_money,

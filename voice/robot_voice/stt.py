@@ -53,20 +53,29 @@ class Recognizer:
         self.language = language
         self.beam_size = beam_size
         self._warned_slow = False
+        # Насколько модель уверена в последнем услышанном. Отрицательное:
+        # около -0.2 — уверенно, ниже -1 — почти наверняка выдумала. Держим
+        # отдельным полем, а не в возвращаемом значении: слушатель один, а
+        # менять форму ответа ради этого пришлось бы во всех вызовах.
+        self.confidence: float | None = None
         log.info("whisper: готов")
 
     def transcribe(self, wav_bytes: bytes) -> str:
         started = time.monotonic()
         segments, info = self._run(io.BytesIO(wav_bytes))
 
-        parts = []
+        parts, scores = [], []
         for s in segments:
             # Сегмент, который сама модель считает тишиной, — это выдумка.
             if getattr(s, "no_speech_prob", 0.0) > 0.85:
                 log.debug("whisper: отбросил сегмент как тишину (%r)", s.text.strip())
                 continue
             parts.append(s.text.strip())
+            score = getattr(s, "avg_logprob", None)
+            if score is not None:
+                scores.append(float(score))
 
+        self.confidence = sum(scores) / len(scores) if scores else None
         text = " ".join(p for p in parts if p).strip()
         spent = time.monotonic() - started
         audio_len = getattr(info, "duration", 0.0) or 0.0
@@ -123,6 +132,8 @@ class Remote:
         self._local = None
         self._down_until = 0.0
         self._said_local = False
+        # Уверенность последнего распознавания — см. Recognizer.confidence.
+        self.confidence: float | None = None
 
     def transcribe(self, wav_bytes: bytes) -> str:
         if time.monotonic() >= self._down_until:
@@ -142,12 +153,17 @@ class Remote:
                 timeout=(PC_CONNECT, PC_READ),
             )
             resp.raise_for_status()
-            text = (resp.json().get("text") or "").strip()
+            body = resp.json()
+            text = (body.get("text") or "").strip()
+            self.confidence = body.get("sure")
         except Exception as e:
             self._down_until = time.monotonic() + PC_DOWN
             log.warning("ПК не распознал (%s) — перехожу на свои силы", e)
             return None
-        log.info("ПК: %.2f с → %r", time.monotonic() - started, text)
+        log.info("ПК: %.2f с | уверенность %s → %r",
+                 time.monotonic() - started,
+                 f"{self.confidence:.2f}" if self.confidence is not None else "—",
+                 text)
         self._said_local = False
         return text
 
@@ -158,4 +174,6 @@ class Remote:
         if not self._said_local:
             self._said_local = True
             log.warning("распознаю сам: медленнее и хуже, чем на ПК")
-        return self._local.transcribe(wav_bytes)
+        text = self._local.transcribe(wav_bytes)
+        self.confidence = self._local.confidence
+        return text

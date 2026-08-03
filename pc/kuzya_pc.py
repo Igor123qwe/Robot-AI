@@ -150,6 +150,16 @@ def to_ollama_messages(system, messages: list) -> list[dict]:
     return out
 
 
+def _no_think(messages: list[dict]) -> list[dict]:
+    """Дописывает мягкий выключатель размышлений к системному сообщению."""
+    out = list(messages)
+    if out and out[0].get("role") == "system":
+        out[0] = {**out[0], "content": out[0].get("content", "") + "\n/no_think"}
+    else:
+        out.insert(0, {"role": "system", "content": "/no_think"})
+    return out
+
+
 def to_ollama_tools(tools: list | None) -> list[dict]:
     """Схемы инструментов: у Anthropic плоско, у Ollama обёрнуто в function."""
     return [{
@@ -168,6 +178,55 @@ def to_ollama_tools(tools: list | None) -> list[dict]:
 def _sse(event: str, data: dict) -> bytes:
     return (f"event: {event}\n"
             f"data: {json.dumps(data, ensure_ascii=False)}\n\n").encode("utf-8")
+
+
+class Unthink:
+    """Отрезает размышления модели, даже когда она их не открыла.
+
+    Qwen3 не пишет <think> в ответе: этот тег уже стоит в шаблоне запроса,
+    поэтому генерация начинается сразу внутри размышлений, а наружу выходит
+    только закрывающий </think>. Фильтр, который ищет пару тегов, такое
+    пропускает целиком — на живом роботе он зачитал вслух полторы страницы
+    рассуждений про то, каким должен быть ответ.
+
+    Поэтому начало ответа придерживаем. Увидели </think> — всё, что было до
+    него, выбрасываем. Не увидели за LIMIT символов — значит размышлений нет,
+    отдаём как есть и дальше не держим.
+
+    Порог небольшой намеренно: платим им один раз в начале ответа, а
+    размышления Qwen3 начинаются с первого же токена, так что если их нет в
+    первых четырёх сотнях символов — их нет вовсе.
+    """
+
+    LIMIT = 400
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self.buf = ""
+        self.holding = True
+
+    def feed(self, chunk: str) -> str:
+        if not self.holding:
+            return chunk
+        self.buf += chunk
+        at = self.buf.find(self.CLOSE)
+        if at >= 0:
+            out = self.buf[at + len(self.CLOSE):]
+            self.buf, self.holding = "", False
+            return out.lstrip()
+        if len(self.buf) > self.LIMIT:
+            out = self.buf
+            self.buf, self.holding = "", False
+            # Открывающий тег всё-таки может прийти — тогда это обычная пара,
+            # и её разберёт фильтр на стороне робота.
+            return out
+        return ""
+
+    def close(self) -> str:
+        """Хвост, который так и не оказался размышлением."""
+        out, self.buf, self.holding = self.buf, "", False
+        return out
 
 
 class AnthropicStream:
@@ -471,15 +530,26 @@ class Whisper:
                 log_prob_threshold=-1.0,
                 compression_ratio_threshold=2.4,
             )
-            parts = [s.text.strip() for s in segments
-                     if getattr(s, "no_speech_prob", 0.0) <= 0.85]
+            parts, scores = [], []
+            for s in segments:
+                if getattr(s, "no_speech_prob", 0.0) > 0.85:
+                    continue
+                parts.append(s.text.strip())
+                # Насколько модель сама уверена в том, что услышала. Число
+                # отрицательное: -0.2 — уверенно, -1.2 — выдумала. Робот по
+                # нему решает, можно ли по этой фразе ехать.
+                score = getattr(s, "avg_logprob", None)
+                if score is not None:
+                    scores.append(float(score))
 
         text = " ".join(p for p in parts if p).strip()
+        sure = sum(scores) / len(scores) if scores else None
         spent = time.monotonic() - started
         length = getattr(info, "duration", 0.0) or 0.0
-        log.info("whisper: %.2f с на %.1f с звука (×%.2f) → %r",
-                 spent, length, spent / length if length else 0, text)
-        return text
+        log.info("whisper: %.2f с на %.1f с звука (×%.2f) | уверенность %s → %r",
+                 spent, length, spent / length if length else 0,
+                 f"{sure:.2f}" if sure is not None else "—", text)
+        return text, sure
 
 
 # --------------------------------------------------------------------------
@@ -540,12 +610,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "пустое тело запроса"})
             return
         try:
-            text = self.server.cfg.whisper.transcribe(wav)
+            text, sure = self.server.cfg.whisper.transcribe(wav)
         except Exception as e:
             log.exception("распознавание не вышло")
             self._json(500, {"error": str(e)})
             return
-        self._json(200, {"text": text})
+        # Уверенность едет вместе с текстом: по ней робот решает, выполнять
+        # услышанное или переспросить. Так делают все, у кого команда может
+        # что-то сдвинуть с места.
+        self._json(200, {"text": text, "sure": sure})
 
     # --- разговор ---
     def _messages(self) -> None:
@@ -557,6 +630,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         messages = to_ollama_messages(req.get("system"), req.get("messages") or [])
+        if not getattr(cfg.ollama, "think", False):
+            # Мягкий выключатель размышлений. Параметр think понимают не все
+            # сборки Ollama, а эту строку Qwen3 понимает сам — и без неё он
+            # сначала пишет полстраницы рассуждений, даже когда параметр
+            # выставлен. Дешевле сказать обоими способами.
+            messages = _no_think(messages)
         tools = to_ollama_tools(req.get("tools"))
         # Имя модели из настроек робота игнорируем намеренно: там может стоять
         # облачное, а здесь запускается то, что реально скачано на этом ПК.
@@ -576,18 +655,32 @@ class Handler(BaseHTTPRequestHandler):
         """Гоняет Ollama и отдаёт куски: («text», строка) и («call», имя, аргументы)."""
         used_in = used_out = 0
         truncated = False
+        unthink = Unthink()
         for part in self.server.cfg.ollama.chat(model, messages, tools, limit):
             msg = part.get("message") or {}
             chunk = msg.get("content") or ""
             if chunk:
-                yield ("text", chunk, None)
+                clean = unthink.feed(chunk)
+                if clean:
+                    yield ("text", clean, None)
             for call in msg.get("tool_calls") or []:
+                # Придержанный текст выпускаем ПЕРЕД вызовом инструмента:
+                # иначе «сейчас гляну» уедет за спину действия, и робот
+                # объявит о сделанном раньше, чем скажет, что делает.
+                # Размышления к этому моменту в любом случае кончились —
+                # вызов инструмента идёт после них.
+                tail = unthink.close()
+                if tail:
+                    yield ("text", tail, None)
                 fn = call.get("function") or {}
                 yield ("call", fn.get("name", ""), fn.get("arguments"))
             if part.get("done"):
                 used_in = int(part.get("prompt_eval_count") or 0)
                 used_out = int(part.get("eval_count") or 0)
                 truncated = part.get("done_reason") == "length"
+        tail = unthink.close()
+        if tail:
+            yield ("text", tail, None)
         yield ("done", used_in, (used_out, truncated))
 
     def _stream(self, model, messages, tools, limit) -> None:

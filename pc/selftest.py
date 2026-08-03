@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import types
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -224,6 +225,78 @@ def test_broken() -> None:
         srv.shutdown()
 
 
+def test_unthink() -> None:
+    """Размышления не должны доехать до речи, даже без открывающего тега.
+
+    Qwen3 не пишет <think> в ответе: тег уже стоит в шаблоне запроса, и
+    генерация начинается сразу внутри размышлений. На живом роботе это
+    вылилось в полторы страницы рассуждений, зачитанных вслух.
+    """
+    section("размышления не выходят наружу")
+    from kuzya_pc import Unthink
+
+    def через(куски: list[str]) -> str:
+        f = Unthink()
+        out = "".join(f.feed(c) for c in куски)
+        return out + f.close()
+
+    check("закрывающий тег без открывающего",
+          через(["Надо ответить коротко. ", "Пожалуй, так.", "</think>", "Привет!"]),
+          "Привет!")
+    check("обычная пара тегов",
+          через(["<think>думаю</think>", "Готово."]), "Готово.")
+    check("тег разорван между кусками",
+          через(["думаю", "</thi", "nk>", "Готово."]), "Готово.")
+    check("короткий ответ без размышлений доходит целиком",
+          через(["Привет", ", Игорь!"]), "Привет, Игорь!")
+    # Длинный ответ не должен застревать в буфере: после порога фильтр
+    # перестаёт держать и пропускает поток дальше.
+    длинный = "а" * 500
+    check("длинный ответ не теряется", через([длинный]), длинный)
+
+
+def test_stt_confidence() -> None:
+    """Вместе с текстом наружу едет уверенность распознавания.
+
+    По ней робот решает, можно ли выполнять услышанное. Без неё он однажды
+    поехал по фразе «Кузяка идла», которую модель домыслила до «влево».
+    """
+    section("уверенность распознавания")
+    import json
+    import urllib.request
+
+    class Сегмент:
+        def __init__(self, text, logprob, no_speech=0.0):
+            self.text, self.avg_logprob = text, logprob
+            self.no_speech_prob = no_speech
+
+    class Модель:
+        def transcribe(self, *a, **kw):
+            return ([Сегмент(" вперёд на метр", -0.31),
+                     Сегмент(" шшш", -1.40, no_speech=0.99)],
+                    types.SimpleNamespace(duration=1.5))
+
+    whisper = Whisper("tiny")
+    whisper._model = Модель()
+    text, sure = whisper.transcribe("звук".encode())
+    check("тишину выбросили", text, "вперёд на метр")
+    check("уверенность посчитана по оставшемуся", round(sure, 2), -0.31)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.cfg = Config("тест", whisper=whisper, ollama=FakeOllama([]))
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/stt"
+        req = urllib.request.Request(url, data="звук".encode(), method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = json.loads(r.read().decode("utf-8"))
+        check("текст доехал", body["text"], "вперёд на метр")
+        check("уверенность доехала", round(body["sure"], 2), -0.31)
+    finally:
+        srv.shutdown()
+
+
 def test_health() -> None:
     section("здоровье")
     import json
@@ -242,7 +315,8 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_tool_call, test_broken, test_health):
+    for test in (test_messages, test_stream, test_tool_call, test_broken,
+                 test_unthink, test_stt_confidence, test_health):
         test()
         print("   ...")
     if FAILED:
