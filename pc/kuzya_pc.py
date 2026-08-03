@@ -171,29 +171,13 @@ def to_ollama_messages(system, messages: list) -> list[dict]:
     return out
 
 
-def _no_think(messages: list[dict]) -> list[dict]:
-    """Дописывает мягкий выключатель размышлений к последней реплике человека.
-
-    Место важное. Сначала строка стояла в системном сообщении — и Qwen3 её
-    проигнорировал: на живом роботе он думал по восемьсот токенов на «привет».
-    Выключатель у Qwen3 разбирает шаблон разговора, и смотрит он на ПОСЛЕДНЮЮ
-    реплику пользователя: в длинной беседе побеждает та, что ближе к концу.
-    Системное сообщение до неё не дотягивается.
-
-    Если последней идёт не реплика человека, а результат инструмента, дописать
-    некуда — там строгая структура, и лишний текст ломает разбор. Тогда
-    оставляем как есть: круг с инструментом всё равно идёт следом за обычным,
-    где выключатель уже сработал.
-    """
-    out = list(messages)
-    for i in range(len(out) - 1, -1, -1):
-        if out[i].get("role") != "user":
-            continue
-        content = out[i].get("content")
-        if isinstance(content, str):
-            out[i] = {**out[i], "content": content + " /no_think"}
-        break
-    return out
+# Мягкого выключателя /no_think здесь НЕТ, и это осознанно. Он был — сначала
+# в системном сообщении, потом в последней реплике человека, — и не сработал
+# ни разу. Проверка прямым запросом к Ollama показала почему: свежие Qwen3
+# разъехались на два отдельных выпуска, думающий и нет, и думающий команду
+# просто не знает. Хуже того, он на неё отвечает: на «привет /no_think» модель
+# сказала «Привет! Но я не понимаю команду /no_think». То есть строка не
+# выключала размышления, а портила фразу человека. Не возвращать.
 
 
 def to_ollama_tools(tools: list | None) -> list[dict]:
@@ -424,27 +408,42 @@ class Ollama:
         # не видно, а гадать об этом дорого.
         self._explained = False
 
-    def explain(self, split: bool, thought: bool) -> None:
-        """Один раз рассказывает, что на самом деле вышло с размышлениями.
+    def explain(self, model: str, split: bool, thought: bool) -> None:
+        """Разбирается с размышлениями по первому же ответу.
 
-        split — Ollama отдала размышления отдельным полем, значит она модель
-        как размышляющую знает и параметр think до неё дошёл.
+        split — Ollama отдала размышления отдельным полем: значит она разбирает
+        их сама, и content приходит чистым.
         thought — размышления всё-таки были.
+
+        Главное открытие живого сеанса: think=false у Ollama означает «не
+        разбирай размышления», а вовсе не «пусть модель не думает». Модель
+        думает ровно столько же, но её рассуждения летят прямо в content
+        вместе с закрывающим тегом. То есть выключатель делает хуже, чем его
+        отсутствие. Поймали такое — включаем разбор обратно: рассуждения
+        уедут в отдельное поле, а content станет чистым.
         """
         if self._explained:
             return
         self._explained = True
         if not thought:
             log.info("размышления выключены (think=%s)", self.think)
-        elif split:
-            log.warning("Ollama отдаёт размышления отдельным полем, но модель "
-                        "думает несмотря на think=%s", self.think)
-        else:
-            log.warning("модель думает вслух прямо в тексте: ни параметр "
-                        "think=%s, ни строка /no_think её не остановили. "
-                        "Ollama размышляющей эту модель не считает — режем "
-                        "их сами, но платим временем и токенами",
-                        self.think if self._think_known else "не поддерживается")
+            return
+        if split:
+            log.warning("модель думает, несмотря на think=%s, но Ollama "
+                        "разбирает размышления сама — наружу они не идут. "
+                        "Плата за это — время и токены на каждый ответ",
+                        self.think)
+            return
+        log.warning("модель думает вслух прямо в тексте, и выключить это "
+                    "нечем: think=%s Ollama понимает как «не разбирать», а не "
+                    "как «не думать». Включаю разбор обратно — рассуждения "
+                    "уедут в отдельное поле. Насовсем это лечится только "
+                    "нерассуждающей моделью: ollama pull "
+                    "qwen3:4b-instruct-2507-q4_K_M", self.think)
+        self.think = True
+        # Привычку забываем: с этого момента content чистый, и держать его
+        # начало, дожидаясь тега, которого больше не будет, незачем.
+        self.habit.pop(model, None)
 
     def _post(self, path: str, payload: dict, *, stream: bool):
         req = urllib.request.Request(
@@ -737,12 +736,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         messages = to_ollama_messages(req.get("system"), req.get("messages") or [])
-        if not getattr(cfg.ollama, "think", False):
-            # Мягкий выключатель размышлений. Параметр think понимают не все
-            # сборки Ollama, а эту строку Qwen3 понимает сам — и без неё он
-            # сначала пишет полстраницы рассуждений, даже когда параметр
-            # выставлен. Дешевле сказать обоими способами.
-            messages = _no_think(messages)
         tools = to_ollama_tools(req.get("tools"))
         # Имя модели из настроек робота игнорируем намеренно: там может стоять
         # облачное, а здесь запускается то, что реально скачано на этом ПК.
@@ -805,7 +798,7 @@ class Handler(BaseHTTPRequestHandler):
                         ", ответ обрезан по лимиту длины" if truncated else "")
         tail = unthink.close(not truncated)
         if hasattr(ollama, "explain"):
-            ollama.explain(split, split or unthink.habit.get(model) is True)
+            ollama.explain(model, split, split or unthink.habit.get(model) is True)
         if tail:
             yield ("text", tail, None)
         yield ("done", used_in, (used_out, truncated))

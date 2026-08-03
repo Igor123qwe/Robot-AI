@@ -231,30 +231,41 @@ def test_ping() -> None:
         kuzya_pc.PING_SECONDS = было
 
 
-def test_no_think() -> None:
-    """Мягкий выключатель размышлений должен стоять там, где Qwen его читает.
+def test_think_switch() -> None:
+    """think=false у Ollama значит «не разбирай размышления», а не «не думай».
 
-    Сначала он стоял в системном сообщении — и Qwen3 его проигнорировал: на
-    живом роботе восемьсот токенов размышлений на «привет». Выключатель
-    разбирает шаблон разговора, и смотрит он на последнюю реплику человека.
+    Выяснено прямым запросом к Ollama. С --think=false qwen3:4b думал 448
+    токенов и вывалил рассуждения в content вместе с закрывающим тегом; без
+    флага — думал столько же, но Ollama отдала их отдельно, и content пришёл
+    чистым. То есть выключатель делает ХУЖЕ, чем его отсутствие. Поймали
+    такое — обязаны вернуть разбор обратно, иначе каждый ответ будет ехать
+    через фильтр и терять начало на ожидании тега.
     """
-    section("выключатель размышлений на своём месте")
-    from kuzya_pc import _no_think
+    section("выключатель размышлений, который делает хуже")
+    from kuzya_pc import Ollama
 
-    out = _no_think([
-        {"role": "system", "content": "ты робот"},
-        {"role": "user", "content": "привет"},
-        {"role": "assistant", "content": "здравствуй"},
-        {"role": "user", "content": "как дела"},
-    ])
-    check("дописан к последней реплике человека", out[3]["content"], "как дела /no_think")
-    check("системное сообщение не тронуто", out[0]["content"], "ты робот")
-    check("ранняя реплика не тронута", out[1]["content"], "привет")
+    o = Ollama(think=False)
+    o.habit["м"] = True
+    # Размышления пришли в тексте, отдельного поля не было.
+    o.explain("м", split=False, thought=True)
+    check("разбор возвращён", o.think, True)
+    check("привычка забыта — content теперь чистый", o.habit.get("м"), None)
 
-    # Круг с результатом инструмента: дописывать некуда, структура строгая.
-    жёсткое = [{"role": "user", "content": [{"type": "tool_result", "content": "12.4"}]}]
-    check("результат инструмента не портим", _no_think(жёсткое), жёсткое)
-    check("без реплик человека не падаем", _no_think([]), [])
+    # А если Ollama разбирает сама — трогать нечего.
+    o = Ollama(think=False)
+    o.explain("м", split=True, thought=True)
+    check("при чужом разборе не вмешиваемся", o.think, False)
+
+    # И если размышлений нет вовсе — тем более.
+    o = Ollama(think=False)
+    o.explain("м", split=False, thought=False)
+    check("молчаливую модель не трогаем", o.think, False)
+
+    # Разбираемся один раз за запуск, а не на каждом ответе.
+    o = Ollama(think=False)
+    o.explain("м", split=False, thought=False)
+    o.explain("м", split=False, thought=True)
+    check("разбираемся однажды", o.think, False)
 
 
 def test_tool_call() -> None:
@@ -429,7 +440,7 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_ping, test_no_think,
+    for test in (test_messages, test_stream, test_ping, test_think_switch,
                  test_tool_call, test_broken,
                  test_unthink, test_stt_confidence, test_health):
         test()
