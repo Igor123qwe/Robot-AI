@@ -95,17 +95,26 @@ def find(what: str, language: str = "russian") -> tuple[str, str] | None:
     находиться, а джаз интернациональн.
     """
     what = " ".join(what.split())
-    if not what:
-        return None
     # codec=MP3 просим прямо у каталога: так меньше шансов, что все двадцать
     # найденных окажутся в AAC и выбирать будет не из чего.
-    попытки = (
-        {"name": what, "codec": "MP3"},
-        {"tag": what, "language": language, "codec": "MP3"},
-        {"tag": what, "codec": "MP3"},
-        {"name": what},
-        {"tag": what},
-    )
+    if not what:
+        # «Включи музыку» без уточнения. Раньше сюда подставлялось слово
+        # «популярное», и робот честно искал станцию с таким названием — а
+        # потом отвечал «не нашёл станцию — ». Просто берём самую слушаемую
+        # русскую.
+        попытки = (
+            {"language": language, "codec": "MP3"},
+            {"language": language},
+            {"codec": "MP3"},
+        )
+    else:
+        попытки = (
+            {"name": what, "codec": "MP3"},
+            {"tag": what, "language": language, "codec": "MP3"},
+            {"tag": what, "codec": "MP3"},
+            {"name": what},
+            {"tag": what},
+        )
     for params in попытки:
         станция = _best(_search(**params))
         if станция:

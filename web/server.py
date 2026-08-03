@@ -34,6 +34,7 @@ IP Webcam умеет только отдавать звук, но не прин�
 
 from __future__ import annotations
 
+import io
 import ipaddress
 import json
 import os
@@ -224,6 +225,30 @@ class Handler(SimpleHTTPRequestHandler):
     # Каталог web/ — не файлопомойка: отдаём пульт, а не листинг и не исходники.
     def list_directory(self, path):
         self.path = "/pult.html"
+        return SimpleHTTPRequestHandler.send_head(self)
+
+    def send_head(self):
+        """Пульт браузеру кэшировать нельзя.
+
+        Робот подтягивает обновления с гитхаба каждые две минуты, а вкладка
+        держит страницу открытой часами. Браузер честно берёт её из кэша — и
+        человек видит вчерашний пульт при сегодняшнем роботе. На живом доме на
+        это ушёл вечер: сервер уже умел включать радио, страница ещё нет, и в
+        логах всё выглядело исправным.
+        """
+        путь = self.path.partition("?")[0]
+        if путь.endswith((".html", "/")) or путь == "":
+            self.send_response(200)
+            try:
+                тело = (WEB_DIR / "pult.html").read_bytes()
+            except OSError:
+                self.send_error(404, "нет пульта")
+                return None
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(тело)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return io.BytesIO(тело)
         return SimpleHTTPRequestHandler.send_head(self)
 
     def do_GET(self):

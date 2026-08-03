@@ -1052,9 +1052,10 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         from . import radio as radio_api
         if play is None:
             return "Мне некуда играть музыку: пульт не подключён."
-        найдено = radio_api.find(что or "популярное")
+        найдено = radio_api.find(что)
         if найдено is None:
-            return f"Не нашёл станцию — {что}. Скажи иначе."
+            return (f"Не нашёл станцию — {что}. Скажи иначе." if что
+                    else "Не нашёл ни одной станции — каталог не отвечает.")
         имя, поток = найдено
         if not play(поток):
             return "Пульт не отвечает, включить музыку некуда."
