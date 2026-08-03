@@ -231,6 +231,59 @@ def test_ping() -> None:
         kuzya_pc.PING_SECONDS = было
 
 
+def test_warming() -> None:
+    """Пока модель едет в видеопамять, мост отвечает сам — и бесплатно.
+
+    Загрузка четырёхмиллиардной модели заняла на живом ПК семьдесят шесть
+    секунд. Робот в это время сказал «Кузя, привет», не дождался ответа за
+    свои двадцать пять секунд, счёл ПК мёртвым и ушёл в облако: одно «привет»
+    обошлось в 9845 оплаченных токенов. Ответить самому — мгновенно, даром и
+    честнее молчания.
+    """
+    section("пока мозг просыпается, отвечаем сами")
+    import anthropic
+
+    fake = FakeOllama(["не должно прозвучать"])
+    fake.ready = False
+    fake.started = kuzya_pc.time.monotonic()
+    srv, url = serve(fake)
+    try:
+        client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0)
+        pieces: list[str] = []
+        with client.messages.stream(
+            model="неважно", max_tokens=64,
+            messages=[{"role": "user", "content": "привет"}],
+        ) as stream:
+            for event in stream:
+                if (event.type == "content_block_delta"
+                        and getattr(event.delta, "type", "") == "text_delta"):
+                    pieces.append(event.delta.text)
+            final = stream.get_final_message()
+        check("робот услышал честный ответ", "".join(pieces), kuzya_pc.WARMING_REPLY)
+        check("ответ завершён по правилам", final.stop_reason, "end_turn")
+        check("Ollama не тронута", fake.seen, None)
+
+        # Прогрелись — дальше как обычно.
+        fake.ready = True
+        msg = client.messages.create(
+            model="неважно", max_tokens=64,
+            messages=[{"role": "user", "content": "привет"}])
+        check("после прогрева отвечает модель", msg.content[0].text,
+              "не должно прозвучать")
+
+        # А если прогрев затянулся сверх всякой меры — Ollama, похоже, не
+        # поднялась вовсе. Вечно отвечать «просыпаюсь» нельзя: робот должен
+        # узнать правду и уйти в облако.
+        fake.ready = False
+        fake.started = kuzya_pc.time.monotonic() - kuzya_pc.WARMING_GRACE - 1
+        msg = client.messages.create(
+            model="неважно", max_tokens=64,
+            messages=[{"role": "user", "content": "привет"}])
+        check("вечно просыпаться не даём", msg.content[0].text, "не должно прозвучать")
+    finally:
+        srv.shutdown()
+
+
 def test_think_switch() -> None:
     """think=false у Ollama значит «не разбирай размышления», а не «не думай».
 
@@ -440,7 +493,7 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_ping, test_think_switch,
+    for test in (test_messages, test_stream, test_ping, test_warming, test_think_switch,
                  test_tool_call, test_broken,
                  test_unthink, test_stt_confidence, test_health):
         test()

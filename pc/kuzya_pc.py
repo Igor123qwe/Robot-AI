@@ -61,6 +61,16 @@ KEEP_ALIVE = -1
 # считает молчащий ПК мёртвым и уходит в платное облако прямо посреди ответа.
 PING_SECONDS = 5.0
 
+# Сколько от старта считаем, что модель ещё грузится, и отвечаем сами. Загрузка
+# четырёхмиллиардной модели с диска в видеопамять заняла на живом ПК семьдесят
+# шесть секунд. Дальше этого срока молча ждать нельзя: если Ollama не поднялась
+# вовсе, робот должен узнать правду и уйти в облако.
+WARMING_GRACE = 240.0
+
+# Что робот скажет вслух, пока мозг просыпается. Дешевле любого облака и
+# честнее молчания: человек слышит, что его услышали.
+WARMING_REPLY = "Секунду, я ещё просыпаюсь."
+
 
 # --------------------------------------------------------------------------
 # Перевод: язык Anthropic → язык Ollama
@@ -407,6 +417,9 @@ class Ollama:
         # параметр think, строка /no_think или сама модель — из обычного лога
         # не видно, а гадать об этом дорого.
         self._explained = False
+        # Модель ещё грузится в видеопамять. Ставится прогревом при старте.
+        self.ready = False
+        self.started = time.monotonic()
 
     def explain(self, model: str, split: bool, thought: bool) -> None:
         """Разбирается с размышлениями по первому же ответу.
@@ -742,10 +755,35 @@ class Handler(BaseHTTPRequestHandler):
         model = cfg.model
         limit = int(req.get("max_tokens") or 1024)
 
+        if self._warming():
+            # Модель ещё едет с диска в видеопамять. Запрос сейчас встанет в
+            # очередь за загрузкой и не уложится в двадцать пять секунд, что
+            # робот отводит на ответ, — он решит, что ПК умер, и уйдёт в
+            # платное облако. На живом роботе одно «привет», сказанное в эту
+            # минуту, стоило девять тысяч оплаченных токенов. Отвечаем сами:
+            # бесплатно, мгновенно и честно.
+            log.info("ещё прогреваюсь — отвечаю сам, не пуская робота в облако")
+            if req.get("stream"):
+                self._stream_text(model, WARMING_REPLY)
+            else:
+                self._whole_text(model, WARMING_REPLY)
+            return
+
         if req.get("stream"):
             self._stream(model, messages, tools, limit)
         else:
             self._whole(model, messages, tools, limit)
+
+    def _warming(self) -> bool:
+        """Модель ещё грузится, и ждать её дольше, чем ждёт робот.
+
+        Срок ограничен: если Ollama не поднялась вовсе, вечно отвечать
+        «просыпаюсь» нельзя — робот должен узнать правду и уйти в облако.
+        """
+        ollama = self.server.cfg.ollama
+        if getattr(ollama, "ready", True):
+            return False
+        return time.monotonic() - getattr(ollama, "started", 0.0) < WARMING_GRACE
 
     @staticmethod
     def _error(kind: str, message: str) -> dict:
@@ -840,6 +878,35 @@ class Handler(BaseHTTPRequestHandler):
             # Начали отдавать — заголовки уже ушли, сказать об ошибке нечем.
             # Просто закрываем: клиент увидит обрыв и уйдёт в облако.
             self.close_connection = True
+
+    def _stream_text(self, model: str, text: str) -> None:
+        """Свой собственный ответ, потоком и по всем правилам протокола."""
+        out = AnthropicStream(model)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self._write(out.start())
+            self._write(out.text(text))
+            self._write(out.finish(0, 0, False))
+        except RobotGone as e:
+            log.info("робот отключился посреди ответа (%s)", e)
+            self.close_connection = True
+
+    def _whole_text(self, model: str, text: str) -> None:
+        """То же самое, но одним куском."""
+        self._json(200, {
+            "id": f"msg_{int(time.time()*1000):x}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        })
 
     def _write(self, chunks) -> None:
         """Отдаёт кусок потока роботу.
@@ -963,13 +1030,23 @@ def main() -> int:
     # первая фраза не должна ждать загрузки моделей. Робот ждёт ответа
     # двадцать пять секунд, а холодный старт занимает больше — и тогда он
     # уходит в облако и не возвращается к ПК целую минуту.
-    def warm() -> None:
+    # Врозь, а не по очереди. Распознавание встаёт за восемнадцать секунд,
+    # модель — за семьдесят шесть, и пока они грузились друг за другом, робот
+    # успевал распознать фразу, отправить её мозгу и не дождаться ответа. По
+    # отдельности распознавание готово втрое раньше и сразу приносит пользу.
+    def warm_whisper() -> None:
         cfg.whisper.warm()
+
+    def warm_model() -> None:
         if ollama.alive():
             ollama.warm(args.model)
+        else:
+            log.warning("Ollama не отвечает — мозг работать не будет")
+        ollama.ready = True
         log.info("прогрет и готов — можно говорить")
 
-    threading.Thread(target=warm, daemon=True).start()
+    for job in (warm_whisper, warm_model):
+        threading.Thread(target=job, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
