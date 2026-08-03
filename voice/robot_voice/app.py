@@ -150,6 +150,50 @@ class Voice:
                 log.debug("не смог показать %s в пульте", kind, exc_info=True)
 
 
+# Насколько часы могут разойтись, прежде чем это станет бедой. Полминуты —
+# сетевая задержка и округление, а вот минута и больше уже сдвигает будильник.
+CLOCK_SLACK = 60.0
+
+
+def _check_clock(cfg) -> None:
+    """Сверяет часы робота с часами ПК и кричит, если они разъехались.
+
+    У SBC робота нет батарейки часов: после выключения питания время берётся
+    из сети, а если сети в этот момент не было — остаётся каким попало. На
+    живом роботе разница с ПК дошла до пяти часов, и «поставь будильник на
+    восемнадцать» уехало на сутки вперёд. По поведению такое не диагностируется
+    вовсе: робот уверенно называет неверное время, а человек ему верит.
+
+    Чинить сами не пытаемся: у робота может быть свой часовой пояс, и решать,
+    чьи часы правильные, — не наше дело. Наше дело — не дать этому пройти
+    незамеченным.
+    """
+    if not cfg.pc_url:
+        return
+    try:
+        with urllib.request.urlopen(cfg.pc_url.rstrip("/") + "/health",
+                                    timeout=3) as resp:
+            import json as _json
+            там = (_json.loads(resp.read() or b"{}") or {}).get("часы")
+    except Exception:
+        return          # ПК выключен — это не про часы, и молчать тут правильно
+    if not там:
+        return          # старая сборка на ПК: часов не сообщает
+    try:
+        разница = (datetime.now() - datetime.fromisoformat(там)).total_seconds()
+    except ValueError:
+        return
+    if abs(разница) < CLOCK_SLACK:
+        log.info("часы робота и ПК сходятся")
+        return
+    log.warning("ЧАСЫ РАЗОШЛИСЬ: робот %s, ПК %s — разница %+.0f минут. "
+                "Будильники и напоминания уедут ровно на неё. "
+                "Починить: sudo timedatectl set-ntp true "
+                "и sudo timedatectl set-timezone Europe/Moscow",
+                datetime.now().strftime("%H:%M"),
+                datetime.fromisoformat(там).strftime("%H:%M"), разница / 60)
+
+
 def _setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -319,6 +363,7 @@ def main() -> None:
     log.info("часы робота: %s, тихие часы %s",
              datetime.now().strftime("%d.%m %H:%M"),
              cfg.quiet_hours or "выключены")
+    _check_clock(cfg)
 
     # Настроенное голосом переживает перезапуск: автообновление случается
     # каждые две минуты, и громкость не должна возвращаться сама.

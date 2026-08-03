@@ -1052,6 +1052,10 @@ class Handler(BaseHTTPRequestHandler):
                 "голос": getattr(getattr(cfg, "voice", None), "ready", False),
                 "узнаю_по_голосу": sorted(
                     getattr(getattr(cfg, "who", None), "people", {})),
+                # Часы. Робот сверяет их со своими: на его SBC нет батарейки
+                # часов, и после выключения питания время уезжает на часы. А от
+                # него зависят будильники, напоминания и тихие часы.
+                "часы": time.strftime("%Y-%m-%dT%H:%M:%S"),
             })
             return
         self._json(404, {"error": "нет такого адреса"})
