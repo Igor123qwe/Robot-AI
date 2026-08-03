@@ -48,6 +48,12 @@ OLLAMA = "http://127.0.0.1:11434"
 OLLAMA_CONNECT = 3.0
 OLLAMA_READ = 300.0
 
+# Сколько держать модель в видеопамяти без работы. Умолчание Ollama — пять
+# минут, после чего она выгружается, и следующая фраза снова ждёт загрузки
+# десятки секунд. Робот столько ждать не станет: он уйдёт в облако и запомнит
+# ПК как неотвечающий на минуту вперёд. -1 — не выгружать вовсе.
+KEEP_ALIVE = -1
+
 
 # --------------------------------------------------------------------------
 # Перевод: язык Anthropic → язык Ollama
@@ -271,6 +277,7 @@ class Ollama:
             "model": model,
             "messages": messages,
             "stream": True,
+            "keep_alive": KEEP_ALIVE,
             "options": {"num_predict": max_tokens},
         }
         if tools:
@@ -284,6 +291,32 @@ class Ollama:
                     yield json.loads(line)
                 except ValueError:
                     log.warning("Ollama прислала не JSON: %r", line[:200])
+
+    def warm(self, model: str) -> None:
+        """Загоняет модель в видеопамять, не дожидаясь первой фразы.
+
+        Первый запрос к незагруженной модели идёт десятки секунд. Робот
+        столько не ждёт: он уходит в облако и запоминает ПК как молчащий на
+        минуту вперёд — то есть за холодный старт расплачивается не только
+        первая фраза, но и все следующие в течение минуты. Проверено на живом
+        роботе: ровно так и вышло.
+        """
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "привет"}],
+            "stream": False,
+            "keep_alive": KEEP_ALIVE,
+            "options": {"num_predict": 1},
+        }
+        started = time.monotonic()
+        try:
+            with self._post("/api/chat", payload, stream=True):
+                pass
+        except Exception as e:
+            log.warning("прогреть модель не вышло (%s) — первая фраза будет долгой", e)
+            return
+        log.info("модель %s в памяти, прогрев занял %.0f с",
+                 model, time.monotonic() - started)
 
     def alive(self) -> bool:
         try:
@@ -305,11 +338,15 @@ class Ollama:
 # Whisper
 # --------------------------------------------------------------------------
 class Whisper:
-    """Распознавание. Модель грузится при первом обращении, а не при старте.
+    """Распознавание.
 
-    Так сервер поднимается мгновенно и отвечает на /health даже до того, как
-    видеокарта прогрелась. Первая фраза за это платит несколькими секундами —
-    один раз за запуск.
+    Модель грузится не при обращении, а прогревом при старте — иначе первая
+    фраза ждёт скачивания полугигабайта и прогрева видеокарты. Робот столько
+    не ждёт: он распознаёт сам и запоминает ПК как молчащий на минуту вперёд.
+    Проверено на живом роботе — именно так и вышло.
+
+    Сервер при этом поднимается сразу: прогрев идёт в своём потоке, а /health
+    честно показывает, загрузилась модель или ещё нет.
     """
 
     def __init__(self, size: str, language: str = "ru") -> None:
@@ -335,6 +372,19 @@ class Whisper:
             log.info("whisper: модель %s на %s", self.size, device)
             return model
         raise RuntimeError("whisper не поднялся ни на видеокарте, ни на процессоре")
+
+    def warm(self) -> None:
+        """Загрузить модель заранее. Зовётся при старте, в отдельном потоке."""
+        started = time.monotonic()
+        with self._lock:
+            if self._model is None:
+                try:
+                    self._model = self._load()
+                except Exception as e:
+                    log.warning("распознавание не поднялось (%s)", e)
+                    return
+        log.info("распознавание готово, прогрев занял %.0f с",
+                 time.monotonic() - started)
 
     def transcribe(self, wav: bytes) -> str:
         import io
@@ -596,6 +646,18 @@ def main() -> int:
     log.info("мозг на %s:%d | модель %s | распознавание %s",
              args.host, args.port, args.model, args.whisper)
     log.info("на роботе: ROBOT_PC_URL=http://<адрес этого ПК>:%d", args.port)
+
+    # Прогрев в своём потоке: сервер должен отвечать на /health сразу, а вот
+    # первая фраза не должна ждать загрузки моделей. Робот ждёт ответа
+    # двадцать пять секунд, а холодный старт занимает больше — и тогда он
+    # уходит в облако и не возвращается к ПК целую минуту.
+    def warm() -> None:
+        cfg.whisper.warm()
+        if ollama.alive():
+            ollama.warm(args.model)
+        log.info("прогрет и готов — можно говорить")
+
+    threading.Thread(target=warm, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
