@@ -422,6 +422,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 people=None, who: Callable[[], str] | None = None,
                 home: Callable[[], tuple[float, float] | None] | None = None,
                 set_place: Callable[[str, float, float], None] | None = None,
+                play: Callable[[str], bool] | None = None,
                 news_url: str = "") -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
@@ -1039,6 +1040,32 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         set_place(имя, lat, lon)
         return f"Запомнил: мы в {имя}."
 
+    def look_up(вопрос: str) -> str:
+        from . import lookup
+        return lookup.find(вопрос)
+
+    def rates() -> str:
+        from . import lookup
+        return lookup.rates()
+
+    def play_radio(что: str = "") -> str:
+        from . import radio as radio_api
+        if play is None:
+            return "Мне некуда играть музыку: пульт не подключён."
+        найдено = radio_api.find(что or "популярное")
+        if найдено is None:
+            return f"Не нашёл станцию — {что}. Скажи иначе."
+        имя, поток = найдено
+        if not play(поток):
+            return "Пульт не отвечает, включить музыку некуда."
+        return f"Включаю {имя}."
+
+    def stop_radio() -> str:
+        if play is None:
+            return "Музыка и так не играет."
+        play("")
+        return "Выключил."
+
     def news() -> str:
         from . import news as news_api
         return news_api.describe(news_api.headlines(news_url or news_api.URL))
@@ -1069,6 +1096,56 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             },
             run=set_home,
         ))
+
+    tools += [
+        Tool(
+            name="look_up",
+            description="Посмотреть справку в интернете: кто это, что это, "
+                        "когда было. Зови вместо ответа по памяти — твоя "
+                        "память устарела, а справка свежая.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "вопрос": {"type": "string",
+                               "description": "О чём справка: «Калининград», "
+                                              "«Юрий Гагарин», «меканум-колесо»."},
+                },
+                "required": ["вопрос"],
+            },
+            run=look_up,
+        ),
+        Tool(
+            name="rates",
+            hidden=True,
+            description="Курс доллара и евро по Центробанку.",
+            input_schema=EMPTY_SCHEMA,
+            run=rates,
+        ),
+    ]
+    if play is not None:
+        tools += [
+            Tool(
+                name="play_radio",
+                description="Включить интернет-радио: по названию станции или "
+                            "по жанру. Своей музыки у робота нет, только радио.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "что": {"type": "string",
+                                "description": "Название или жанр: «Рекорд», "
+                                               "«джаз», «классика», «новости»."},
+                    },
+                },
+                run=play_radio,
+            ),
+            Tool(
+                name="stop_radio",
+                hidden=True,
+                description="Выключить музыку.",
+                input_schema=EMPTY_SCHEMA,
+                run=stop_radio,
+            ),
+        ]
 
     if people is not None and who is not None:
         def remember_person(факт: str) -> str:

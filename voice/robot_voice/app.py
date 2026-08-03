@@ -432,10 +432,24 @@ def main() -> None:
         state.set("дом", {"город": имя, "lat": lat, "lon": lon})
         log.info("дом теперь %s (%.3f, %.3f)", имя, lat, lon)
 
+    def включить_радио(поток: str) -> bool:
+        """Просит пульт играть поток. Пустая строка — выключить."""
+        try:
+            запрос = urllib.request.Request(
+                cfg.web_endpoint.rsplit("/", 1)[0] + "/speak/radio",
+                data=поток.encode("utf-8"), method="POST",
+                headers={"Content-Type": "text/plain; charset=utf-8"})
+            urllib.request.urlopen(запрос, timeout=5).close()
+            return True
+        except Exception as e:
+            log.warning("пульт не принял радио (%s)", e)
+            return False
+
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
-                        home=дом, set_place=запомнить_дом, news_url=cfg.news_url)
+                        home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
+                        play=включить_радио if cfg.audio_out == "browser" else None)
     brain = Brain(cfg, tools)
 
     # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.

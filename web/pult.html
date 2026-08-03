@@ -568,6 +568,12 @@ camBtn.click();
 const sndBtn = $('sndBtn'), caption = $('caption');
 const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=';
 const player = new Audio();
+// Радио — отдельный проигрыватель: реплики робота идут очередью и кончаются, а
+// поток играет, пока не выключат. Смешивать их в одном нельзя.
+const radio = new Audio();
+radio.preload = 'none';
+const RADIO_LOUD = 0.7;     // обычная громкость
+const RADIO_QUIET = 0.12;   // пока робот говорит: слышно, но не мешает
 const speechQueue = [];
 let soundOn = false, playing = false, captionTimer = null;
 let speech = null;
@@ -592,8 +598,15 @@ function setSound(on) {
 sndBtn.addEventListener('click', () => setSound(!soundOn));
 
 function playNext() {
-  if (playing || !speechQueue.length) return;
+  if (playing || !speechQueue.length) {
+    // Очередь пуста — радио можно вернуть к обычной громкости.
+    if (!playing) radio.volume = RADIO_LOUD;
+    return;
+  }
   playing = true;
+  // Под музыку робота не слышно. Приглушаем поток на время реплики — так же,
+  // как это делает автомагнитола под навигатор.
+  radio.volume = RADIO_QUIET;
   player.src = speechQueue.shift();
   player.play().catch(() => { playing = false; playNext(); });
 }
@@ -622,6 +635,21 @@ function listen() {
       speechQueue.length = 0;
       player.pause();
       playing = false;
+      radio.volume = RADIO_LOUD;
+      return;
+    }
+    if (data.radio !== undefined) {   // включить или выключить радио
+      if (!data.radio) {
+        radio.pause();
+        radio.removeAttribute('src');
+        radio.load();
+        return;
+      }
+      radio.src = data.radio;
+      radio.volume = RADIO_LOUD;
+      // Автовоспроизведение без жеста браузер запрещает. Звук в пульте
+      // включают кнопкой — этот жест и разрешает поток.
+      radio.play().catch(() => showCaption('Нажмите 🔈, чтобы включить звук'));
       return;
     }
     if (data.heard !== undefined) {   // что робот расслышал

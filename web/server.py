@@ -265,7 +265,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True})
             return
 
-        if path not in ("/speak", "/speak/stop", "/speak/heard", "/speak/status"):
+        if path not in ("/speak", "/speak/stop", "/speak/heard", "/speak/status",
+                        "/speak/radio"):
             self.fail(404, "нет такой ручки")
             return
         # Говорить роботом может только сам робот, не любое устройство в сети.
@@ -280,6 +281,15 @@ class Handler(SimpleHTTPRequestHandler):
             # «Замолчи»: реплики уже в очереди вкладки, сам робот их оттуда
             # не достанет — просит пульт бросить очередь.
             SPEECH.broadcast({"stop": True})
+            self.send_json({"ok": True})
+            return
+
+        if path == "/speak/radio":
+            # Радио играет сама вкладка: у робота своего динамика пока нет, а
+            # браузер тянет поток без нашего участия. Робот только называет
+            # адрес — и он же велит замолчать, прислав пустое тело.
+            body = self.rfile.read(max(0, min(length, 4096))).decode("utf-8", "replace")
+            SPEECH.broadcast({"radio": body})
             self.send_json({"ok": True})
             return
 
