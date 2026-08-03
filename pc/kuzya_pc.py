@@ -964,7 +964,7 @@ class Voiceprints:
                 best, score = name, near
         return best, score
 
-    def _merge_twins(self) -> None:
+    def _merge_twins(self) -> dict[str, str]:
         """Сливает слепки, оказавшиеся одним человеком.
 
         Пороги строги намеренно, и расплата за это — расщепление: один человек
@@ -975,6 +975,7 @@ class Voiceprints:
         """
         import numpy as np
 
+        куда: dict[str, str] = {}
         while True:
             пара = None
             имена = list(self.people)
@@ -988,7 +989,7 @@ class Voiceprints:
                 if пара:
                     break
             if not пара:
-                return
+                return куда
             a, b = пара
             # Кличка уступает имени; при прочих равных — тот, у кого фраз больше.
             если_кличка = (a.startswith("голос "), -self.people[a].get("фраз", 0))
@@ -1005,6 +1006,12 @@ class Voiceprints:
             смесь = смесь / (float(np.linalg.norm(смесь)) or 1.0)
             self.people[главный] = {"вектор": [float(x) for x in смесь],
                                     "фраз": всего, "слит_из": лишний}
+            # Куда переехал каждый слитый — включая тех, кто переехал раньше в
+            # того, кто сам только что переехал.
+            куда[лишний] = главный
+            for откуда, куда_шёл in list(куда.items()):
+                if куда_шёл == лишний:
+                    куда[откуда] = главный
 
     def confirm(self, метка: str, name: str = "") -> str:
         """Запоминает голос последней фразы. Возвращает, за кем он записан.
@@ -1045,9 +1052,18 @@ class Voiceprints:
         средний = средний / (float(np.linalg.norm(средний)) or 1.0)
         self.people[name] = {"вектор": [float(x) for x in средний],
                              "фраз": card["фраз"] + 1}
-        self._merge_twins()
+        # Слияние может увести этот самый слепок в другой: имя побеждает
+        # кличку, и «голос 4» растворяется в «голосе 1». Дальше говорить надо
+        # про того, кто уцелел, — иначе падение с KeyError ровно там, где
+        # робот только что успешно всех узнал.
+        name = self._merge_twins().get(name, name)
         self._trim()
         self._write()
+        # Уборка тоже могла выбросить этот слепок, если он оказался самым
+        # нехоженым. Тогда честнее промолчать, чем врать про запомненное.
+        if name not in self.people:
+            log.info("голос не удержался в памяти: слишком мало фраз")
+            return ""
         log.info("голос %s уточнён, фраз в слепке: %d",
                  name, self.people[name]["фраз"])
         return name

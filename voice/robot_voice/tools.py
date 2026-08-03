@@ -964,7 +964,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         Tool(
             name="weather",
             description="Погода там, где стоит робот. По памяти не отвечай. "
-                        "Про другой город не знает — так и скажи, не вызывай.",
+                        "Города не знаешь — сначала set_home, потом это.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1043,18 +1043,25 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         from . import news as news_api
         return news_api.describe(news_api.headlines(news_url or news_api.URL))
 
+    # Новости и город модели ВИДНЫ, в отличие от таймеров и списка. Причина
+    # простая: спрашивают их как попало — «расскажи, какие новости последние
+    # были», «а живу я в городе Калининграде», — и правило такое не ловит. На
+    # живом роботе это вышло враньём: модель ответила «у меня нет доступа к
+    # новостям», хотя доступ есть, просто инструмент был от неё спрятан.
     tools.append(Tool(
         name="news",
-        hidden=True,
-        description="Прочитать вслух несколько свежих заголовков новостей.",
+        description="Свежие заголовки новостей. Зови, когда спрашивают, что "
+                    "нового, что в мире, какие новости. По памяти не отвечай: "
+                    "твои новости старые.",
         input_schema=EMPTY_SCHEMA,
         run=news,
     ))
     if set_place is not None:
         tools.append(Tool(
             name="set_home",
-            hidden=True,
-            description="Запомнить город, в котором стоит робот.",
+            description="Запомнить город, где стоит робот. Зови, когда человек "
+                        "сказал, где он живёт или где вы находитесь, — после "
+                        "этого заработает погода.",
             input_schema={
                 "type": "object",
                 "properties": {"город": {"type": "string"}},
