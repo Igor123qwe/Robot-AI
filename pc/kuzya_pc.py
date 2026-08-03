@@ -419,6 +419,32 @@ class Ollama:
         # Что выяснилось на деле: думает ли модель вслух, несмотря на всё
         # вышесказанное. Ключ — имя модели, значение ставит Unthink.
         self.habit: dict[str, bool] = {}
+        # Разбор первого ответа печатаем один раз: кто из троих не сработал —
+        # параметр think, строка /no_think или сама модель — из обычного лога
+        # не видно, а гадать об этом дорого.
+        self._explained = False
+
+    def explain(self, split: bool, thought: bool) -> None:
+        """Один раз рассказывает, что на самом деле вышло с размышлениями.
+
+        split — Ollama отдала размышления отдельным полем, значит она модель
+        как размышляющую знает и параметр think до неё дошёл.
+        thought — размышления всё-таки были.
+        """
+        if self._explained:
+            return
+        self._explained = True
+        if not thought:
+            log.info("размышления выключены (think=%s)", self.think)
+        elif split:
+            log.warning("Ollama отдаёт размышления отдельным полем, но модель "
+                        "думает несмотря на think=%s", self.think)
+        else:
+            log.warning("модель думает вслух прямо в тексте: ни параметр "
+                        "think=%s, ни строка /no_think её не остановили. "
+                        "Ollama размышляющей эту модель не считает — режем "
+                        "их сами, но платим временем и токенами",
+                        self.think if self._think_known else "не поддерживается")
 
     def _post(self, path: str, payload: dict, *, stream: bool):
         req = urllib.request.Request(
@@ -739,8 +765,13 @@ class Handler(BaseHTTPRequestHandler):
         ollama = self.server.cfg.ollama
         unthink = Unthink(getattr(ollama, "habit", None), model)
         alive = time.monotonic()
+        split = False
         for part in ollama.chat(model, messages, tools, limit):
             msg = part.get("message") or {}
+            # Размышления отдельным полем — так их отдаёт Ollama, когда знает
+            # модель как размышляющую. Наружу они не идут никогда.
+            if msg.get("thinking"):
+                split = True
             chunk = msg.get("content") or ""
             if chunk:
                 clean = unthink.feed(chunk)
@@ -773,6 +804,8 @@ class Handler(BaseHTTPRequestHandler):
                         len(unthink.buf), used_out,
                         ", ответ обрезан по лимиту длины" if truncated else "")
         tail = unthink.close(not truncated)
+        if hasattr(ollama, "explain"):
+            ollama.explain(split, split or unthink.habit.get(model) is True)
         if tail:
             yield ("text", tail, None)
         yield ("done", used_in, (used_out, truncated))
@@ -883,7 +916,14 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Мозг робота на домашнем ПК")
     p.add_argument("--model", default="qwen3:4b",
                    help="имя модели в Ollama (ollama list покажет скачанные)")
-    p.add_argument("--whisper", default="small",
+    # medium, а не small. На видеокарте small тратил пятую долю длительности
+    # записи — то есть запас был десятикратный, а платили мы за него разбором
+    # русского: «Кузя, сколько времени» превращалось в «Пусть за сколько
+    # времени», «анекдот» в «негдот». Medium весит полтора гигабайта
+    # видеопамяти и укладывается в полсекунды — на слух разницы нет, а слов он
+    # путает заметно меньше. Меньше брать имеет смысл только если видеопамять
+    # кончилась: тогда --whisper small.
+    p.add_argument("--whisper", default="medium",
                    help="размер модели распознавания: tiny|base|small|medium|large-v3")
     p.add_argument("--port", type=int, default=4000)
     p.add_argument("--host", default="0.0.0.0",
