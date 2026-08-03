@@ -961,9 +961,14 @@ def test_names() -> None:
     files += sorted((here.parent / "web").glob("*.py"))
     files += sorted((here.parent / "pc").glob("*.py"))
 
+    # Имена, которые питон заводит в каждом модуле сам. В таблице символов их
+    # нет, пока в них не пишут, — а обращаться к ним законно.
+    dunder = {"__file__", "__name__", "__doc__", "__package__",
+              "__spec__", "__loader__", "__builtins__"}
+
     for path in files:
         top = symtable.symtable(path.read_text(), str(path), "exec")
-        known = {s.get_name() for s in top.get_symbols()} | set(dir(builtins))
+        known = {s.get_name() for s in top.get_symbols()} | set(dir(builtins)) | dunder
         missing: list[str] = []
 
         def walk(table, missing=missing, known=known):
