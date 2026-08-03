@@ -419,7 +419,10 @@ class Timers:
 def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 place: tuple[float, float] | None = None,
                 addressed: Callable[[], bool] | None = None,
-                people=None, who: Callable[[], str] | None = None) -> list[Tool]:
+                people=None, who: Callable[[], str] | None = None,
+                home: Callable[[], tuple[float, float] | None] | None = None,
+                set_place: Callable[[str, float, float], None] | None = None,
+                news_url: str = "") -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
     speaker нужен для громкости и «повтори», notes — для списка покупок,
@@ -744,10 +747,11 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         return f"Убрал {gone}."
 
     def weather(day: str = "сейчас") -> str:
-        if not place or not any(place):
-            return ("Я не знаю, где мы находимся. Впиши координаты дома "
-                    "в настройки, и буду говорить погоду.")
-        data = weather_api.fetch(*place)
+        где = home() if home is not None else place
+        if not где or not any(где):
+            return ("Я не знаю, в каком мы городе. Скажи «мы в Калининграде» — "
+                    "запомню и буду говорить погоду.")
+        data = weather_api.fetch(*где)
         if data is None:
             return "Не смог узнать погоду — интернета нет или сервис молчит."
         if day.strip().lower().startswith("завтра"):
@@ -1018,6 +1022,46 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 run=repeat,
             ),
         ]
+
+    def set_home(город: str) -> str:
+        """Запоминает город со слов человека — координаты ищутся сами.
+
+        Раньше широту и долготу полагалось вписать руками в файл настроек, и
+        на живом роботе это вышло глупо: человек сказал «я живу в
+        Калининграде», а робот ответил «я не знаю, где мы находимся».
+        """
+        if set_place is None:
+            return "Я не умею запоминать город."
+        найдено = weather_api.find_city(город)
+        if найдено is None:
+            return f"Не нашёл такого города — {город}. Скажи иначе."
+        имя, lat, lon = найдено
+        set_place(имя, lat, lon)
+        return f"Запомнил: мы в {имя}."
+
+    def news() -> str:
+        from . import news as news_api
+        return news_api.describe(news_api.headlines(news_url or news_api.URL))
+
+    tools.append(Tool(
+        name="news",
+        hidden=True,
+        description="Прочитать вслух несколько свежих заголовков новостей.",
+        input_schema=EMPTY_SCHEMA,
+        run=news,
+    ))
+    if set_place is not None:
+        tools.append(Tool(
+            name="set_home",
+            hidden=True,
+            description="Запомнить город, в котором стоит робот.",
+            input_schema={
+                "type": "object",
+                "properties": {"город": {"type": "string"}},
+                "required": ["город"],
+            },
+            run=set_home,
+        ))
 
     if people is not None and who is not None:
         def remember_person(факт: str) -> str:

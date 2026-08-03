@@ -421,9 +421,21 @@ def main() -> None:
     people = People(cfg.data_dir / "люди.json")
     # Кто говорит — узнаётся заново на каждой фразе, поэтому инструменту
     # передаётся не имя, а способ его спросить.
+    def дом() -> tuple[float, float] | None:
+        """Где робот стоит: сначала сказанное голосом, потом настройки."""
+        куда = state.get("дом")
+        if куда:
+            return float(куда["lat"]), float(куда["lon"])
+        return (cfg.lat, cfg.lon) if any((cfg.lat, cfg.lon)) else None
+
+    def запомнить_дом(имя: str, lat: float, lon: float) -> None:
+        state.set("дом", {"город": имя, "lat": lat, "lon": lon})
+        log.info("дом теперь %s (%.3f, %.3f)", имя, lat, lon)
+
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
-                        place=(cfg.lat, cfg.lon), addressed=addressed)
+                        place=(cfg.lat, cfg.lon), addressed=addressed,
+                        home=дом, set_place=запомнить_дом, news_url=cfg.news_url)
     brain = Brain(cfg, tools)
 
     # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.

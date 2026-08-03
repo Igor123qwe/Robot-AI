@@ -790,8 +790,12 @@ class Voiceprints:
     # точно не он»: только НИЖЕ него заводим нового. Между ними — молчание:
     # не узнали и не запомнили. Ошибиться в сторону «не узнал» дёшево, а
     # слить двух людей в одного — значит показать одному записи про другого.
-    SAME = 0.62
-    NEW = 0.45
+    # Числа с живого робота: свой же голос против своего слепка дал 0.50–0.52,
+    # а не обещанные 0.7. Микрофон телефона, комната, короткие фразы — и порог
+    # 0.62 не срабатывал НИ РАЗУ: за пять минут разговора Игорь развалился на
+    # четыре разных «голоса». Опущено по факту, а не по описанию модели.
+    SAME = 0.45
+    NEW = 0.30
 
     # Сколько голосов держим. Больше в квартире не живёт, а лишние — это
     # телевизор и гости на один вечер.
@@ -931,6 +935,11 @@ class Voiceprints:
             return "", 0.0, ""
 
         best, score = self._nearest(mine)
+        # Пишем расклад целиком: без живых чисел пороги подбираются гаданием,
+        # а гадать тут дорого — на кону чужие записи, показанные не тому.
+        if self.people:
+            log.info("голоса: %s", ", ".join(
+                f"{n} {self._one(mine, n):.2f}" for n in sorted(self.people)))
         метка = f"{int(time.time() * 1000):x}"
         self._recent[метка] = (mine, seconds)
         # Держим только последние: робот подтверждает сразу за распознаванием,
@@ -941,15 +950,61 @@ class Voiceprints:
             return "", score, метка
         return best, score, метка
 
-    def _nearest(self, mine) -> tuple[str, float]:
+    def _one(self, mine, name: str) -> float:
         import numpy as np
 
+        return float(np.dot(mine, np.asarray(self.people[name]["вектор"],
+                                             dtype="float32")))
+
+    def _nearest(self, mine) -> tuple[str, float]:
         best, score = "", -1.0
-        for name, card in self.people.items():
-            near = float(np.dot(mine, np.asarray(card["вектор"], dtype="float32")))
+        for name in self.people:
+            near = self._one(mine, name)
             if near > score:
                 best, score = name, near
         return best, score
+
+    def _merge_twins(self) -> None:
+        """Сливает слепки, оказавшиеся одним человеком.
+
+        Пороги строги намеренно, и расплата за это — расщепление: один человек
+        в разных настроениях заводится как «голос 1» и «голос 4». По одной
+        фразе этого не видно, а по накопленным слепкам — прекрасно видно, они
+        похожи друг на друга сильнее порога. Чиним задним числом: имя
+        побеждает кличку, обкатанный слепок — свежий.
+        """
+        import numpy as np
+
+        while True:
+            пара = None
+            имена = list(self.people)
+            for i, a in enumerate(имена):
+                va = np.asarray(self.people[a]["вектор"], dtype="float32")
+                for b in имена[i + 1:]:
+                    vb = np.asarray(self.people[b]["вектор"], dtype="float32")
+                    if float(np.dot(va, vb)) >= self.SAME:
+                        пара = (a, b)
+                        break
+                if пара:
+                    break
+            if not пара:
+                return
+            a, b = пара
+            # Кличка уступает имени; при прочих равных — тот, у кого фраз больше.
+            если_кличка = (a.startswith("голос "), -self.people[a].get("фраз", 0))
+            если_вторая = (b.startswith("голос "), -self.people[b].get("фраз", 0))
+            главный, лишний = (a, b) if если_кличка <= если_вторая else (b, a)
+            log.info("голоса %r и %r — один человек, сливаю в %r",
+                     a, b, главный)
+            ушедший = self.people.pop(лишний)
+            карта = self.people[главный]
+            всего = карта.get("фраз", 0) + ушедший.get("фраз", 0)
+            смесь = (np.asarray(карта["вектор"], dtype="float32") * карта.get("фраз", 0)
+                     + np.asarray(ушедший["вектор"], dtype="float32")
+                     * ушедший.get("фраз", 0))
+            смесь = смесь / (float(np.linalg.norm(смесь)) or 1.0)
+            self.people[главный] = {"вектор": [float(x) for x in смесь],
+                                    "фраз": всего, "слит_из": лишний}
 
     def confirm(self, метка: str, name: str = "") -> str:
         """Запоминает голос последней фразы. Возвращает, за кем он записан.
@@ -990,6 +1045,7 @@ class Voiceprints:
         средний = средний / (float(np.linalg.norm(средний)) or 1.0)
         self.people[name] = {"вектор": [float(x) for x in средний],
                              "фраз": card["фраз"] + 1}
+        self._merge_twins()
         self._trim()
         self._write()
         log.info("голос %s уточнён, фраз в слепке: %d",

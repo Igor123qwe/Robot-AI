@@ -148,6 +148,8 @@ class Config:
 
     # Координаты дома для погоды. Пусто — робот честно скажет, что не знает,
     # где находится: врать про погоду в чужом городе хуже, чем молчать.
+    # Лента новостей. Пусто — берётся лента по умолчанию из news.py.
+    news_url: str = field(default_factory=lambda: _env("ROBOT_NEWS_URL").strip())
     lat: float = field(default_factory=lambda: _num("ROBOT_LAT", 0.0))
     lon: float = field(default_factory=lambda: _num("ROBOT_LON", 0.0))
 

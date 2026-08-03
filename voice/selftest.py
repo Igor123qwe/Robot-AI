@@ -1077,13 +1077,14 @@ def test_hidden() -> None:
     speaker = types.SimpleNamespace(volume=1.0, last_said="",
                                     set_volume=lambda v: None, hush=lambda: None)
     tools = build_tools(ros, timers, speaker=speaker,
-                        notes=Notes(store / "notes.json"))
+                        notes=Notes(store / "notes.json"),
+                        set_place=lambda *a: None)
     hidden = {t.name for t in tools if t.hidden}
     phrases = [
         "приостанови таймер", "продолжи таймер", "сбрось все таймеры",
         "что ты умеешь", "говори тише", "замолчи", "повтори",
         "добавь в список молоко", "что в списке", "убери молоко из списка",
-        "очисти список",
+        "очисти список", "какие новости", "мы в калининграде",
     ]
     reachable = {m.tool for m in (parse(p) for p in phrases) if m is not None}
     check("до каждого скрытого достают правила", sorted(hidden - reachable), [])
