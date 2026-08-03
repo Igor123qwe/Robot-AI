@@ -617,7 +617,7 @@ sndBtn.addEventListener('click', () => setSound(!soundOn));
 // с уверенности −0.25 до −0.75, а половина фраз возвращалась пустыми.
 // Автомагнитола делает то же самое под навигатор, только здесь навигатор —
 // это сам разговор.
-let duckUntil = 0;
+let duckUntil = 0, learnUntil = 0;
 function setRadioVolume() {
   const duck = playing || Date.now() < duckUntil;
   radio.volume = duck ? Math.min(RADIO_QUIET, radioLoud) : radioLoud;
@@ -659,6 +659,12 @@ radio.addEventListener('error', () => {
 
 function playMusic(url) {
   radio.src = url;
+  // Даём фону несколько секунд, чтобы подняться до уровня самой музыки, и всё
+  // это время не приглушаем. Иначе музыка глушит себя сама: она только что
+  // заиграла, фон ещё помнит тишину, и превышение над ним выглядит как
+  // «человек заговорил» — песня начиналась с трёх секунд шёпота.
+  learnUntil = Date.now() + FLOOR_LEARN;
+  duckUntil = 0;
   setRadioVolume();
   // Автовоспроизведение без жеста браузер запрещает. Звук в пульте включают
   // кнопкой — этот жест и разрешает поток.
@@ -910,6 +916,9 @@ async function micStart() {
 // речь человека затянула бы фон наверх и приглушение перестало бы срабатывать.
 let micFloor = 0.02;
 const FLOOR_UP = 0.01, FLOOR_DOWN = 0.08;
+// Сразу после включения музыки фон догоняет её быстро и приглушение молчит:
+// см. playMusic. Полторы секунды — это меньше, чем вступление любой песни.
+const FLOOR_FAST = 0.25, FLOOR_LEARN = 1500;
 // Во сколько раз громче фона — это уже человек, а не комната. И нижняя
 // граница, чтобы в полной тишине не приглушать музыку от скрипа стула.
 const VOICE_OVER = 2.5, VOICE_MIN = 0.045;
@@ -922,8 +931,12 @@ function micLevel(peak) {
   micBtn.classList.toggle('talking', micPeak > 0.02);
   micBtn.title = 'уровень микрофона: ' + Math.round(micPeak * 100) + ' %';
 
-  micFloor += (peak - micFloor) * (peak > micFloor ? FLOOR_UP : FLOOR_DOWN);
-  if (peak > Math.max(VOICE_MIN, micFloor * VOICE_OVER)) duckUntil = Date.now() + DUCK_HOLD;
+  const учимся = Date.now() < learnUntil;
+  const вверх = учимся ? FLOOR_FAST : FLOOR_UP;
+  micFloor += (peak - micFloor) * (peak > micFloor ? вверх : FLOOR_DOWN);
+  if (!учимся && peak > Math.max(VOICE_MIN, micFloor * VOICE_OVER)) {
+    duckUntil = Date.now() + DUCK_HOLD;
+  }
   setRadioVolume();
 
   if (micPeak > 0.02) {

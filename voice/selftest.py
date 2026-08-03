@@ -1820,6 +1820,20 @@ def test_music_queue() -> None:
     check("станция подсыпала треков", ya4.партии > было, True)
     check("музыка не кончилась", player4.играет, True)
 
+    # Веб-сервер перезапустили — счётчик начал считать с нуля. Без этого его
+    # ноль никогда не стал бы больше нашей семёрки, и музыка встала бы навсегда.
+    п6 = ГлухойПульт()
+    п6.счётчик = 7
+    player6 = Player(п6, ФальшивыйЯндекс())
+    player6.очередь([ФальшивыйТрек(1), ФальшивыйТрек(2)])
+    п6.счётчик = 0                       # сервер перезапустился
+    player6._tick()
+    check("перезапуск сервера не двигает трек", player6.название, "Кто-то — Песня 1")
+    п6.счётчик = 1                       # а вот теперь песня и правда кончилась
+    player6._tick()
+    check("после перезапуска очередь снова идёт",
+          player6.название, "Кто-то — Песня 2")
+
     # Вкладку закрыли — «доиграл» не придёт никогда. Без запаса по времени
     # музыка встала бы намертво до следующей команды голосом.
     п5 = ГлухойПульт()
@@ -1908,17 +1922,56 @@ def test_noisy_ear() -> None:
     check("в тишине порог обычный",
           (l.start_frames, l.min_speech_frames), (2, 15))
     l.background(True)
-    check("под музыку порог выше",
-          (l.start_frames, l.min_speech_frames), (4, 30))
+    check("под музыку начать труднее", l.start_frames, 4)
+    # А вот длину фразы поднимать нельзя: «стоп» — это меньше полусекунды
+    # речи, и удвоенный порог выбросил бы ровно ту команду, ради которой всё
+    # и останавливается. Музыкальный мусор в логе был длинный, по три секунды,
+    # так что пользы от этого порога всё равно не было бы.
+    check("длину фразы музыка не трогает", l.min_speech_frames, 15)
     l.background(False)
     check("музыку выключили — порог вернулся",
           (l.start_frames, l.min_speech_frames), (2, 15))
 
-    # Короткий кусок, который в тишине проходит, под музыку отбрасывается.
-    check("короткая фраза под музыку отброшена",
-          прогон_фраз([(False, 20), (True, 20), (False, 40)], шумно=True), [])
-    check("она же в тишине проходит",
-          len(прогон_фраз([(False, 20), (True, 20), (False, 40)])), 1)
+    # Одиночный щелчок под музыку начинать запись не должен, а короткое
+    # «стоп» — должно, и под музыку тоже.
+    check("щелчок под музыку не начинает запись",
+          прогон_фраз([(False, 20), (True, 3), (False, 40)], шумно=True), [])
+    check("короткое «стоп» под музыку слышно",
+          len(прогон_фраз([(False, 20), (True, 20), (False, 40)], шумно=True)), 1)
+
+
+def test_rules_reach_tools() -> None:
+    """Каждое правило должно попадать в существующий инструмент.
+
+    Имя из Match ищется среди Tool по строке, и опечатка тут не падает, а
+    молча уводит фразу платной модели: правило сработало, инструмента нет,
+    в логе — обычное «правилами не разобрал». Ровно так и вышло бы при
+    переименовании play_radio → play_music, если забыть одну из двух сторон.
+    """
+    import re as _re
+
+    from robot_voice.people import People
+
+    section("правила достают до инструментов")
+    store = Path(tempfile.mkdtemp())
+    timers = Timers(announce=lambda text, **kw: None, store=store / "timers.json")
+    ros = types.SimpleNamespace(voltage=12.4, moving=False, connected=True,
+                                drive=lambda *a, **k: None, stop_motion=lambda: None)
+    speaker = types.SimpleNamespace(volume=1.0, last_said="",
+                                    set_volume=lambda v: None, hush=lambda: None)
+    # Собираем робота во всей полноте: часть инструментов появляется только
+    # вместе с пультом, списком или людьми, и без них проверка бы соврала.
+    tools = build_tools(ros, timers, speaker=speaker,
+                        notes=Notes(store / "notes.json"),
+                        people=People(store / "люди.json"), who=lambda: "Игорь",
+                        home=lambda: (54.7, 20.5), set_place=lambda *a: None,
+                        addressed=lambda: True, player=Player(ГлухойПульт()))
+    есть = {t.name for t in tools}
+
+    исходник = (Path(__file__).resolve().parent / "robot_voice" / "intents.py"
+                ).read_text(encoding="utf-8")
+    зовут = set(_re.findall(r"Match\(\s*\"([a-z_]+)\"", исходник))
+    check("все имена из правил существуют", sorted(зовут - есть), [])
 
 
 def test_pult_and_server_agree() -> None:
@@ -1956,6 +2009,7 @@ def main() -> int:
                  test_speech_streams,
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,
+                 test_rules_reach_tools,
                  test_pult_and_server_agree,
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,
