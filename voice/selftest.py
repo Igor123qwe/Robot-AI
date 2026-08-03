@@ -638,6 +638,29 @@ def test_meeting() -> None:
     check("«кто ты» — не «кто я»", bool(_WHO_AM_I.match("кто ты")), False)
 
 
+def test_wake_word() -> None:
+    """Имя робота Whisper пишет как попало — ловить надо все варианты.
+
+    С живого робота за один вечер: «Хузя», «Куля», «Куся», «Культа». Половина
+    обращений проходила мимо, и человек повторял всё громче. Порог измерен на
+    этих самых вариантах: они дают 0.75, а обычные слова — не выше 0.67.
+    Между ними чистый зазор, по нему и режем.
+    """
+    section("варианты имени")
+    from robot_voice.app import _strip_wake_word
+
+    имена = ("кузя", "кузь", "куся", "кузи", "кузьма")
+    порог = Config().wake_ratio
+    for phrase in ["Кузя, привет", "Хузя, привет", "Куля, привет",
+                   "Куся, привет", "Гузя, привет"]:
+        check(f"«{phrase}» — это ко мне",
+              _strip_wake_word(phrase, имена, порог), "привет")
+    # А это обычные слова, и робот не должен на них просыпаться.
+    for phrase in ["куда мне идти", "коля пришёл", "кухня большая",
+                   "кузов машины", "пуля просвистела", "муза пришла"]:
+        check(f"«{phrase}» — не имя", _strip_wake_word(phrase, имена, порог), None)
+
+
 def test_not_for_me() -> None:
     """В открытом окне робот не должен вступать в чужой разговор.
 
@@ -1505,7 +1528,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_not_for_me, test_remote_voice,
+                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,

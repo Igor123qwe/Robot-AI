@@ -576,7 +576,11 @@ class Enrolling:
             return False
         wav_left = self.left
         try:
-            resp = _post(f"{self.pc_url}/voice/enroll?имя="
+            # Имя параметра — латиницей, и это не вкусовщина: строку запроса
+            # http.client кодирует в latin-1, и кириллица в самом «имя=» рвала
+            # запрос ещё до отправки. Знакомство падало молча: робот говорил
+            # «не вышло запомнить голос», а причина была здесь.
+            resp = _post(f"{self.pc_url}/voice/enroll?name="
                          + urllib.parse.quote(self.name), wav)
             фраз = int((resp or {}).get("фраз") or 0)
         except Exception as e:
@@ -643,7 +647,7 @@ def _about_people(command: str, who: str, voice, people, enrolling, cfg) -> bool
             # Слепок голоса живёт на ПК, дело — на роботе. Стираем оба: иначе
             # робот «забыл» человека, но продолжает его узнавать.
             try:
-                _post(f"{(cfg.tts_url or cfg.pc_url).rstrip('/')}/voice/forget?имя="
+                _post(f"{(cfg.tts_url or cfg.pc_url).rstrip('/')}/voice/forget?name="
                       + urllib.parse.quote(who), b"")
             except Exception as e:
                 log.warning("слепок голоса на ПК стереть не вышло (%s)", e)

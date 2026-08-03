@@ -140,6 +140,13 @@ def _distance(a: str, b: str, limit: int) -> int:
     return prev[-1]
 
 
+# Что починка сделала в последний раз. Пишем в лог не всегда, а только когда
+# правка помогла разобрать команду: «насколько» похоже на «сколько», и на
+# каждом вопросе «насколько они сильнее» строка «расслышал X — понял как Y»
+# читалась как ошибка распознавания, хотя всё было расслышано верно.
+_fixed: list[tuple[str, str]] = []
+
+
 def repair(text: str) -> str:
     """Чинит слова команд, которые распознавание услышало почти правильно.
 
@@ -149,6 +156,7 @@ def repair(text: str) -> str:
     в словаре нет.
     """
     out = []
+    _fixed.clear()
     for word in text.split():
         bare = word.strip(" ,.!?…—-").lower()
         limit = next((d for n, d in _REPAIR_RULES if len(bare) >= n), 0)
@@ -163,7 +171,7 @@ def repair(text: str) -> str:
             elif d == best:
                 near.append(known)
         if best <= limit and len(near) == 1:
-            log.info("расслышал %r — понял как %r", bare, near[0])
+            _fixed.append((bare, near[0]))
             out.append(word.lower().replace(bare, near[0]))
         else:
             out.append(word)
@@ -236,7 +244,16 @@ def parse(text: str) -> Match | None:
     if m is not None:
         return m
     fixed = normalize(repair(t))
-    return _match(fixed) if fixed != t else None
+    if fixed == t:
+        return None
+    правки = list(_fixed)
+    m = _match(fixed)
+    if m is not None and правки:
+        # Логируем только удачную починку: она объясняет, почему сработало
+        # правило, которого в исходной фразе не видно.
+        for было, стало in правки:
+            log.info("расслышал %r — понял как %r", было, стало)
+    return m
 
 
 def _match(t: str) -> Match | None:
