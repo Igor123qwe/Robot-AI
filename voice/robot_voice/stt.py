@@ -83,6 +83,7 @@ class Recognizer:
         # нет вовсе.
         self.speaker = ""
         self.similarity = 0.0
+        self.tag = ""
         log.info("whisper: готов")
 
     def transcribe(self, wav_bytes: bytes) -> str:
@@ -165,6 +166,7 @@ class Remote:
         # Кого узнал ПК по голосу и насколько похоже.
         self.speaker = ""
         self.similarity = 0.0
+        self.tag = ""
 
     def transcribe(self, wav_bytes: bytes) -> str:
         if time.monotonic() >= self._down_until:
@@ -191,6 +193,9 @@ class Remote:
             # выключено; робот тогда разговаривает, никого не различая.
             self.speaker = (body.get("кто") or "").strip()
             self.similarity = float(body.get("похожесть") or 0.0)
+            # Метка слепка этой фразы. По ней робот потом скажет ПК «это
+            # говорили мне» — и только тогда голос попадёт в память.
+            self.tag = (body.get("метка") or "").strip()
         except Exception as e:
             self._down_until = time.monotonic() + PC_DOWN
             log.warning("ПК не распознал (%s) — перехожу на свои силы", e)
@@ -213,7 +218,7 @@ class Remote:
         # Узнавание по голосу живёт на ПК. Раз мы сюда попали, ПК недоступен —
         # и тащить в разговор имя от прошлой фразы нельзя: робот показал бы
         # одному человеку записи про другого.
-        self.speaker, self.similarity = "", 0.0
+        self.speaker, self.similarity, self.tag = "", 0.0, ""
         if self._local is None:
             log.info("поднимаю распознавание на роботе — это займёт время")
             self._local = self._make_local()

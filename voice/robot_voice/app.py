@@ -529,130 +529,171 @@ class Addressed:
         return self.by_name and self.sure
 
 
-class Enrolling:
-    """Знакомство: несколько фраз подряд уходят в слепок голоса.
+class Meeting:
+    """Знакомство без обряда: голос заводится сам, имя приходит из разговора.
 
-    По одной фразе голос не запомнить — в ней слишком мало тембра и слишком
-    много случайного: простуда, зевок, шум холодильника. Поэтому просим три и
-    усредняем; каждая следующая уточняет слепок, а не заменяет его.
+    Первая версия просила «скажи три фразы». На живом роботе это не сработало
+    ни разу: Whisper ломал саму просьбу, человек сбивался, а под конец робот
+    заявил, что голоса запоминать не умеет. Да и по существу обряд лишний —
+    людям не приходит в голову представляться пылесосу.
 
-    Имя человек называет голосом, а не набирает: клавиатуры у робота нет.
-    Поэтому знакомство идёт двумя шагами — сначала имя, потом фразы.
+    Теперь так. Каждая обращённая к роботу фраза уходит на ПК дважды: сначала
+    узнать (это делает распознавание заодно), потом — подтвердить, что
+    говорили именно с роботом, и только тогда голос попадает в память. Раздельно
+    потому, что телевизор в комнате говорит больше всех, и учиться на всём
+    подряд — верный способ растащить слепки по дикторам.
+
+    Имя не обязательно. Гость приходит, разговаривает, робот заводит на него
+    дело под кличкой «голос 3» и копит заметки. Назвался — кличка меняется на
+    имя вместе со всем архивом. Не назвался — и ладно, дело всё равно ведётся.
     """
 
-    NEED = 3
+    # После скольких разговоров робот один раз спросит имя. Раньше — навязчиво:
+    # человек ещё не понял, с кем говорит. Позже — глупо: он уже всё рассказал.
+    ASK_AFTER = 3
 
     def __init__(self, pc_url: str) -> None:
         self.pc_url = pc_url.rstrip("/")
-        self.name = ""
-        self.left = 0
-        self.asking_name = False
+        self.asking = False
+        # Имя, которое надо привязать к голосу при следующем подтверждении.
+        self._name_next = ""
 
-    def busy(self) -> bool:
-        return self.asking_name or self.left > 0
-
-    def start(self, voice, known: str = "") -> None:
-        """Начинает знакомство. Если человек уже узнан — просто уточняем слепок."""
-        if not self.pc_url:
-            voice.say("Голоса я не запоминаю: для этого нужен компьютер.")
-            return
-        if known:
-            self.name, self.left, self.asking_name = known, self.NEED, False
-            voice.say(f"Хорошо, {known}. Скажи три любые фразы, я послушаю.")
-            return
-        self.name, self.left, self.asking_name = "", 0, True
-        voice.say("Давай знакомиться. Как тебя зовут?")
-
-    def stop(self) -> None:
-        self.name, self.left, self.asking_name = "", 0, False
-
-    def take(self, wav: bytes, who: str, voice, people) -> bool:
-        """Забирает фразу себе, если идёт знакомство. True — забрала."""
-        if not self.busy():
-            return False
-        if self.asking_name:
-            # Имя разбирается из уже распознанного текста, а не отсюда: здесь
-            # только звук. Ждём, пока главный цикл позовёт name_is().
-            return False
-        wav_left = self.left
+    def confirm(self, метка: str, name: str = "") -> str:
+        """«Это говорили мне» — голос попадает в память. Возвращает, за кем."""
+        name = name or self._name_next
+        self._name_next = ""
+        if not self.pc_url or not метка:
+            return ""
+        адрес = f"{self.pc_url}/voice/confirm?tag={urllib.parse.quote(метка)}"
+        if name:
+            адрес += "&name=" + urllib.parse.quote(name)
         try:
-            # Имя параметра — латиницей, и это не вкусовщина: строку запроса
-            # http.client кодирует в latin-1, и кириллица в самом «имя=» рвала
-            # запрос ещё до отправки. Знакомство падало молча: робот говорил
-            # «не вышло запомнить голос», а причина была здесь.
-            resp = _post(f"{self.pc_url}/voice/enroll?name="
-                         + urllib.parse.quote(self.name), wav)
-            фраз = int((resp or {}).get("фраз") or 0)
+            return (_post(адрес, b"") or {}).get("кто", "")
         except Exception as e:
             log.warning("не смог запомнить голос (%s)", e)
-            self.stop()
-            voice.say("Не вышло запомнить голос. Попробуем позже.")
-            return True
-        self.left -= 1
-        log.info("знакомство с %s: фраз в слепке %d, осталось сказать %d",
-                 self.name, фраз, self.left)
-        if self.left > 0:
-            voice.say("Ещё.")
-            return True
-        people.met(self.name)
-        self.stop()
-        voice.say(f"Запомнил твой голос, {self.name}. Теперь узнаю.")
-        return wav_left > 0
+            return ""
 
-    def name_is(self, text: str, voice) -> bool:
+    def forget(self, name: str) -> None:
+        if not self.pc_url or not name:
+            return
+        try:
+            _post(f"{self.pc_url}/voice/forget?name=" + urllib.parse.quote(name), b"")
+        except Exception as e:
+            log.warning("слепок голоса на ПК стереть не вышло (%s)", e)
+
+    def time_to_ask(self, who: str, people) -> bool:
+        """Пора ли один раз спросить, как зовут этот голос."""
+        return (not self.asking and who and people.nameless(who)
+                and people.card(who).get("разговоров", 0) >= self.ASK_AFTER)
+
+    def name_is(self, text: str, who: str, voice, people) -> bool:
         """Приняли имя в ответ на «как тебя зовут». True — приняли."""
-        if not self.asking_name:
+        if not self.asking:
             return False
+        self.asking = False
         name = _person_name(text)
         if not name:
-            voice.say("Не разобрал имя. Скажи его одним словом.")
+            voice.say("Ладно, потом скажешь.")
             return True
-        self.name, self.left, self.asking_name = name, self.NEED, False
-        voice.say(f"Очень приятно, {name}. Скажи три любые фразы, я послушаю.")
+        people.rename(who, name)
+        self.name_voice(name)
+        voice.say(f"Очень приятно, {name}.")
         return True
+
+    def name_voice(self, name: str) -> None:
+        """Просит ПК переименовать слепок вслед за личным делом.
+
+        Порядок не важен, важна полнота: если переименовать дело и забыть про
+        слепок, робот при следующей фразе снова назовёт человека кличкой — и
+        заведёт ему второе дело.
+        """
+        self._name_next = name
 
 
 # Разговор про самих людей: знакомство, память, забвение. Правилами, а не
 # моделью, — это команды роботу, а не тема для беседы, и ошибаться тут нельзя:
 # «забудь про меня» должно стирать дело, а не отвечать «хорошо, забыл».
+# Все формы, которыми просят запомнить голос. На живом роботе не сработало
+# ничего: Whisper то ставит запятую («запомни, мой голос»), то слышит будущее
+# время («запомнишь мой голос»), то слепляет слова. А не сработавшее правило —
+# это не «робот не понял», это «робот соврал»: модель бодро ответила «у меня
+# нет функции запоминать голоса», хотя функция есть.
+_ЗАПОМНИ = r"(?:запомн\w*|запоминай|запиши)"
 _KNOW_ME = re.compile(
-    r"^(запомни|запоминай)\s+(мой\s+голос|меня)$|^познакомимся$|^давай\s+знакомиться$")
-_WHO_AM_I = re.compile(r"^(кто\s+я|ты\s+знаешь,?\s+кто\s+я|узнаешь\s+меня)\??$")
+    rf"^{_ЗАПОМНИ}\s+(?:мой\s+голос|голос\s+мой|мой\s+тембр|меня)$"
+    r"|^познакомимся$|^давай\s+знакомиться$|^знакомство$"
+    rf"|^узнавай\s+меня$|^{_ЗАПОМНИ}\s+как\s+я\s+говорю$")
+_WHO_AM_I = re.compile(
+    r"^(?:кто\s+я|ты\s+знаешь\s+кто\s+я|знаешь\s+кто\s+я|"
+    r"узнаешь\s+меня|ты\s+меня\s+узнаешь|ты\s+меня\s+узнал)$")
 _WHAT_ABOUT_ME = re.compile(
-    r"^что\s+ты\s+(обо?\s+мне\s+)?(знаешь|помнишь)(\s+обо?\s+мне)?\??$")
-_FORGET_ME = re.compile(r"^забудь\s+(про\s+меня|меня|мой\s+голос|обо\s+мне)$")
-_REMEMBER = re.compile(r"^запомни,?\s+(?:что\s+)?(.{3,})$")
+    r"^что\s+ты\s+(?:обо?\s+мне\s+)?(?:знаешь|помнишь)(?:\s+обо?\s+мне)?$")
+_FORGET_ME = re.compile(
+    rf"^забудь\s+(?:про\s+меня|меня|мой\s+голос|обо\s+мне)$"
+    r"|^сотри\s+(?:мо[её]\s+)?(?:личное\s+)?дело$")
+_REMEMBER = re.compile(rf"^{_ЗАПОМНИ}\s+(?:что\s+)?(.{{3,}})$")
+# «Меня зовут Игорь», сказанное просто так: тоже повод дать голосу имя.
+_MY_NAME = re.compile(r"^(?:меня\s+зовут|я)\s+([А-ЯЁа-яёA-Za-z-]{2,20})$")
 
 
-def _about_people(command: str, who: str, voice, people, enrolling, cfg) -> bool:
+def _bare(text: str) -> str:
+    """Фраза без знаков препинания — по ней и сверяем правила.
+
+    Whisper расставляет запятые и тире по своему разумению, и правило,
+    написанное под чистую строку, на живой речи не срабатывает ни разу.
+    """
+    return " ".join(re.sub(r"[^\w\s]", " ",
+                           text.lower().replace("ё", "е")).split())
+
+
+def _about_people(command: str, who: str, voice, people, meeting) -> bool:
     """Разговор о самих людях. True — разобрались, модель звать не надо."""
-    # Whisper охотно ставит в начале тире и кавычки — «— Кто я?». Правила
-    # про самого человека на этом спотыкались, и «кто я» уходило модели,
-    # которая отвечала по системному промпту, а не по личному делу.
-    bare = command.strip(" —–-«»\"'").lower().replace("ё", "е").rstrip(".!")
+    bare = _bare(command)
 
     if _KNOW_ME.match(bare):
-        enrolling.start(voice, who)
+        # Голос робот запоминает сам, из разговора. Просьба «запомни меня»
+        # теперь значит другое: дай голосу имя вместо клички.
+        if not who:
+            voice.say("Голос твой я ещё не запомнил. "
+                      "Поговори со мной немного, и запомню сам.")
+        elif people.nameless(who):
+            meeting.asking = True
+            voice.say("Голос твой я уже узнаю. А как тебя зовут?")
+        else:
+            voice.say(f"Я тебя и так узнаю, {who}.")
         return True
+
     if _WHO_AM_I.match(bare):
-        voice.say(f"Ты {who}." if who else
-                  "Пока не узнаю тебя по голосу. Скажи «запомни мой голос».")
+        if not who:
+            voice.say("Пока не узнаю тебя по голосу — мало тебя слышал.")
+        elif people.nameless(who):
+            meeting.asking = True
+            voice.say("Голос узнаю, а имени не знаю. Как тебя зовут?")
+        else:
+            voice.say(f"Ты {who}.")
         return True
+
     if _WHAT_ABOUT_ME.match(bare):
         voice.say(people.tell(who))
         return True
+
     if _FORGET_ME.match(bare):
         said = people.forget(who)
-        if who and cfg.tts_url:
-            # Слепок голоса живёт на ПК, дело — на роботе. Стираем оба: иначе
-            # робот «забыл» человека, но продолжает его узнавать.
-            try:
-                _post(f"{(cfg.tts_url or cfg.pc_url).rstrip('/')}/voice/forget?name="
-                      + urllib.parse.quote(who), b"")
-            except Exception as e:
-                log.warning("слепок голоса на ПК стереть не вышло (%s)", e)
+        # Слепок голоса живёт на ПК, дело — на роботе. Стираем оба: иначе
+        # робот «забыл» человека, но продолжает его узнавать.
+        meeting.forget(who)
         voice.say(said)
         return True
+
+    m = _MY_NAME.match(bare)
+    if m and who:
+        имя = _person_name(m.group(0))
+        if имя and имя != who:
+            people.rename(who, имя)
+            meeting.name_voice(имя)
+            voice.say(f"Запомнил, {имя}.")
+            return True
+
     m = _REMEMBER.match(bare)
     if m:
         voice.say(people.remember(who, m.group(1)))
@@ -743,7 +784,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
     # в разговоре и отвечает без имени, пока не замолчат.
     awake_until = 0.0
 
-    enrolling = Enrolling(cfg.tts_url or cfg.pc_url)
+    meeting = Meeting(cfg.tts_url or cfg.pc_url)
     debug_audio = os.environ.get("ROBOT_DEBUG_AUDIO") == "1"
     if debug_audio:
         log.info("записи услышанного складываю в /tmp/robot-audio")
@@ -762,11 +803,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         # Кто это сказал. Пусто — ПК не узнал голос, выключен или узнавание
         # не поднято; тогда робот разговаривает, никого не различая.
         who = getattr(recognizer, "speaker", "")
-        if enrolling.take(wav, who, voice, people):
-            continue
         brain.about = people.brief(who)
-        if who:
-            people.met(who)
         # Насколько распознавание само себе верит. Пишем в лог всегда: без
         # живых чисел порог подбирается гаданием, а цена ошибки здесь —
         # уехавший робот.
@@ -837,10 +874,22 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
 
         # Знакомство идёт своим порядком и главнее правил: пока робот ждёт
         # имя, «Игорь» — это ответ ему, а не команда.
-        if enrolling.name_is(command, voice):
+        # Голос запоминаем ТОЛЬКО здесь — когда уже точно знаем, что говорили
+        # с роботом. Всё, что звучало в комнате мимо, до памяти не доходит.
+        метка = getattr(recognizer, "tag", "")
+        узнан = meeting.confirm(метка) or who
+        if узнан:
+            people.met(узнан)
+            if узнан != who:
+                # Голос завели прямо сейчас: справку для модели надо
+                # пересобрать, иначе первый разговор пройдёт мимо дела.
+                who = узнан
+                brain.about = people.brief(who)
+
+        if meeting.name_is(command, who, voice, people):
             awake_until = time.monotonic() + cfg.session_seconds
             continue
-        if _about_people(command, who, voice, people, enrolling, cfg):
+        if _about_people(command, who, voice, people, meeting):
             awake_until = time.monotonic() + cfg.session_seconds
             last_talk = brain.last_talk = time.monotonic()
             continue
@@ -887,6 +936,12 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # выборка под конкретного человека, а не общий корпус.
             log.info("правилами не разобрал, спрашиваю модель")
             _respond(command, brain, voice, recognizer, ros, turn)
+
+        # Поговорили несколько раз, а как зовут — так и не знаем. Спросим
+        # один раз: раньше навязчиво, позже глупо — человек уже всё рассказал.
+        if meeting.time_to_ask(who, people):
+            meeting.asking = True
+            voice.say("Кстати, мы так и не познакомились. Как тебя зовут?")
 
         # Окно отсчитываем от конца ответа, а не от начала: иначе длинная
         # реплика робота съедала бы всё время, отведённое на продолжение.

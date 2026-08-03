@@ -759,22 +759,49 @@ class Voiceprints:
     вектор из двух сотен чисел, и у одного человека эти векторы лежат кучно, а
     у разных людей — врозь. Сравнение — косинус между векторами.
 
-    Зачем это роботу. Во-первых, чтобы не отвечать телевизору: голос диктора
-    не совпадёт ни с чьим слепком. Во-вторых, чтобы знать, с кем разговаривает,
-    и держать на каждого своё личное дело.
+    Знакомства как обряда здесь НЕТ, и это главное решение. Первая версия
+    просила «скажи три фразы» — на живом роботе это не сработало ни разу:
+    Whisper ломал саму просьбу, человек сбивался, а под конец робот отвечал,
+    что голоса запоминать не умеет. Да и по существу обряд лишний: люди не
+    представляются пылесосу.
+
+    Поэтому голос заводится сам. Каждая фраза, сказанная роботу, сравнивается
+    с известными: похоже на кого-то — это он, и слепок уточняется; явно ни на
+    кого — заводится новый, пока безымянный. Имя приходит потом, из разговора:
+    «меня зовут Игорь» — и безымянный становится Игорем вместе со всем, что
+    робот уже успел о нём записать.
+
+    Учимся ТОЛЬКО на обращённой к роботу речи. Это не мелочь: телевизор в
+    комнате говорит больше всех, и если учиться на всём подряд, слепки
+    расползутся по дикторам, а однажды чужой голос подмешается в хозяйский.
+    Поэтому /stt только узнаёт, а запоминает отдельный вызов — робот делает
+    его, когда убедился, что говорили с ним.
 
     Слепки лежат здесь, на ПК, — там же, где считаются. Личные дела живут на
     роботе: они нужны ему для разговора и тогда, когда ПК выключен.
-
-    Порог намеренно строгий. Ошибиться в сторону «не узнал» дёшево: робот
-    переспросит. Ошибиться в другую — значит показать одному человеку записи
-    про другого.
     """
 
     # Косинус между слепками. У ECAPA свой человек обычно даёт 0.7 и выше,
     # чужой — 0.3 и ниже. Настоящее число подберём по живому логу: похожесть
     # пишется в каждый ответ ровно ради этого.
+    #
+    # Порогов два, и они несимметричны. SAME — «это точно он»: только выше
+    # него мы приписываем фразу человеку и уточняем его слепок. NEW — «это
+    # точно не он»: только НИЖЕ него заводим нового. Между ними — молчание:
+    # не узнали и не запомнили. Ошибиться в сторону «не узнал» дёшево, а
+    # слить двух людей в одного — значит показать одному записи про другого.
     SAME = 0.62
+    NEW = 0.45
+
+    # Сколько голосов держим. Больше в квартире не живёт, а лишние — это
+    # телевизор и гости на один вечер.
+    LIMIT = 12
+
+    # Короче этого фразу для завода нового голоса не берём. Узнать по «ага»
+    # ещё можно, а вот заводить по нему нового человека — верный способ
+    # расплодить призраков.
+    ENOUGH = 1.5
+
     RATE = 16000
     MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 
@@ -790,6 +817,9 @@ class Voiceprints:
         self.people: dict[str, dict] = {}
         self.ready = False
         self._broken_until = 0.0
+        # Слепки последних фраз: /stt их только считает, а запоминает отдельный
+        # вызов — когда робот убедился, что говорили с ним.
+        self._recent: dict[str, tuple] = {}
         self._read()
 
     # --- хранение --------------------------------------------------------
@@ -885,18 +915,33 @@ class Voiceprints:
         return vector / (float(np.linalg.norm(vector)) or 1.0)
 
     # --- работа ----------------------------------------------------------
-    def identify(self, wav: bytes) -> tuple[str, float]:
-        """Кто это сказал и насколько похоже. Пустое имя — не узнал."""
-        if not self.people:
-            return "", 0.0
+    def identify(self, wav: bytes, seconds: float = 0.0) -> tuple[str, float, str]:
+        """Кто это сказал, насколько похоже и метка для последующего запоминания.
+
+        Ничего не меняет: узнать надо на каждой фразе, а запоминать — только
+        то, что сказали роботу. Метка позволяет вернуться к этому слепку, не
+        пересылая звук второй раз.
+        """
         try:
             mine = self._vector(wav)
         except Exception as e:
             log.warning("не смог снять слепок голоса (%s)", e)
-            return "", 0.0
+            return "", 0.0, ""
         if mine is None:
-            return "", 0.0
+            return "", 0.0, ""
 
+        best, score = self._nearest(mine)
+        метка = f"{int(time.time() * 1000):x}"
+        self._recent[метка] = (mine, seconds)
+        # Держим только последние: робот подтверждает сразу за распознаванием,
+        # а копить чужие векторы в памяти незачем.
+        for старая in list(self._recent)[:-8]:
+            self._recent.pop(старая, None)
+        if score < self.SAME:
+            return "", score, метка
+        return best, score, метка
+
+    def _nearest(self, mine) -> tuple[str, float]:
         import numpy as np
 
         best, score = "", -1.0
@@ -904,17 +949,37 @@ class Voiceprints:
             near = float(np.dot(mine, np.asarray(card["вектор"], dtype="float32")))
             if near > score:
                 best, score = name, near
-        if score < self.SAME:
-            log.info("голос не опознан (ближе всех %s: %.2f)", best, score)
-            return "", score
         return best, score
 
-    def enroll(self, name: str, wav: bytes) -> int:
-        """Добавляет фразу к слепку человека. Возвращает, сколько их всего."""
-        mine = self._vector(wav)
-        if mine is None:
-            raise ValueError("фраза короче секунды — по такой голос не запомнить")
+    def confirm(self, метка: str, name: str = "") -> str:
+        """Запоминает голос последней фразы. Возвращает, за кем он записан.
 
+        Зовётся только когда робот убедился, что говорили с ним. Три исхода:
+        узнали — уточняем слепок; явно никто из известных — заводим нового,
+        пока безымянного; между порогами — молчим и не портим ничего.
+        """
+        сохранённое = self._recent.pop(метка, None)
+        if сохранённое is None:
+            return ""
+        mine, seconds = сохранённое
+        best, score = self._nearest(mine)
+
+        if name:
+            # Имя пришло из разговора. Если этот голос уже ходит под кличкой,
+            # переименовываем вместе со всей историей: человек не должен
+            # терять слепок из-за того, что представился поздно.
+            if best and score >= self.SAME and best != name:
+                self._rename(best, name)
+            return self._absorb(name, mine)
+        if score >= self.SAME:
+            return self._absorb(best, mine)
+        if score < self.NEW and seconds >= self.ENOUGH:
+            return self._absorb(self._new_name(), mine)
+        # Серая зона: похоже, но не точно. Не приписываем и не заводим.
+        return ""
+
+    def _absorb(self, name: str, mine) -> str:
+        """Вливает фразу в слепок человека, уточняя его."""
         import numpy as np
 
         card = self.people.get(name) or {"вектор": [0.0] * len(mine), "фраз": 0}
@@ -925,10 +990,43 @@ class Voiceprints:
         средний = средний / (float(np.linalg.norm(средний)) or 1.0)
         self.people[name] = {"вектор": [float(x) for x in средний],
                              "фраз": card["фраз"] + 1}
+        self._trim()
         self._write()
-        log.info("голос %s запомнен, фраз в слепке: %d",
+        log.info("голос %s уточнён, фраз в слепке: %d",
                  name, self.people[name]["фраз"])
-        return self.people[name]["фраз"]
+        return name
+
+    def _new_name(self) -> str:
+        n = 1
+        while f"голос {n}" in self.people:
+            n += 1
+        log.info("новый голос: голос %d", n)
+        return f"голос {n}"
+
+    def _rename(self, old: str, new: str) -> None:
+        if old == new or old not in self.people:
+            return
+        card = self.people.pop(old)
+        # Если под этим именем уже кто-то есть, побеждает более обкатанный
+        # слепок: у него больше фраз, значит он вернее.
+        было = self.people.get(new)
+        if было is None or было.get("фраз", 0) < card.get("фраз", 0):
+            self.people[new] = card
+        log.info("голос %r теперь %r", old, new)
+
+    def _trim(self) -> None:
+        """Держим не больше LIMIT голосов, выбрасывая самые нехоженые.
+
+        Безымянные уходят первыми: «голос 4», услышанный дважды, — это почти
+        наверняка телевизор или гость на один вечер, а Игорь с сотней фраз
+        должен пережить любую уборку.
+        """
+        while len(self.people) > self.LIMIT:
+            кого = min(self.people,
+                       key=lambda n: (not n.startswith("голос "),
+                                      self.people[n].get("фраз", 0)))
+            log.info("забываю голос %r: слишком мало фраз", кого)
+            del self.people[кого]
 
     def forget(self, name: str) -> bool:
         if name not in self.people:
@@ -1037,6 +1135,18 @@ class Voice:
         return _wav(raw, self.RATE)
 
 
+def _wav_seconds(wav: bytes) -> float:
+    """Длина записи в секундах. Нужна, чтобы не заводить голос по «ага»."""
+    import io
+    import wave as wavelib
+
+    try:
+        with wavelib.open(io.BytesIO(wav)) as w:
+            return w.getnframes() / (w.getframerate() or 1)
+    except Exception:
+        return 0.0
+
+
 def _wav(raw: bytes, rate: int) -> bytes:
     """Оборачивает сырой звук в wav-заголовок. Без внешних библиотек."""
     import struct
@@ -1112,8 +1222,8 @@ class Handler(BaseHTTPRequestHandler):
             self._stt()
         elif path.endswith("/tts"):
             self._tts()
-        elif path.endswith("/voice/enroll"):
-            self._enroll()
+        elif path.endswith("/voice/confirm"):
+            self._confirm()
         elif path.endswith("/voice/forget"):
             self._forget()
         else:
@@ -1128,26 +1238,31 @@ class Handler(BaseHTTPRequestHandler):
         return (parse_qs(urlparse(self.path).query).get("имя", [""])[0]
                 or parse_qs(urlparse(self.path).query).get("name", [""])[0]).strip()
 
-    def _enroll(self) -> None:
+    def _confirm(self) -> None:
+        """«Это говорили мне» — только теперь голос попадает в память.
+
+        Раздельно с /stt намеренно: узнавать надо каждую фразу, а запоминать
+        только обращённые к роботу. Иначе телевизор, который говорит в комнате
+        больше всех, растащил бы слепки по дикторам.
+        """
         who = self._who()
         if who is None:
             self._json(503, {"error": "узнавание по голосу не поднято"})
             return
-        name = self._name_asked()
-        wav = self._body()
-        if not name or not wav:
-            self._json(400, {"error": "нужны имя в запросе и wav в теле"})
+        from urllib.parse import parse_qs, urlparse
+        query = parse_qs(urlparse(self.path).query)
+        метка = (query.get("tag", [""])[0] or "").strip()
+        if not метка:
+            self._json(400, {"error": "нужна метка фразы"})
             return
         try:
-            фраз = who.enroll(name, wav)
-        except ValueError as e:
-            self._json(400, {"error": str(e)})
-            return
+            кто = who.confirm(метка, self._name_asked())
         except Exception as e:
             log.exception("не смог запомнить голос")
             self._json(500, {"error": str(e)})
             return
-        self._json(200, {"кто": name, "фраз": фраз})
+        self._json(200, {"кто": кто,
+                         "фраз": who.people.get(кто, {}).get("фраз", 0)})
 
     def _forget(self) -> None:
         who = self._who()
@@ -1207,12 +1322,12 @@ class Handler(BaseHTTPRequestHandler):
         # что-то сдвинуть с места.
         # Кто это сказал. Робот по этому решает, с кем разговаривает, и не
         # отвечает ли он телевизору.
-        кто, похожесть = "", 0.0
+        кто, похожесть, метка = "", 0.0, ""
         who = self._who()
         if who is not None and text:
-            кто, похожесть = who.identify(wav)
-        self._json(200, {"text": text, "sure": sure,
-                         "кто": кто, "похожесть": round(похожесть, 3)})
+            кто, похожесть, метка = who.identify(wav, _wav_seconds(wav))
+        self._json(200, {"text": text, "sure": sure, "кто": кто,
+                         "похожесть": round(похожесть, 3), "метка": метка})
 
     # --- разговор ---
     def _messages(self) -> None:

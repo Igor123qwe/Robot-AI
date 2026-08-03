@@ -608,7 +608,7 @@ def test_notes_about_people() -> None:
 
 
 def test_meeting() -> None:
-    """Знакомство голосом: имя со слуха и разбор команд про самого человека."""
+    """Знакомство без обряда: имя со слуха и команды про самого человека."""
     section("знакомство")
     from robot_voice.app import _person_name
 
@@ -621,21 +621,91 @@ def test_meeting() -> None:
         check(f"«{phrase}» — не имя", _person_name(phrase), "")
 
     # Команды про самого человека разбираются правилами, а не моделью: «забудь
-    # про меня» должно стирать дело, а не отвечать «хорошо, забыл».
-    from robot_voice.app import (_FORGET_ME, _KNOW_ME, _REMEMBER, _WHAT_ABOUT_ME,
-                                 _WHO_AM_I)
-    check("запомни мой голос", bool(_KNOW_ME.match("запомни мой голос")), True)
-    check("давай знакомиться", bool(_KNOW_ME.match("давай знакомиться")), True)
-    check("кто я", bool(_WHO_AM_I.match("кто я")), True)
-    check("что ты обо мне знаешь",
-          bool(_WHAT_ABOUT_ME.match("что ты обо мне знаешь")), True)
-    check("что ты помнишь", bool(_WHAT_ABOUT_ME.match("что ты помнишь")), True)
-    check("забудь про меня", bool(_FORGET_ME.match("забудь про меня")), True)
+    # про меня» должно стирать дело, а не отвечать «хорошо, забыл». И правила
+    # обязаны переживать пунктуацию Whisper: на живом роботе «запомни, мой
+    # голос» не сработало, робот спросил модель, и та заявила, что голоса
+    # запоминать не умеет.
+    from robot_voice.app import (_FORGET_ME, _KNOW_ME, _MY_NAME, _REMEMBER,
+                                 _WHAT_ABOUT_ME, _WHO_AM_I, _bare)
+
+    def бьётся(rule, phrase: str) -> bool:
+        return bool(rule.match(_bare(phrase)))
+
+    for phrase in ["запомни мой голос", "запомни, мой голос", "запомнишь мой голос",
+                   "давай знакомиться", "познакомимся", "узнавай меня"]:
+        check(f"«{phrase}» — знакомство", бьётся(_KNOW_ME, phrase), True)
+    for phrase in ["кто я", "кто я?", "ты меня узнал?", "узнаешь меня"]:
+        check(f"«{phrase}» — кто я", бьётся(_WHO_AM_I, phrase), True)
+    for phrase in ["что ты обо мне знаешь?", "что ты помнишь", "— Что ты знаешь обо мне?"]:
+        check(f"«{phrase}» — что знаешь", бьётся(_WHAT_ABOUT_ME, phrase), True)
+    check("забудь про меня", бьётся(_FORGET_ME, "забудь про меня"), True)
+    check("сотри моё дело", бьётся(_FORGET_ME, "сотри моё дело"), True)
     check("запомни, что я люблю чай",
-          _REMEMBER.match("запомни, что я люблю чай").group(1), "я люблю чай")
+          _REMEMBER.match(_bare("запомни, что я люблю чай")).group(1), "я люблю чай")
+    check("меня зовут Игорь", бьётся(_MY_NAME, "меня зовут Игорь"), True)
     # И чего эти правила ловить не должны.
-    check("«забудь» одно — это не про меня", bool(_FORGET_ME.match("забудь")), False)
-    check("«кто ты» — не «кто я»", bool(_WHO_AM_I.match("кто ты")), False)
+    check("«забудь» одно — это не про меня", бьётся(_FORGET_ME, "забудь"), False)
+    check("«кто ты» — не «кто я»", бьётся(_WHO_AM_I, "кто ты"), False)
+
+
+def test_auto_meeting() -> None:
+    """Голос заводится сам, имя приходит потом — и архив едет за ним.
+
+    Обряд знакомства («скажи три фразы») выкинут: на живом роботе он не
+    сработал ни разу, а по существу лишний — людям не приходит в голову
+    представляться пылесосу. Гость приходит, разговаривает, робот заводит на
+    него дело под кличкой и копит заметки. Назвался — кличка стала именем
+    вместе со всем архивом. Не назвался — и ладно.
+    """
+    section("голос заводится сам")
+    from robot_voice.app import Meeting
+    from robot_voice.people import People
+
+    store = Path(tempfile.mkdtemp()) / "люди.json"
+    people = People(store)
+
+    # Гость поговорил, робот записал за ним пару наблюдений — ещё не зная имени.
+    people.met("голос 1")
+    people.remember("голос 1", "приехал из Москвы", asked=False)
+    check("безымянного видно", people.nameless("голос 1"), True)
+    check("модель понимает, что имени нет", people.brief("голос 1"),
+          "Ты узнаёшь этот голос, но имени не знаешь. "
+          "Что ты о нём знаешь: приехал из Москвы.")
+
+    # Назвался — архив переезжает целиком.
+    people.rename("голос 1", "Настя")
+    check("кличка исчезла", "голос 1" in people.cards, False)
+    check("заметки уцелели", people.facts("Настя"), ["приехал из Москвы"])
+    check("и счётчик встреч", people.card("Настя")["разговоров"], 1)
+    check("теперь с именем", people.nameless("Настя"), False)
+
+    # Если под именем уже было дело, два сливаются, ничего не теряя.
+    people.remember("Настя", "любит чай")
+    people.met("голос 7")
+    people.remember("голос 7", "работает в школе", asked=False)
+    people.rename("голос 7", "Настя")
+    check("дела слились", sorted(people.facts("Настя")),
+          ["любит чай", "приехал из Москвы", "работает в школе"])
+    check("встречи сложились", people.card("Настя")["разговоров"], 2)
+
+    # Робот спрашивает имя один раз и не раньше третьего разговора: раньше
+    # навязчиво, позже глупо — человек уже всё рассказал.
+    meeting = Meeting("")
+    people.met("голос 9")
+    check("после первого разговора молчим",
+          meeting.time_to_ask("голос 9", people), False)
+    people.met("голос 9")
+    people.met("голос 9")
+    check("после третьего спрашиваем",
+          meeting.time_to_ask("голос 9", people), True)
+    meeting.asking = True
+    check("пока спрашиваем — второй раз не лезем",
+          meeting.time_to_ask("голос 9", people), False)
+    # У кого имя есть, того не переспрашиваем никогда.
+    for _ in range(5):
+        people.met("Настя")
+    check("названного не переспрашиваем",
+          Meeting("").time_to_ask("Настя", people), False)
 
 
 def test_wake_word() -> None:
@@ -1528,7 +1598,7 @@ def test_dialogue() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_wake_word, test_not_for_me, test_remote_voice,
+                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,

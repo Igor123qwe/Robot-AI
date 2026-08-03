@@ -130,6 +130,30 @@ class People:
                  "запомнил по просьбе" if asked else "подметил сам", fact)
         return "Запомнил." if asked else "Записал в память, вслух не говори."
 
+    def rename(self, old: str, new: str) -> None:
+        """Безымянный голос обрёл имя — архив переезжает вместе с ним.
+
+        Без этого всё, что робот записал про «голос 1», пропадало ровно в тот
+        момент, когда человек представился, — то есть терялось самое ценное:
+        первый разговор, в котором о себе рассказывают больше всего.
+        """
+        if old == new or old not in self.cards:
+            return
+        with self._lock:
+            card = self.cards.pop(old)
+            было = self.cards.get(new)
+            if было:
+                # Под этим именем уже есть дело: сливаем, не теряя ни одной
+                # записи. Дубликаты отсеет remember при следующем добавлении.
+                факты = _as_records(было.get("факты")) + _as_records(card.get("факты"))
+                было["факты"] = _trimmed(факты)
+                было["разговоров"] = (было.get("разговоров", 0)
+                                      + card.get("разговоров", 0))
+            else:
+                self.cards[new] = card
+            self._save()
+        log.info("личное дело %r теперь %r", old, new)
+
     def forget(self, name: str) -> str:
         if not name or name not in self.cards:
             return "Я про тебя ничего и не помню."
@@ -148,10 +172,20 @@ class People:
         if not name:
             return "Пока не знаю, кто ты."
         facts = self.facts(name)
+        if self.nameless(name):
+            начало = "Голос твой узнаю, а имени не знаю."
+            if not facts:
+                return начало + " И больше пока ничего."
+            return начало + " Про тебя знаю вот что. " + " ".join(
+                f[:1].upper() + f[1:].rstrip(".") + "." for f in facts)
         if not facts:
             return f"Знаю, что тебя зовут {name}. Больше пока ничего."
         return "Про тебя знаю вот что. " + " ".join(
             f[:1].upper() + f[1:].rstrip(".") + "." for f in facts)
+
+    def nameless(self, name: str) -> bool:
+        """Голос узнан, но как зовут человека — неизвестно."""
+        return name.startswith("голос ")
 
     def brief(self, name: str) -> str:
         """Короткая справка для модели. Уезжает в каждом запросе, поэтому сжато.
@@ -163,7 +197,8 @@ class People:
         if not name:
             return ""
         facts = self.facts(name)
-        who = f"Сейчас с тобой говорит {name}."
+        who = ("Ты узнаёшь этот голос, но имени не знаешь."
+               if self.nameless(name) else f"Сейчас с тобой говорит {name}.")
         if not facts:
             return who
         return who + " Что ты о нём знаешь: " + "; ".join(facts) + "."
