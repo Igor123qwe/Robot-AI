@@ -2185,6 +2185,112 @@ def test_rules_reach_tools() -> None:
     check("все имена из правил существуют", sorted(зовут - есть), [])
 
 
+def test_ws_proxy() -> None:
+    """Мостик до rosbridge через сервер пульта.
+
+    Нужен из-за https: страница по https не имеет права открыть ws:// —
+    браузер блокирует это как смешанное содержимое, и молча. То есть, включив
+    https ради микрофона на телефоне, мы бы разом сломали езду, ничего не
+    заметив: джойстик перестал бы двигать робота, а в логе было бы пусто.
+
+    Проверяем главное: рукопожатие подписано правильно и кадры доходят в обе
+    стороны без правок. Переливаем байтами, потому что роли совпадают —
+    браузер шлёт клиентские кадры, которых rosbridge и ждёт, а обратно идут
+    серверные, которых ждёт браузер.
+    """
+    import base64 as _b64
+    import hashlib as _hash
+    import os as _os
+    import socket as _sock
+    import threading as _thr
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "web"))
+    import wsproxy
+
+    section("мостик до rosbridge")
+
+    МАГИЯ = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def кадр(данные: bytes) -> bytes:
+        return bytes([0x81, len(данные)]) + данные
+
+    def поддельный_ros(гнездо: _sock.socket) -> None:
+        соединение, _ = гнездо.accept()
+        буфер = b""
+        while b"\r\n\r\n" not in буфер:
+            кусок = соединение.recv(4096)
+            if not кусок:
+                return
+            буфер += кусок
+        ключ = ""
+        for строка in буфер.split(b"\r\n"):
+            if строка.lower().startswith(b"sec-websocket-key:"):
+                ключ = строка.split(b":", 1)[1].strip().decode()
+        подпись = _b64.b64encode(
+            _hash.sha1((ключ + МАГИЯ).encode()).digest()).decode()
+        соединение.sendall(
+            (f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+             f"Connection: Upgrade\r\nSec-WebSocket-Accept: {подпись}\r\n\r\n"
+             ).encode())
+        соединение.sendall(кадр(b"privet"))
+        пришло = соединение.recv(4096)
+        # Снимаем маску и отправляем обратно: так видно, что кадр дошёл целым.
+        длина, маска = пришло[1] & 0x7F, пришло[2:6]
+        тело = пришло[6:6 + длина]
+        соединение.sendall(
+            кадр(bytes(б ^ маска[i % 4] for i, б in enumerate(тело))))
+
+    ros = _sock.socket()
+    ros.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+    ros.bind(("127.0.0.1", 0))
+    ros.listen(1)
+    wsproxy.ROS_HOST, wsproxy.ROS_PORT = "127.0.0.1", ros.getsockname()[1]
+    _thr.Thread(target=поддельный_ros, args=(ros,), daemon=True).start()
+
+    браузер, изнанка = _sock.socketpair()
+    ключ = _b64.b64encode(_os.urandom(16)).decode()
+    заголовки = {"Sec-WebSocket-Key": ключ, "Upgrade": "websocket",
+                 "Connection": "Upgrade"}
+    check("вебсокет опознан", wsproxy.это_вебсокет(заголовки), True)
+    check("обычный запрос не опознан",
+          wsproxy.это_вебсокет({"Connection": "keep-alive"}), False)
+
+    мост = _thr.Thread(target=wsproxy.проводить, args=(изнанка, заголовки),
+                       daemon=True)
+    мост.start()
+
+    браузер.settimeout(10)
+    ответ = b""
+    while b"\r\n\r\n" not in ответ:
+        ответ += браузер.recv(4096)
+    голова, _, хвост = ответ.partition(b"\r\n\r\n")
+    ждём = _b64.b64encode(_hash.sha1((ключ + МАГИЯ).encode()).digest()).decode()
+    check("ответ 101", b"101" in голова.split(b"\r\n")[0], True)
+    check("подпись рукопожатия верна", ждём.encode() in голова, True)
+
+    привет = хвост or браузер.recv(4096)
+    check("первое слово rosbridge дошло", привет[2:2 + (привет[1] & 0x7F)], b"privet")
+
+    маска = _os.urandom(4)
+    слово = b"ping"
+    браузер.sendall(bytes([0x81, 0x80 | len(слово)]) + маска
+                    + bytes(б ^ маска[i % 4] for i, б in enumerate(слово)))
+    эхо = браузер.recv(4096)
+    check("кадр дошёл до rosbridge целым",
+          эхо[2:2 + (эхо[1] & 0x7F)], b"ping")
+
+    браузер.close()
+    ros.close()
+
+    # Без ключа рукопожатия соединение должно закрыться понятной ошибкой, а не
+    # повиснуть: браузер в этом случае показал бы «соединение прервано».
+    браузер2, изнанка2 = _sock.socketpair()
+    wsproxy.проводить(изнанка2, {"Upgrade": "websocket"})
+    браузер2.settimeout(5)
+    check("без ключа — 400", b"400" in браузер2.recv(4096), True)
+    браузер2.close()
+
+
 def test_pult_and_server_agree() -> None:
     """Сервер умеет, а страница нет — этот класс ошибок стоил целого вечера.
 
@@ -2220,7 +2326,7 @@ def main() -> int:
                  test_speech_streams,
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,
-                 test_counting, test_rules_reach_tools,
+                 test_counting, test_rules_reach_tools, test_ws_proxy,
                  test_pult_and_server_agree,
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,

@@ -353,7 +353,12 @@ function drawWheels() {
 }
 
 // ── rosbridge ────────────────────────────────────────────────────────────
-const ROSBRIDGE = 'ws://' + (location.hostname || '192.168.0.50') + ':9090';
+// По https обращаться к ws:// нельзя — браузер блокирует это как смешанное
+// содержимое, и молча: джойстик просто перестал бы двигать робота. Поэтому
+// с защищённой страницы идём к rosbridge через сам сервер пульта, /ros.
+const ROSBRIDGE = location.protocol === 'https:'
+  ? 'wss://' + location.host + '/ros'
+  : 'ws://' + (location.hostname || '192.168.0.50') + ':9090';
 let ws = null, wsReady = false, reconnectTimer = null;
 
 function setStatus(text, ok) {

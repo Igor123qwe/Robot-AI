@@ -49,6 +49,7 @@ import ipaddress
 import json
 import os
 import queue
+import ssl
 import sys
 import threading
 import time
@@ -58,8 +59,15 @@ import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import tls
+import wsproxy
+
 WEB_DIR = Path(__file__).resolve().parent
 PORT = int(os.environ.get("ROBOT_WEB_PORT", "8000"))
+# Второй вход, по https: браузер пускает к микрофону только
+# в защищённом контексте, и с телефона обычного http не хватает.
+# Ноль — не поднимать вовсе.
+TLS_PORT = int(os.environ.get("ROBOT_WEB_TLS_PORT", "8443"))
 DEFAULT_PHONE = os.environ.get("ROBOT_PHONE_URL", "http://192.168.3.9:8080").rstrip("/")
 
 # Сколько ждать телефон, прежде чем признать его недоступным.
@@ -325,6 +333,13 @@ class Handler(SimpleHTTPRequestHandler):
         # проверки, и исходник сервера уезжает любому в домашней сети.
         if urllib.parse.unquote(path).endswith(".py"):
             self.fail(404, "нет такой страницы")
+            return
+        # Мостик до rosbridge. Нужен из-за https: страница по https не имеет
+        # права открыть ws:// — браузер молча блокирует это как смешанное
+        # содержимое, и джойстик на телефоне перестал бы двигать робота.
+        if path == "/ros" and wsproxy.это_вебсокет(self.headers):
+            self.close_connection = True
+            wsproxy.проводить(self.connection, self.headers)
             return
         if path == "/camera":
             self.proxy_stream(phone_base(query) + "/video")
@@ -601,9 +616,39 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"online": False, "detail": message}, code)
 
 
+def _слушать_https() -> ThreadingHTTPServer | None:
+    """Второй вход, по https. Без него микрофон с телефона не работает.
+
+    Обычный http на своём порту остаётся нетронутым: по нему с роботом
+    разговаривает его же голосовая служба через 127.0.0.1, и ей сертификаты
+    ни к чему.
+    """
+    бумаги = tls.выписать()
+    if бумаги is None:
+        print("https не поднял: нет openssl. Микрофон с телефона не заработает,"
+              " см. README", flush=True)
+        return None
+    сертификат, ключ = бумаги
+    контекст = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        контекст.load_cert_chain(сертификат, ключ)
+    except (ssl.SSLError, OSError) as e:
+        print(f"https не поднял: сертификат не читается ({e})", flush=True)
+        return None
+    сервер = ThreadingHTTPServer(("0.0.0.0", TLS_PORT), Handler)
+    сервер.daemon_threads = True
+    сервер.socket = контекст.wrap_socket(сервер.socket, server_side=True)
+    threading.Thread(target=сервер.serve_forever, daemon=True).start()
+    адрес = (tls.адреса() or ["адрес робота"])[-1]
+    print(f"https на порту {TLS_PORT}: https://{адрес}:{TLS_PORT}/pult.html "
+          f"— микрофон с телефона работает только отсюда", flush=True)
+    return сервер
+
+
 def main() -> None:
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
+    безопасный = _слушать_https() if TLS_PORT else None
     print(f"пульт на порту {PORT}, камера с {DEFAULT_PHONE}", flush=True)
     try:
         server.serve_forever()
@@ -611,6 +656,8 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        if безопасный is not None:
+            безопасный.server_close()
 
 
 if __name__ == "__main__":
