@@ -874,6 +874,39 @@ def test_thinkless_habit() -> None:
     check("и держать не перестаём", early, "")
 
 
+def test_smart() -> None:
+    """«Подумай хорошо» уводит ход в облако, а обычная фраза — нет.
+
+    Зоопарк моделей в шесть гигабайт видеопамяти не помещается: пока одна
+    отвечает, остальные пришлось бы выгружать, и каждая смена стоила бы
+    десятки секунд. Вместо зоопарка — лестница: правила, домашняя модель,
+    облако. Не хватило домашней — человек зовёт умного вслух и платит
+    осознанно, а не по решению классификатора, который сам ошибается.
+    """
+    section("позвать умного по просьбе")
+    from robot_voice.intents import wants_smart
+
+    check("подумай хорошо", wants_smart("подумай хорошо сколько будет 17 на 23"),
+          (True, "сколько будет 17 на 23"))
+    check("спроси умного", wants_smart("спроси умного как работает меканум"),
+          (True, "как работает меканум"))
+    check("напрягись", wants_smart("напрягись, что подарить маме")[0], True)
+    check("обычная фраза не трогается",
+          wants_smart("расскажи анекдот"), (False, "расскажи анекдот"))
+    # «Подумай» в одиночку — продолжение разговора, а не пустой вопрос:
+    # спрашивать умного не о чем, но и терять фразу нельзя.
+    check("одна просьба без вопроса", wants_smart("подумай"), (True, "подумай"))
+
+    # И сама развилка: при просьбе первым спрашивается платный.
+    cfg = Config()
+    cfg.local_api_base = "http://пк:4000"
+    cfg.api_key = "ключ"
+    b = Brain(cfg, [])
+    check("обычно первым идёт ПК", [e.paid for e in b._live()], [False, True])
+    check("умного просили — первым облако",
+          [e.paid for e in b._live(smart=True)], [True, False])
+
+
 def test_endpoints() -> None:
     """ПК основной, облако запасное: выключенный ПК не должен ломать разговор.
 
@@ -983,7 +1016,7 @@ def test_brain_money() -> None:
             stop_reason="tool_use", usage=None),
     ])
 
-    def сбой(messages, on_text):
+    def сбой(messages, on_text, smart=False):
         try:
             return b.endpoints[0], next(круги)
         except StopIteration:
@@ -1015,7 +1048,7 @@ def test_brain_money() -> None:
     #    её не озвучивал.
     сказано: list[str] = []
     b2 = Brain(cfg, [])
-    b2._round = lambda messages, on_text: (
+    b2._round = lambda messages, on_text, smart=False: (
         b2.endpoints[0],
         types.SimpleNamespace(content=[], stop_reason="refusal", usage=None))
     b2.reply("что-то нехорошее", сказано.append)
@@ -1155,7 +1188,7 @@ def test_dialogue() -> None:
     class FakeBrain:
         last_talk = 0.0
         def __init__(self): self.asked: list[str] = []
-        def reply(self, text, on_text):
+        def reply(self, text, on_text, smart=False):
             self.asked.append(text)
             on_text("Отвечаю модели.")
             return "Отвечаю модели."
@@ -1215,7 +1248,7 @@ def test_dialogue() -> None:
 
     # Модель, которая пытается поехать, не спросив имени.
     class DrivingBrain(FakeBrain):
-        def reply(self, text, on_text):
+        def reply(self, text, on_text, smart=False):
             self.asked.append(text)
             answer = by_name["drive"]({"direction": "вперёд"})
             on_text(answer)
@@ -1250,7 +1283,7 @@ def main() -> int:
                  test_speech_streams,
                  test_pc_url, test_hidden,
                  test_thinkless, test_thinkless_habit,
-                 test_endpoints, test_brain_money,
+                 test_smart, test_endpoints, test_brain_money,
                  test_history,
                  test_names, test_dialogue):
         test()

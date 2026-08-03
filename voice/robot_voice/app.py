@@ -809,7 +809,14 @@ def _respond(command: str, brain: Brain, voice: Voice,
 
         said = ""
         try:
-            said = brain.reply(command, on_text)
+            # «Подумай хорошо» — просьба позвать умного. Домашняя модель
+            # отвечает за секунду и даром, но потолок у неё свой, и человек
+            # это слышит раньше любого автомата. Решение платить принимает он,
+            # вслух и осознанно, а не классификатор, который сам ошибается.
+            smart, command = intents.wants_smart(command)
+            if smart:
+                log.info("просили умного — иду в облако")
+            said = brain.reply(command, on_text, smart)
             tail = buffer.flush()
             if tail:
                 log.info("робот: %s", tail)

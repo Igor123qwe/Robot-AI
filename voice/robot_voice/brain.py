@@ -303,10 +303,17 @@ class Brain:
         return anthropic.Anthropic(**args)
 
     # --- выбор собеседника ------------------------------------------------
-    def _live(self) -> list[Endpoint]:
-        """Кого сейчас имеет смысл спрашивать, в порядке предпочтения."""
+    def _live(self, smart: bool = False) -> list[Endpoint]:
+        """Кого сейчас имеет смысл спрашивать, в порядке предпочтения.
+
+        smart — человек попросил позвать умного. Тогда порядок переворачивается:
+        сначала облако, а домашняя модель остаётся запасной на случай, если
+        интернета нет. Платить за это решает человек, вслух и осознанно.
+        """
         now = time.monotonic()
         live = [e for e in self.endpoints if e.down_until <= now]
+        if smart:
+            live.sort(key=lambda e: not e.paid)
         # Если отдыхают все — облако всё равно пробуем: лучше подождать, чем
         # отказать человеку, пока идёт отсчёт.
         return live or self.endpoints[-1:]
@@ -389,7 +396,8 @@ class Brain:
                 if not self._degrade(ep, e):
                     raise
 
-    def _round(self, messages: list[dict], on_text: Callable[[str], None]):
+    def _round(self, messages: list[dict], on_text: Callable[[str], None],
+               smart: bool = False):
         """Один запрос к модели: отдаёт текст кусками, возвращает ответ целиком.
 
         Молчащего собеседника обходим и идём к следующему. Возвращаем ещё и
@@ -403,7 +411,7 @@ class Brain:
             on_text(chunk)
 
         failure: Exception | None = None
-        for ep in self._live():
+        for ep in self._live(smart):
             try:
                 return ep, self._ask(ep, messages, watch)
             # Две сестринские ветки, и нужны обе. APIConnectionError — ПК
@@ -424,8 +432,12 @@ class Brain:
         raise failure
 
     # --- один ход --------------------------------------------------------
-    def reply(self, user_text: str, on_text: Callable[[str], None]) -> str:
-        """Отвечает на реплику. on_text вызывается на каждый кусок текста."""
+    def reply(self, user_text: str, on_text: Callable[[str], None],
+              smart: bool = False) -> str:
+        """Отвечает на реплику. on_text вызывается на каждый кусок текста.
+
+        smart — спросили умного: этот ход идёт в облако, за деньги.
+        """
         messages = self.history + [{"role": "user", "content": user_text}]
         spoken: list[str] = []
         used_in = used_out = cached = written = 0
@@ -439,7 +451,7 @@ class Brain:
         answered: Endpoint | None = None
         try:
             for rounds in range(1, MAX_TOOL_ROUNDS + 1):
-                answered, message = self._round(messages, emit)
+                answered, message = self._round(messages, emit, smart)
 
                 usage = getattr(message, "usage", None)
                 if usage is not None:
