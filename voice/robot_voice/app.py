@@ -440,9 +440,16 @@ def main() -> None:
     # и «сделай тише» человек говорит одинаково, что бы под ними ни играло.
     player = None
     if cfg.audio_out == "browser":
-        музыка = Music(cfg.yandex_token) if cfg.yandex_token else None
-        log.info("музыка: %s",
-                 "Яндекс и радио" if музыка is not None else "интернет-радио")
+        # Про Яндекс говорим честно и сразу: без библиотеки токен бесполезен,
+        # а узнавать об этом в момент «Кузя, включи Грота» — потерянный вечер.
+        музыка = None
+        if cfg.yandex_token and not Music.installed():
+            log.warning("токен Яндекса есть, а библиотеки нет — играет только "
+                        "радио. Поставь: pip3 install --user yandex-music")
+        elif cfg.yandex_token:
+            музыка = Music(cfg.yandex_token)
+        log.info("музыка: %s", "Яндекс и радио" if музыка is not None
+                 else "интернет-радио (Яндекс не подключён)")
         player = Player(
             Pult(cfg.web_endpoint.rsplit("/", 1)[0]), музыка,
             громкость=float(state.get("громкость музыки", MUSIC_LOUD)),
