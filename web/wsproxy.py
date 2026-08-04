@@ -24,6 +24,7 @@ import logging
 import os
 import selectors
 import socket
+import urllib.parse
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,26 @@ def это_вебсокет(headers) -> bool:
     апгрейд = (headers.get("Upgrade") or "").lower()
     коннекшн = (headers.get("Connection") or "").lower()
     return апгрейд == "websocket" and "upgrade" in коннекшн
+
+
+def свой(headers) -> bool:
+    """Пришли ли с нашей же страницы.
+
+    До мостика браузер сам закрывал дорогу к rosbridge со страниц из интернета:
+    с https-страницы обычный ws:// запрещён как смешанное содержимое. Мостик
+    эту дорогу открывает — и надо закрыть её обратно, иначе любой сайт,
+    открытый в этом доме, сможет двигать робота. Заголовок Origin браузер
+    ставит сам и подделать его со страницы нельзя.
+
+    Пустой Origin пропускаем: так приходят не браузеры — свои же скрипты и
+    голосовая служба робота, у которых страницы нет вовсе.
+    """
+    откуда = (headers.get("Origin") or "").strip()
+    if not откуда:
+        return True
+    свой_хост = (headers.get("Host") or "").split(":")[0].strip().lower()
+    чужой_хост = urllib.parse.urlsplit(откуда).hostname or ""
+    return bool(свой_хост) and чужой_хост.lower() == свой_хост
 
 
 def _рукопожатие_с_ros(канал: socket.socket) -> bytes | None:
@@ -92,6 +113,10 @@ def проводить(браузер: socket.socket, headers) -> None:
     if not ключ:
         браузер.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
         return
+    if not свой(headers):
+        log.warning("отказал чужой странице: Origin=%r", headers.get("Origin"))
+        браузер.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+        return
 
     ros = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ros.settimeout(ЖДЁМ)
@@ -116,9 +141,16 @@ def проводить(браузер: socket.socket, headers) -> None:
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Accept: {_подпись(ключ)}\r\n\r\n"
     ).encode("ascii")
-    браузер.sendall(ответ)
-    if начало:
-        браузер.sendall(начало)
+    try:
+        браузер.sendall(ответ)
+        if начало:
+            браузер.sendall(начало)
+    except OSError as e:
+        # Вкладку закрыли ровно в этот миг. Без этого сокет к rosbridge оставался
+        # висеть: исключение улетало наружу мимо всей уборки.
+        log.info("браузер ушёл до начала разговора: %s", e)
+        ros.close()
+        return
 
     _перелить(браузер, ros)
 
