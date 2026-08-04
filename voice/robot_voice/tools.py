@@ -758,7 +758,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             return секундомер.сброс()
         return секундомер.сколько()
 
-    def random_pick(вид: str = "монетка", снизу: int = 1, сверху: int = 0,
+    def random_pick(вид: str = "монетка", снизу: int | None = None,
+                    сверху: int | None = None,
                     из_чего: list | None = None) -> str:
         """Настоящий бросок. Модель на «загадай число от одного до десяти»
         отвечает семёркой заметно чаще прочего — для игры это подделка."""
@@ -766,10 +767,14 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if вид.startswith("монет"):
             return counting.монетка()
         if вид.startswith("куб"):
-            return counting.кубик(сверху or 6)
+            return counting.кубик(6 if сверху is None else сверху)
         if вид.startswith("выбор") or из_чего:
             return counting.выбрать(list(из_чего or []))
-        return counting.число(снизу or 1, сверху or 10)
+        # Ноль в границе — настоящий ноль, а не «границу не назвали». Через
+        # «or» он превращался в единицу и в десятку: «от нуля до трёх» никогда
+        # не давало нуля, а «от минус десяти до нуля» считало до десяти.
+        return counting.число(1 if снизу is None else снизу,
+                              10 if сверху is None else сверху)
 
     def volume(change: str = "тише", про_голос: bool = False) -> str:
         """Громкость голоса — но под музыку «сделай тише» почти всегда про неё.
