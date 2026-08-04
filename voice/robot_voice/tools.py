@@ -1395,7 +1395,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                         "этого заработает погода.",
             input_schema={
                 "type": "object",
-                "properties": {"город": {"type": "string"}},
+                "properties": {
+                    "город": {
+                        "type": "string",
+                        "description": "Название города так, как его назвал "
+                                       "человек. Падеж не важен.",
+                    },
+                },
                 "required": ["город"],
             },
             run=set_home,
