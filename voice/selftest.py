@@ -1517,6 +1517,43 @@ def test_endpoints() -> None:
               b.reply("привет", lambda s: None), "из облака")
         check(f"{кто} — ПК отложен", b.endpoints[0].down_until > 0, True)
 
+    # А вот запрос, неправильный сам по себе, отвергнет кто угодно — и метить
+    # из-за него собеседников мёртвыми нельзя. Иначе одна наша ошибка выводит
+    # из строя всех разом: следующую минуту робот не спрашивает никого, хотя
+    # спросить есть кого. Ровно так и вышло с русскими именами полей в схемах.
+    from robot_voice.app import _failure_phrase
+    from robot_voice.brain import наша_вина
+    схема = _http_error(
+        400, "tools.5.custom.input_schema.properties: Property keys should "
+             "match pattern '^[a-zA-Z0-9_.-]{1,64}$'")
+    b = brain(pc=схема, cloud=схема)
+    try:
+        b.reply("привет", lambda s: None)
+        check("неправильный запрос не проглочен", "ответил", "отказался")
+    except Exception as e:
+        check("неправильный запрос назван нашей ошибкой", наша_вина(e), True)
+    check("ПК не помечен мёртвым из-за нашей ошибки",
+          b.endpoints[0].down_until, 0.0)
+    check("облако не помечено мёртвым из-за нашей ошибки",
+          b.endpoints[1].down_until, 0.0)
+    # Шлюз заворачивает чужие ошибки в свои: живьём это пришло как
+    # overloaded_error, то есть «перегружен, попробуй позже». По коду и типу
+    # такое не отличить — только по тому, на что ошибка показывает пальцем.
+    подделка = _http_error(
+        529, '{"error":{"message":"Provider returned error","code":400,'
+             '"metadata":{"raw":"invalid_request_error: '
+             'tools.5.custom.input_schema.properties: ..."}}}')
+    check("529 с нашей ошибкой внутри распознан", наша_вина(подделка), True)
+    # А это не наша вина: у следующего собеседника всё получится.
+    check("опечатка в имени модели — не наша вина",
+          наша_вина(_http_error(400, "model: unknown model 'qwen3:4b'")), False)
+    check("перегрузка — не наша вина",
+          наша_вина(_http_error(529, "Overloaded, try again later")), False)
+    # И человеку об этом говорят по-разному: «повтори» тут бесполезно, он
+    # повторит и получит то же самое.
+    check("про нашу ошибку сказано честно",
+          "Повторять бесполезно" in _failure_phrase(схема), True)
+
     # Без облачного ключа облачного собеседника быть не должно: вместо обрыва
     # связи оттуда прилетит отказ авторизации, и запасного пути не станет.
     cfg = Config()
@@ -1596,18 +1633,103 @@ def test_brain_money() -> None:
     check("на отказ робот говорит вслух", "".join(сказано).startswith("Извини"), True)
 
 
-def _http_error(code: int) -> Exception:
-    """Ответ с HTTP-кодом так, как его создаёт SDK."""
+def test_degraded() -> None:
+    """Робот обязан сказать, что работает не в полную силу.
+
+    Запасные пути есть у каждого звена, и это хорошо — но проходил их робот
+    молча. Снаружи ухудшение выглядит как «стал тупить»: отвечает медленнее,
+    хуже слышит, а почему — видно только в журнале по ssh.
+    """
+    import types as _t
+
+    from robot_voice.app import Watchdog
+
+    section("робот говорит, что ему плохо")
+    сказано: list[str] = []
+    строки: list[str] = []
+    voice = _t.SimpleNamespace(say=сказано.append, status=строки.append)
+    ros = _t.SimpleNamespace(voltage=None)
+    listener = _t.SimpleNamespace(pump=_t.SimpleNamespace(alive=True))
+
+    слух = _t.SimpleNamespace(сам_разбираю=False)
+    мозг = _t.SimpleNamespace(ответил="", endpoints=[
+        _t.SimpleNamespace(name="ПК"), _t.SimpleNamespace(name="облако")])
+    сторож = Watchdog(ros, voice, listener, recognizer=слух, brain=мозг)
+
+    # Первый заход при живом роботе: сказать «всё хорошо» тому, кто ничего не
+    # спрашивал, незачем.
+    мозг.ответил = "ПК"
+    сторож._запасной_путь()
+    check("на здоровом роботе молчит", (сказано, строки), ([], []))
+
+    # ПК замолчал: отвечает облако, речь разбираем сами.
+    мозг.ответил = "облако"
+    слух.сам_разбираю = True
+    сторож._запасной_путь()
+    check("сказал вслух один раз", len(сказано), 1)
+    check("и назвал оба звена",
+          ("разбираю речь сам" in строки[-1], "облако" in строки[-1]),
+          (True, True))
+
+    # Пока ничего не изменилось — молчит, а не ноет каждые полминуты.
+    сторож._запасной_путь()
+    сторож._запасной_путь()
+    check("не повторяется", len(сказано), 1)
+
+    # Вернулись на основной путь — это тоже стоит показать, но без голоса.
+    мозг.ответил = "ПК"
+    слух.сам_разбираю = False
+    сторож._запасной_путь()
+    check("о возвращении сказано строкой", строки[-1], "всё на своих местах")
+    check("но вслух не празднуем", len(сказано), 1)
+
+    # Распознаватель без этого свойства (когда ПК не настроен вовсе) не должен
+    # ронять сторожа.
+    сторож2 = Watchdog(ros, voice, listener, recognizer=object(), brain=None)
+    сторож2._запасной_путь()
+    check("без ПК сторож не падает", True, True)
+
+    # Своё распознавание поднимается заранее, а не в тот миг, когда ПК
+    # замолчал. Раньше человек в этот момент ждал минуту тишины — и это была
+    # ровно та минута, когда ему нужен ответ.
+    from robot_voice.stt import Remote
+
+    поднято: list[int] = []
+
+    def сделать_модель():
+        поднято.append(1)
+        return _t.SimpleNamespace(transcribe=lambda w: "", confidence=0.9)
+
+    слух2 = Remote("http://пк:4000/stt", сделать_модель)
+    check("до прогрева модель не грузится", поднято, [])
+    слух2.прогреть()
+    check("прогрев поднял модель", поднято, [1])
+    слух2.прогреть()
+    check("второй прогрев не грузит снова", поднято, [1])
+    # Не поднялась — не беда: поднимем, когда понадобится. Ронять из-за этого
+    # весь голос нельзя, прогрев идёт в фоне.
+    Remote("http://пк:4000/stt",
+           lambda: (_ for _ in ()).throw(RuntimeError("нет модели"))).прогреть()
+    check("неудачный прогрев не роняет робота", True, True)
+
+
+def _http_error(code: int, текст: str = "") -> Exception:
+    """Ответ с HTTP-кодом так, как его создаёт SDK.
+
+    Текст важен не меньше кода: по нему робот отличает «запрос неправилен сам
+    по себе» от «этот собеседник не смог». Один и тот же 400 бывает и про то,
+    и про другое.
+    """
     import anthropic
     kinds = {400: "BadRequestError", 404: "NotFoundError",
-             500: "InternalServerError"}
+             500: "InternalServerError", 529: "APIStatusError"}
     cls = getattr(anthropic, kinds[code], None)
     if cls is None:                       # заглушка вместо настоящего SDK
         return anthropic.APIConnectionError()
     try:
         import httpx
         return cls(
-            f"код {code}",
+            текст or f"код {code}",
             response=httpx.Response(
                 code, request=httpx.Request("POST", "http://пк:4000/v1/messages")),
             body=None)
@@ -2787,6 +2909,7 @@ def main() -> int:
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,
                  test_counting, test_rules_reach_tools, test_ws_proxy,
+                 test_degraded,
                  test_duck,
                  test_tls,
                  test_pult_and_server_agree,

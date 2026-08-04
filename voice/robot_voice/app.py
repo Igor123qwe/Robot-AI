@@ -293,13 +293,16 @@ class Watchdog:
               (CUTOFF_VOLT, "Батарея почти пустая, ехать я больше не буду."))
 
     def __init__(self, ros, voice: Voice, listener: Listener,
-                 period: float = 30.0) -> None:
+                 period: float = 30.0, recognizer=None, brain=None) -> None:
         self.ros = ros
         self.voice = voice
         self.listener = listener
         self.period = period
+        self.recognizer = recognizer
+        self.brain = brain
         self._said: set[float] = set()
         self._mic_was: bool | None = None
+        self._запас_был: str | None = None
         self._stop = threading.Event()
 
     def start(self) -> None:
@@ -313,6 +316,7 @@ class Watchdog:
             try:
                 self._battery()
                 self._mic()
+                self._запасной_путь()
             except Exception:
                 log.exception("наблюдатель споткнулся")
 
@@ -328,6 +332,40 @@ class Watchdog:
                 log.info("батарея %.1f В — предупреждаю", volt)
                 self.voice.say(phrase)
                 break
+
+    def _запасной_путь(self) -> None:
+        """Сказать, что робот работает не в полную силу.
+
+        Запасные пути есть у каждого звена, и это хорошо — но проходил их
+        робот молча. Снаружи ухудшение выглядит как «стал тупить»: отвечает
+        медленнее, хуже слышит, а почему — видно только в журнале по ssh.
+        Про синтез не говорим: там запасной путь слышно и так, голос меняется.
+        """
+        беды = []
+        if self.recognizer is not None and getattr(
+                self.recognizer, "сам_разбираю", False):
+            беды.append("разбираю речь сам")
+        мозг = self.brain
+        если_запасной = (мозг is not None and мозг.ответил
+                         and мозг.endpoints and мозг.ответил != мозг.endpoints[0].name)
+        if если_запасной:
+            беды.append(f"отвечаю через {мозг.ответил}")
+        стало = "; ".join(беды)
+        if стало == self._запас_был:
+            return
+        # Первый заход при живом роботе — молчим: сказать «всё хорошо» тому,
+        # кто ничего не спрашивал, незачем.
+        впервые = self._запас_был is None
+        self._запас_был = стало
+        if стало:
+            log.info("работаю на запасном: %s", стало)
+            self.voice.status(f"на запасном пути: {стало}")
+            if not впервые:
+                self.voice.say("Отвечаю на запасных силах, "
+                               "ПК не отзывается — будет медленнее.")
+        elif not впервые:
+            log.info("вернулся на основной путь")
+            self.voice.status("всё на своих местах")
 
     def _mic(self) -> None:
         online = self.listener.pump.alive
@@ -396,11 +434,16 @@ def main() -> None:
                           beam_size=cfg.whisper_beam)
 
     if cfg.stt_url:
-        # Модель на роботе при этом не грузится вовсе — поднимется сама, если
-        # ПК замолчит. Это полторы сотни мегабайт памяти и несколько секунд
-        # старта, которые в обычный день не нужны ни разу.
         log.info("распознавание на ПК: %s", cfg.stt_url)
         recognizer = Remote(cfg.stt_url, local_recognizer)
+        # Своё распознавание поднимаем заранее и в фоне. Раньше оно грузилось
+        # в тот самый миг, когда ПК замолчал, — то есть когда человек уже ждёт
+        # ответа, и робот вместо ответа надолго замолкал. Память под модель
+        # тратится теперь всегда: это размен полутора сотен мегабайт на минуту
+        # немоты в единственный важный момент. ROBOT_WARM_LOCAL_STT=0 вернёт
+        # прежнее поведение тем, кому память дороже.
+        if cfg.warm_local_stt:
+            threading.Thread(target=recognizer.прогреть, daemon=True).start()
     else:
         recognizer = local_recognizer()
 
@@ -468,7 +511,7 @@ def main() -> None:
     brain = Brain(cfg, tools)
 
     # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.
-    watch = Watchdog(ros, voice, listener)
+    watch = Watchdog(ros, voice, listener, recognizer=recognizer, brain=brain)
     watch.start()
 
     def shutdown(_sig, _frm) -> None:
@@ -1139,6 +1182,14 @@ def _failure_phrase(error: Exception) -> str:
     и получал то же самое. При телефоне-микрофоне и двойном NAT отвалившийся
     интернет — обычное дело, и сказать об этом честно полезнее.
     """
+    from .brain import наша_вина
+
+    # Наша собственная ошибка в запросе. Раньше она попадала в последнюю ветку
+    # и человек слышал «повтори» — повторял, и получал то же самое, потому что
+    # повтор тут не помогает никогда.
+    if наша_вина(error):
+        return ("Я сломан внутри: модель не принимает мой запрос. "
+                "Повторять бесполезно, нужен журнал.")
     name = type(error).__name__
     if "Connection" in name or "Timeout" in name:
         return ("Сейчас я без интернета. Таймеры, время, список и езда "

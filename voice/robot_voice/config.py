@@ -126,6 +126,10 @@ class Config:
     # Тихие часы: в это время робот говорит вполголоса и не здоровается при
     # перезапуске. Будильник и таймер звучат в полную громкость — их для того
     # и ставили. Пусто — режим выключен.
+    # Держать ли своё распознавание прогретым, пока ПК жив. Стоит памяти,
+    # экономит минуту немоты в тот момент, когда ПК замолчал.
+    warm_local_stt: bool = field(
+        default_factory=lambda: _env("ROBOT_WARM_LOCAL_STT", "1") == "1")
     quiet_hours: str = field(default_factory=lambda: _env("ROBOT_QUIET_HOURS", "23-8"))
     quiet_volume: float = field(
         default_factory=lambda: _num("ROBOT_QUIET_VOLUME", 0.45))
