@@ -49,6 +49,7 @@ import ipaddress
 import json
 import os
 import queue
+import socket
 import ssl
 import sys
 import threading
@@ -616,6 +617,52 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"online": False, "detail": message}, code)
 
 
+# Сколько ждём рукопожатия от клиента. Дальше — не наш человек: браузер
+# здоровается сразу.
+РУКОПОЖАТИЕ = 15.0
+
+
+class ЗащищённыйСервер(ThreadingHTTPServer):
+    """https, у которого рукопожатие делается в потоке соединения.
+
+    Раньше защищённым делался слушающий сокет целиком, а значит рукопожатие
+    случалось внутри accept() — в том же единственном потоке, который принимает
+    всех. Один клиент, открывший соединение и замолчавший, замораживал https
+    для всей квартиры: пульт на телефоне переставал отвечать, а робот при этом
+    выглядел живым, потому что обычный http работал.
+    """
+
+    контекст: ssl.SSLContext | None = None
+
+    def finish_request(self, request, client_address) -> None:
+        try:
+            request.settimeout(РУКОПОЖАТИЕ)
+            защищённый = self.контекст.wrap_socket(request, server_side=True)
+        except (OSError, ssl.SSLError) as e:
+            # Обычное дело: браузер зашёл по http на порт https, или человек
+            # закрыл вкладку посреди рукопожатия. Роняем соединение, не сервер.
+            log_tls(f"рукопожатие не состоялось с {client_address[0]}: {e}")
+            return
+        try:
+            # Дальше сроков нет: и события пульта, и картинка с камеры живут
+            # долго и молчат по полчаса — таймаут рвал бы их без причины.
+            защищённый.settimeout(None)
+            self.RequestHandlerClass(защищённый, client_address, self)
+        finally:
+            # Закрываем сами: обёрнутый сокет забирает себе файловый номер, и
+            # уборка socketserver до него уже не дотянется.
+            try:
+                защищённый.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            защищённый.close()
+
+
+def log_tls(строка: str) -> None:
+    """Тихо, но не молча: такое случается часто и пугать им человека незачем."""
+    print(f"https: {строка}", file=sys.stderr, flush=True)
+
+
 def _слушать_https() -> ThreadingHTTPServer | None:
     """Второй вход, по https. Без него микрофон с телефона не работает.
 
@@ -623,9 +670,9 @@ def _слушать_https() -> ThreadingHTTPServer | None:
     разговаривает его же голосовая служба через 127.0.0.1, и ей сертификаты
     ни к чему.
     """
-    бумаги = tls.выписать()
+    бумаги, беда = tls.выписать()
     if бумаги is None:
-        print("https не поднял: нет openssl. Микрофон с телефона не заработает,"
+        print(f"https не поднял: {беда}. Микрофон с телефона не заработает,"
               " см. README", flush=True)
         return None
     сертификат, ключ = бумаги
@@ -635,9 +682,17 @@ def _слушать_https() -> ThreadingHTTPServer | None:
     except (ssl.SSLError, OSError) as e:
         print(f"https не поднял: сертификат не читается ({e})", flush=True)
         return None
-    сервер = ThreadingHTTPServer(("0.0.0.0", TLS_PORT), Handler)
+    try:
+        сервер = ЗащищённыйСервер(("0.0.0.0", TLS_PORT), Handler)
+    except OSError as e:
+        # Порт занят — обычно это второй запуск службы. Ронять из-за этого
+        # весь пульт нельзя: по http он ещё нужен, а под systemd с вечным
+        # перезапуском мы бы просто падали по кругу.
+        print(f"https не поднял: порт {TLS_PORT} занят ({e}). "
+              f"Пульт работает по http", flush=True)
+        return None
     сервер.daemon_threads = True
-    сервер.socket = контекст.wrap_socket(сервер.socket, server_side=True)
+    сервер.контекст = контекст
     threading.Thread(target=сервер.serve_forever, daemon=True).start()
     адрес = (tls.адреса() or ["адрес робота"])[-1]
     print(f"https на порту {TLS_PORT}: https://{адрес}:{TLS_PORT}/pult.html "

@@ -2479,6 +2479,76 @@ def test_ws_proxy() -> None:
     браузер2.close()
 
 
+def test_tls() -> None:
+    """Бумаги для https. Ломается это тихо: микрофон с телефона отказывает.
+
+    Всё здесь проверяется настоящим openssl. Если его в системе нет —
+    проверять нечего, и честнее сказать это вслух, чем показать зелёное.
+    """
+    import os as _os
+    import shutil as _sh
+    import tempfile as _tmp
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "web"))
+    import tls
+
+    section("сертификат для пульта")
+    if _sh.which("openssl") is None:
+        check("openssl в системе есть", False, True)
+        return
+
+    было_адреса, было_серт, было_ключ = tls.адреса, tls.СЕРТ, tls.КЛЮЧ
+    дом = Path(_tmp.mkdtemp())
+    try:
+        tls.адреса = lambda: ["127.0.0.1", "192.168.1.55"]
+        бумаги, беда = tls.выписать(дом)
+        check("выписали без жалоб", (bool(бумаги), беда), (True, ""))
+        check("адреса попали в бумагу", sorted(tls._san_из_сертификата()),
+              ["127.0.0.1", "192.168.1.55"])
+        check("ключ читаем только нами", oct(tls.КЛЮЧ.stat().st_mode)[-3:], "600")
+
+        # Новый адрес — начало старого. Подстрокой «192.168.1.5» находилась
+        # внутри «192.168.1.55», бумага считалась годной, и браузер потом
+        # ругался на несовпадение, а человек думал, что сломался пульт.
+        tls.адреса = lambda: ["127.0.0.1", "192.168.1.5"]
+        check("переезд на адрес-начало замечен",
+              tls._годен(["127.0.0.1", "192.168.1.5"]), False)
+        tls.выписать(дом)
+        check("бумагу перевыписали", sorted(tls._san_из_сертификата()),
+              ["127.0.0.1", "192.168.1.5"])
+
+        # openssl пропал, а бумаги на месте: https поднимать есть чем.
+        путь = _os.environ.get("PATH", "")
+        _os.environ["PATH"] = str(дом / "нет-такого")
+        try:
+            бумаги2, беда2 = tls.выписать(дом)
+            check("без openssl берём готовые бумаги",
+                  (bool(бумаги2), беда2), (True, ""))
+        finally:
+            _os.environ["PATH"] = путь
+
+        # openssl живой, но отказывает — человеку надо сказать, чем именно.
+        # Раньше это объявлялось как «нет openssl», и он шёл ставить пакет,
+        # который уже стоял.
+        корзина = дом / "bin"
+        корзина.mkdir()
+        (корзина / "openssl").write_text(
+            '#!/bin/sh\necho "req: Unrecognized flag addext" >&2\nexit 1\n')
+        (корзина / "openssl").chmod(0o755)
+        пусто = Path(_tmp.mkdtemp())
+        _os.environ["PATH"] = str(корзина)
+        try:
+            бумаги3, беда3 = tls.выписать(пусто)
+            check("отказ openssl назван своими словами",
+                  (бумаги3, "Unrecognized flag" in беда3), (None, True))
+        finally:
+            _os.environ["PATH"] = путь
+            _sh.rmtree(пусто, ignore_errors=True)
+    finally:
+        tls.адреса, tls.СЕРТ, tls.КЛЮЧ = было_адреса, было_серт, было_ключ
+        _sh.rmtree(дом, ignore_errors=True)
+
+
 def test_pult_and_server_agree() -> None:
     """Сервер умеет, а страница нет — этот класс ошибок стоил целого вечера.
 
@@ -2515,6 +2585,7 @@ def main() -> int:
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,
                  test_counting, test_rules_reach_tools, test_ws_proxy,
+                 test_tls,
                  test_pult_and_server_agree,
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,

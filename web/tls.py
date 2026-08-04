@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 import subprocess
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # Рядом с настройками робота, а не в репозитории: ключ в git не место.
 ДОМ = Path.home() / ".robot-ai"
@@ -56,30 +59,54 @@ def _san(список: list[str]) -> str:
     return "subjectAltName=" + ",".join(куски)
 
 
-def _годен(нужные: list[str]) -> bool:
-    """Есть ли сертификат и покрывает ли он сегодняшние адреса."""
-    if not (СЕРТ.exists() and КЛЮЧ.exists()):
-        return False
+def _san_из_сертификата() -> set[str] | None:
+    """Адреса, вписанные в сертификат. None — спросить не вышло."""
     try:
         готово = subprocess.run(
-            ["openssl", "x509", "-in", str(СЕРТ), "-noout", "-text"],
+            ["openssl", "x509", "-in", str(СЕРТ), "-noout", "-ext",
+             "subjectAltName"],
             capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return False
+        return None
     if готово.returncode != 0:
+        return None
+    адреса_в_бумаге = set()
+    for кусок in готово.stdout.replace("\n", ",").split(","):
+        кусок = кусок.strip()
+        if кусок.startswith("IP Address:"):
+            адреса_в_бумаге.add(кусок[len("IP Address:"):].strip())
+    return адреса_в_бумаге
+
+
+def _годен(нужные: list[str]) -> bool:
+    """Есть ли сертификат и покрывает ли он сегодняшние адреса.
+
+    Сравниваем списком, а не поиском подстроки. Подстрокой «192.168.1.5»
+    находилась внутри «192.168.1.55», и робот, переехавший на такой адрес,
+    считал старую бумагу годной — браузер потом ругался на несовпадение, а
+    человек думал, что сломался пульт.
+    """
+    if not (СЕРТ.exists() and КЛЮЧ.exists()):
         return False
-    текст = готово.stdout
-    return all(f"IP Address:{адрес}" in текст for адрес in нужные)
+    есть = _san_из_сертификата()
+    if есть is None:
+        return False
+    return set(нужные) <= есть
 
 
-def выписать(куда: Path | None = None) -> tuple[Path, Path] | None:
-    """Сертификат и ключ. None — если openssl нет и выписать нечем."""
+def выписать(куда: Path | None = None) -> tuple[tuple[Path, Path] | None, str]:
+    """Бумаги и причина отказа. Причина пустая, когда всё вышло.
+
+    Причину возвращаем отдельной строкой, потому что раньше любая неудача
+    объявлялась человеку как «нет openssl» — в том числе отказ живого openssl,
+    не понимающего -addext. Человек шёл ставить пакет, который уже стоял.
+    """
     global СЕРТ, КЛЮЧ
     if куда is not None:
         СЕРТ, КЛЮЧ = куда / "pult-cert.pem", куда / "pult-key.pem"
     сегодняшние = адреса()
     if _годен(сегодняшние):
-        return СЕРТ, КЛЮЧ
+        return (СЕРТ, КЛЮЧ), ""
 
     СЕРТ.parent.mkdir(parents=True, exist_ok=True)
     приказ = [
@@ -93,13 +120,29 @@ def выписать(куда: Path | None = None) -> tuple[Path, Path] | None:
     try:
         готово = subprocess.run(приказ, capture_output=True, text=True,
                                 timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except (OSError, subprocess.SubprocessError) as e:
+        return _старые_бумаги(f"openssl не запустился ({e})")
     if готово.returncode != 0 or not СЕРТ.exists():
-        return None
+        беда = (готово.stderr or "").strip().splitlines()
+        return _старые_бумаги("openssl отказал"
+                              + (f": {беда[-1]}" if беда else ""))
     # Ключ читаем только мы: он лежит в домашней папке, но папка общая.
     КЛЮЧ.chmod(0o600)
-    return СЕРТ, КЛЮЧ
+    return (СЕРТ, КЛЮЧ), ""
+
+
+def _старые_бумаги(беда: str) -> tuple[tuple[Path, Path] | None, str]:
+    """Выписать не вышло — но, может, годные бумаги уже лежат.
+
+    Так бывает, когда openssl из системы пропал: проверить сертификат нечем и
+    перевыписать нечем, а сам он на месте и работает. Раньше в этом случае
+    https не поднимался вовсе, и микрофон с телефона молча отказывал при
+    полностью исправных бумагах.
+    """
+    if СЕРТ.exists() and КЛЮЧ.exists():
+        log.warning("%s; беру сертификат, который уже лежит", беда)
+        return (СЕРТ, КЛЮЧ), ""
+    return None, беда
 
 
 # Проверки срока годности здесь намеренно нет. Сертификат выписывается на десять
