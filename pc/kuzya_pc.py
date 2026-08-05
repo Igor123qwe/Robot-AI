@@ -1557,7 +1557,13 @@ class Handler(BaseHTTPRequestHandler):
         # Каким голосом это прозвучало. Робот называет этим именем свой кэш:
         # иначе после смены --voice заготовки продолжают звучать прежним
         # голосом, а новые фразы — новым, и голос «прорезается» через раз.
-        self.send_header("X-Voice", voice.кто(req.get("voice") or ""))
+        #
+        # Через getattr намеренно: синтез уже удался, звук лежит готовый, и
+        # ронять запрос из-за подсказки нельзя. Без заголовка робот всего лишь
+        # спросит голос отдельно, через /health.
+        кто = getattr(voice, "кто", None)
+        if callable(кто):
+            self.send_header("X-Voice", кто(req.get("voice") or ""))
         self.end_headers()
         try:
             self.wfile.write(wav)
