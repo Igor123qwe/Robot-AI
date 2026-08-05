@@ -2811,6 +2811,8 @@ def test_tls() -> None:
     """
     import os as _os
     import shutil as _sh
+    import socket
+    import subprocess
     import tempfile as _tmp
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "web"))
@@ -2830,6 +2832,17 @@ def test_tls() -> None:
         check("адреса попали в бумагу", sorted(tls._san_из_сертификата()),
               ["127.0.0.1", "192.168.1.55"])
         check("ключ читаем только нами", oct(tls.КЛЮЧ.stat().st_mode)[-3:], "600")
+        # Имя с «.local» — единственное, что переживает смену адреса. По нему
+        # телефон находит робота в домашней сети сам, как находит принтер.
+        # Без него ссылка на пульт умирает при каждом переезде.
+        готово = subprocess.run(
+            ["openssl", "x509", "-in", str(tls.СЕРТ), "-noout", "-ext",
+             "subjectAltName"], capture_output=True, text=True, timeout=10)
+        имя = socket.gethostname()
+        check("в бумаге есть имя робота с .local",
+              f"DNS:{имя}.local" in готово.stdout, True)
+        check("и localhost — для ssh-туннеля",
+              "DNS:localhost" in готово.stdout, True)
 
         # Новый адрес — начало старого. Подстрокой «192.168.1.5» находилась
         # внутри «192.168.1.55», бумага считалась годной, и браузер потом
