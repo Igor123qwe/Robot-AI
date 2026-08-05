@@ -627,6 +627,54 @@ def test_broken() -> None:
         srv.shutdown()
 
 
+def test_context_window() -> None:
+    """Запрос робота обязан помещаться в окно, которое просит мост.
+
+    Умолчание Ollama — 4096 токенов. Постоянная часть запроса робота, то есть
+    системный промпт плюс схемы инструментов, это около двенадцати тысяч
+    символов, и половина из них кириллица — а она в токенизаторе дороже
+    латиницы. Даже по самой щедрой оценке (четыре символа на токен) в 4096 это
+    не помещается вместе с историей и ответом.
+
+    За краем окна Ollama молча выбрасывает начало — ровно ту часть, где
+    записано, кто робот такой и как ему разговаривать. Ни ошибки, ни
+    предупреждения: робот просто начинает отвечать казённо и забывать разговор.
+    """
+    section("окно контекста")
+    from kuzya_pc import DEFAULT_CTX, Ollama
+
+    мост = Ollama("http://нет")
+    check("num_ctx уходит в Ollama явно",
+          мост._payload("м", [], [], 384)["options"].get("num_ctx"), DEFAULT_CTX)
+    check("и он больше умолчания самой Ollama", DEFAULT_CTX > 4096, True)
+    # Прогрев обязан просить то же окно: Ollama держит модель вместе с
+    # KV-кэшем нужного размера, и запрос с другим num_ctx перезагружает всё
+    # заново — то есть греет не то и не экономит ничего.
+    исходник = (Path(__file__).resolve().parent / "kuzya_pc.py").read_text(encoding="utf-8")
+    кусок = исходник[исходник.index("def warm(self, model"):]
+    check("прогрев просит то же окно", "self._options(" in кусок[:1200], True)
+    check("совсем маленькое окно не примем", Ollama("http://нет", ctx=128).ctx >= 2048, True)
+
+    # Настоящий выключатель размышлений — chat_template_kwargs, а не think:
+    # think у Ollama означает «разбирать ли размышления отдельным полем», и
+    # модель при нём думает ровно столько же. Гибридным моделям (Qwen3.5 и
+    # родня) при пределе ответа в 384 токена это стоит всей фразы.
+    выкл = мост._payload("м", [], [], 384)
+    check("размышления выключены аргументом шаблона",
+          выкл.get("chat_template_kwargs"), {"enable_thinking": False})
+    вкл = Ollama("http://нет", think=True)._payload("м", [], [], 384)
+    check("а с --think их не выключаем", "chat_template_kwargs" in вкл, False)
+
+    # Сборка Ollama может не знать ни того, ни другого параметра. Тогда мост
+    # гасит их по одному, и заходов должно хватить на оба плюс рабочий.
+    кусок = исходник[исходник.index("def chat(self, model"):]
+    check("заходов хватает на оба необязательных параметра",
+          "range(3)" in кусок[:900], True)
+    мост._kwargs_known = False
+    check("без chat_template_kwargs запрос всё равно собирается",
+          "chat_template_kwargs" in мост._payload("м", [], [], 384), False)
+
+
 def test_unthink() -> None:
     """Размышления не должны доехать до речи, даже без открывающего тега.
 
@@ -838,7 +886,7 @@ def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
     for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch,
                  test_tool_call, test_broken,
-                 test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health):
+                 test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health):
         test()
         print("   ...")
     if FAILED:

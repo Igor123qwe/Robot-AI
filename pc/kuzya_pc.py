@@ -435,9 +435,33 @@ class AnthropicStream:
 # --------------------------------------------------------------------------
 # Ollama
 # --------------------------------------------------------------------------
+# Сколько токенов контекста просить у Ollama.
+#
+# Числа тут не с потолка. Постоянная часть запроса робота — системный промпт
+# плюс схемы инструментов — это около двенадцати тысяч символов, причём
+# половина из них кириллица, а она в токенизаторе дороже латиницы. Выходит
+# примерно четыре тысячи токенов ДО того, как человек сказал хоть слово.
+#
+# Умолчание Ollama — 4096. То есть робот в него не помещался никогда: справка
+# о собеседнике, восемь сообщений истории и сам ответ шли уже за край. А за
+# краем Ollama молча выбрасывает начало — то самое, где записано, кто робот
+# такой и как ему говорить. Ни ошибки, ни предупреждения: модель просто
+# отвечает казённо и не помнит, о чём был разговор.
+#
+# Восемь тысяч закрывают постоянную часть с запасом на историю. Платим за это
+# видеопамятью под KV-кэш — на 4B-модели это сотни мегабайт.
+DEFAULT_CTX = 8192
+
+
 class Ollama:
-    def __init__(self, base: str = OLLAMA, *, think: bool = False) -> None:
+    def __init__(self, base: str = OLLAMA, *, think: bool = False,
+                 ctx: int = DEFAULT_CTX) -> None:
         self.base = base.rstrip("/")
+        self.ctx = max(2048, int(ctx))
+        # Знает ли эта сборка chat_template_kwargs — единственный настоящий
+        # выключатель размышлений у гибридных моделей. Выясняется по первому
+        # отказу, как и think.
+        self._kwargs_known = True
         # Размышления вслух. Qwen3 и родня по умолчанию сначала пишут ход
         # мысли и только потом ответ. В переписке это полезно, для голоса —
         # разорительно: на живом роботе «Да, я здесь!» стоило 695 токенов
@@ -506,6 +530,9 @@ class Ollama:
         # дозвон до localhost и так падает мгновенно.
         return urllib.request.urlopen(req, timeout=OLLAMA_READ if stream else 10)
 
+    def _options(self, max_tokens: int) -> dict:
+        return {"num_predict": max_tokens, "num_ctx": self.ctx}
+
     def _payload(self, model: str, messages: list, tools: list,
                  max_tokens: int) -> dict:
         payload = {
@@ -513,12 +540,21 @@ class Ollama:
             "messages": messages,
             "stream": True,
             "keep_alive": KEEP_ALIVE,
-            "options": {"num_predict": max_tokens},
+            "options": self._options(max_tokens),
         }
         if tools:
             payload["tools"] = tools
         if self._think_known:
             payload["think"] = self.think
+        if self._kwargs_known and not self.think:
+            # Настоящий выключатель размышлений — вот этот, а не think.
+            # think у Ollama означает «разбирать ли размышления отдельным
+            # полем»; модель при нём думает ровно столько же. А гибридные
+            # модели (Qwen3.5 и родня) слушаются именно enable_thinking из
+            # аргументов шаблона чата. Для голоса это принципиально: предел
+            # ответа у робота 384 токена, и думающая модель выбирает его
+            # целиком на рассуждения, обрывая фразу на полуслове.
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         return payload
 
     def chat(self, model: str, messages: list, tools: list, max_tokens: int):
@@ -526,7 +562,10 @@ class Ollama:
         # Соединение открываем до первой выдачи: тогда отказ можно исправить и
         # повторить, не показав наружу половину ответа.
         resp = None
-        for _ in range(2):
+        # Попыток на одну больше, чем необязательных параметров: каждый отказ
+        # гасит ровно один из них, и после последнего должен остаться заход,
+        # который дойдёт до Ollama.
+        for _ in range(3):
             try:
                 resp = self._post("/api/chat",
                                   self._payload(model, messages, tools, max_tokens),
@@ -538,7 +577,14 @@ class Ollama:
                     body = e.read().decode("utf-8", "replace")
                 except Exception:
                     pass
-                if self._think_known and "think" in body.lower():
+                низ = body.lower()
+                if self._kwargs_known and "chat_template_kwargs" in низ:
+                    log.warning("эта сборка Ollama не знает chat_template_kwargs "
+                                "— размышления гибридных моделей выключить "
+                                "нечем (%s)", body[:200])
+                    self._kwargs_known = False
+                    continue
+                if self._think_known and "think" in низ:
                     log.warning("эта сборка Ollama не знает параметр think — "
                                 "работаю без него (%s)", body[:200])
                     self._think_known = False
@@ -564,13 +610,17 @@ class Ollama:
         первая фраза, но и все следующие в течение минуты. Проверено на живом
         роботе: ровно так и вышло.
         """
+        # num_ctx здесь тот же, что в бою, и это не мелочь: Ollama держит в
+        # памяти модель ВМЕСТЕ с KV-кэшем нужного размера, и запрос с другим
+        # num_ctx заставляет её перезагрузить всё заново. Прогрев с чужим
+        # числом не экономил ничего — он просто грел не то.
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": "привет"}],
             "stream": False,
             "keep_alive": KEEP_ALIVE,
             "think": self.think,
-            "options": {"num_predict": 1},
+            "options": self._options(1),
         }
         started = time.monotonic()
         try:
@@ -1856,6 +1906,14 @@ def main() -> int:
     p.add_argument("--host", default="0.0.0.0",
                    help="0.0.0.0 — слышно роботу по сети, 127.0.0.1 — только этой машине")
     p.add_argument("--ollama", default=OLLAMA)
+    p.add_argument("--ctx", type=int, default=DEFAULT_CTX,
+                   help=f"окно контекста Ollama в токенах (по умолчанию "
+                        f"{DEFAULT_CTX}). Умолчание самой Ollama — 4096, а "
+                        "постоянная часть запроса робота это примерно четыре "
+                        "тысячи токенов: в 4096 он не помещается никогда, и "
+                        "Ollama молча срезает начало вместе с промптом. "
+                        "Меньше ставить нельзя, больше — если хватает "
+                        "видеопамяти под KV-кэш")
     p.add_argument("--think", action="store_true",
                    help="разрешить модели размышлять вслух: точнее с "
                         "инструментами, но ответ идёт в разы дольше")
@@ -1881,7 +1939,7 @@ def main() -> int:
                       "filelock", "faster_whisper"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    ollama = Ollama(args.ollama, think=args.think)
+    ollama = Ollama(args.ollama, think=args.think, ctx=args.ctx)
     рядом = Path(os.environ.get("HF_HOME", Path.home() / ".cache")) / "кузя"
     слух = Whisper(args.whisper, wake=args.wake)
     if args.stt == "gigaam":

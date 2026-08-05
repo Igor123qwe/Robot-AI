@@ -572,9 +572,10 @@ python pc/kuzya_pc.py --model qwen3:4b --whisper small
 netsh advfirewall firewall add rule name="kuzya" dir=in action=allow protocol=TCP localport=4000
 ```
 
-Выбор модели упирается в видеопамять (`nvidia-smi --query-gpu=name,memory.total --format=csv`):
-`qwen3:4b` живёт в 4 ГБ и отвечает за секунду, `qwen3:8b` умнее и просит 6 ГБ
-и более.
+Выбор модели упирается в видеопамять (`nvidia-smi --query-gpu=name,memory.total --format=csv`),
+и считать надо остаток: на той же карте живёт распознавание речи. Файл модели
+должен быть примерно на 2 ГБ меньше видеопамяти. Подробная таблица и разбор
+размышлений с окном контекста — в `pc/README.md`, раздел «Выбор моделей».
 
 На роботе — одна строка в `~/.robot-ai.env`, где `X` это адрес ПК в домашней
 сети:
