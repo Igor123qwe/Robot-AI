@@ -684,6 +684,30 @@ def test_gigaam() -> None:
     check("а не у аргумента командной строки",
           "args.whisper.rsplit" in исходник, False)
 
+    # Без ffmpeg GigaAM не прочитает ни одного файла: своего декодера у него
+    # нет. Узнать об этом надо при запуске, а не на первой фразе — иначе робот
+    # встречает человека трассировкой, и так на каждое слово.
+    check("проверяем ffmpeg до первой фразы",
+          hasattr(kuzya_pc.GigaAM, "ffmpeg_есть"), True)
+    check("и говорим, чем лечится", "winget install" in исходник, True)
+    было = kuzya_pc.shutil.which
+    try:
+        kuzya_pc.shutil.which = lambda имя: None
+        check("без ffmpeg честно отказывается",
+              kuzya_pc.GigaAM.ffmpeg_есть(), False)
+        # Сам gigaam здесь не установлен, поэтому смотрим в исходник: заслон
+        # должен стоять в _load до обращения к библиотеке — иначе он проверит
+        # ffmpeg уже после того, как модель загрузится, то есть слишком поздно.
+        кусок = исходник[исходник.index("class GigaAM"):
+                         исходник.index("class Voiceprints")]
+        загрузка = кусок[кусок.index("def _load"):]
+        check("заслон стоит в загрузке модели",
+              "ffmpeg_есть()" in загрузка, True)
+        check("и отказ объясняет причину",
+              "нет ffmpeg" in загрузка, True)
+    finally:
+        kuzya_pc.shutil.which = было
+
 
 def test_no_initial_prompt() -> None:
     """Подсказки распознаванию быть не должно, и это проверяется.

@@ -36,10 +36,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
-import contextlib
 import os
+import shutil
 import sys
 import threading
 import time
@@ -789,10 +790,24 @@ class GigaAM:
         self._model = None
         self._lock = threading.Lock()
 
+    @staticmethod
+    def ffmpeg_есть() -> bool:
+        """Есть ли ffmpeg. Без него GigaAM не прочитает ни одного файла.
+
+        Своего декодера у него нет: звук он читает, запуская ffmpeg. Проверять
+        это надо при запуске, а не на первой фразе — иначе робот встречает
+        человека трассировкой вместо ответа, и так на каждое слово.
+        """
+        return shutil.which("ffmpeg") is not None
+
     def _load(self):
         import gigaam
         import torch
 
+        if not self.ffmpeg_есть():
+            raise RuntimeError(
+                "нет ffmpeg — GigaAM читает звук только через него. "
+                "Windows: winget install Gyan.FFmpeg; Debian: apt install ffmpeg")
         # Видеокарта, если есть: на процессоре GigaAM тоже быстр, но зачем.
         куда = "cuda" if torch.cuda.is_available() else "cpu"
         модель = gigaam.load_model(self.size, device=куда)
@@ -1787,6 +1802,11 @@ def main() -> int:
         кандидат = GigaAM(args.gigaam_model)
         try:
             import gigaam                      # noqa: F401
+            if not кандидат.ffmpeg_есть():
+                raise RuntimeError(
+                    "нет ffmpeg — GigaAM читает звук только через него. "
+                    "Windows: winget install Gyan.FFmpeg; "
+                    "Debian: apt install ffmpeg")
             слух = кандидат
         except Exception as e:                  # noqa: BLE001
             log.warning("GigaAM не поднялся (%s) — распознаю Whisper'ом", e)
