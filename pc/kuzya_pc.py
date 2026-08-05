@@ -765,6 +765,26 @@ class Whisper:
         return text, sure
 
 
+def _текстом(ответ) -> str:
+    """Распознанное — строкой, что бы ни вернула библиотека.
+
+    GigaAM отдаёт не строку, а объект с полем text. Полагаться на одно имя
+    поля не хочется: библиотека молодая, и в разных версиях это уже называлось
+    по-разному. Поэтому спрашиваем по очереди и в самом конце соглашаемся на
+    строковое представление — робот не должен глохнуть из-за переименованного
+    поля.
+    """
+    if ответ is None:
+        return ""
+    if isinstance(ответ, str):
+        return ответ.strip()
+    for имя in ("text", "transcription", "transcript"):
+        значение = getattr(ответ, имя, None)
+        if isinstance(значение, str):
+            return значение.strip()
+    return str(ответ).strip()
+
+
 class GigaAM:
     """Русское распознавание от Сбера. Тот же договор, что у Whisper.
 
@@ -838,7 +858,7 @@ class GigaAM:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     f.write(wav)
                     имя = f.name
-                text = (self._model.transcribe(имя) or "").strip()
+                text = _текстом(self._model.transcribe(имя))
             finally:
                 if имя:
                     with contextlib.suppress(OSError):

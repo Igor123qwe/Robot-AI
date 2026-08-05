@@ -687,6 +687,19 @@ def test_gigaam() -> None:
     # Без ffmpeg GigaAM не прочитает ни одного файла: своего декодера у него
     # нет. Узнать об этом надо при запуске, а не на первой фразе — иначе робот
     # встречает человека трассировкой, и так на каждое слово.
+    # GigaAM отдаёт не строку, а объект с полем text. Робот на этом падал на
+    # каждой фразе: 'TranscriptionResult' object has no attribute 'strip'.
+    # Полагаться на одно имя поля нельзя — библиотека молодая.
+    import types as _t
+    for ответ, ждём, имя in (
+        (_t.SimpleNamespace(text="Кузя, вперёд"), "Кузя, вперёд", "поле text"),
+        (_t.SimpleNamespace(transcription="привет"), "привет", "поле transcription"),
+        ("уже строка", "уже строка", "просто строка"),
+        (None, "", "ничего"),
+        (_t.SimpleNamespace(text="  с пробелами  "), "с пробелами", "обрезка"),
+    ):
+        check(f"текст из ответа: {имя}", kuzya_pc._текстом(ответ), ждём)
+
     check("проверяем ffmpeg до первой фразы",
           hasattr(kuzya_pc.GigaAM, "ffmpeg_есть"), True)
     check("и говорим, чем лечится", "winget install" in исходник, True)
