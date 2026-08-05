@@ -631,9 +631,13 @@ class Whisper:
     честно показывает, загрузилась модель или ещё нет.
     """
 
-    def __init__(self, size: str, language: str = "ru") -> None:
+    def __init__(self, size: str, language: str = "ru",
+                 wake: str = "Кузя") -> None:
         self.size = size
         self.language = language
+        # Как зовут робота. Нужно распознаванию: короткое редкое имя оно
+        # слышит хуже всего, а ошибиться в нём дороже всего.
+        self.wake = wake
         self.device = "не загружена"
         self._model = None
         self._lock = threading.Lock()
@@ -703,6 +707,13 @@ class Whisper:
         log.info("распознавание готово, прогрев занял %.0f с",
                  time.monotonic() - started)
 
+    @property
+    def hint(self) -> str:
+        """Подсказка распознаванию: как зовут робота и как к нему обращаются."""
+        имя = self.wake or "Кузя"
+        return (f"{имя} — домашний робот. {имя}, поезжай вперёд. "
+                f"{имя}, включи музыку.")
+
     def transcribe(self, wav: bytes) -> str:
         import io
 
@@ -718,6 +729,13 @@ class Whisper:
                 language=self.language,
                 beam_size=5,          # на видеокарте это ничего не стоит
                 vad_filter=False,     # тишину уже отрезал робот
+                # Имя робота подсказываем заранее. Без подсказки Whisper
+                # превращал «Кузя» в «Уйди», «Кулям», «Кудяка», «Кульдер» —
+                # а это единственное слово, по которому робот понимает, что
+                # зовут его. Человек звал, робот отвечал «не мне», и оба были
+                # уверены, что виноват другой. Подсказка короткая и в виде
+                # обычных фраз: длинная начинает вылезать в самом ответе.
+                initial_prompt=self.hint,
                 condition_on_previous_text=False,
                 temperature=[0.0, 0.2],
                 no_speech_threshold=0.6,
@@ -1649,6 +1667,9 @@ def main() -> int:
     p.add_argument("--whisper", default=DEFAULT_WHISPER,
                    help="модель распознавания: имя размера (tiny|base|small|"
                         "medium|large-v3) или склад на HuggingFace")
+    p.add_argument("--wake", default="Кузя",
+                   help="как зовут робота — подсказка распознаванию, "
+                        "чтобы имя не превращалось в «Уйди» и «Кудяка»")
     p.add_argument("--port", type=int, default=4000)
     p.add_argument("--host", default="0.0.0.0",
                    help="0.0.0.0 — слышно роботу по сети, 127.0.0.1 — только этой машине")
@@ -1677,7 +1698,7 @@ def main() -> int:
 
     ollama = Ollama(args.ollama, think=args.think)
     рядом = Path(os.environ.get("HF_HOME", Path.home() / ".cache")) / "кузя"
-    cfg = Config(args.model, Whisper(args.whisper), ollama,
+    cfg = Config(args.model, Whisper(args.whisper, wake=args.wake), ollama,
                  None if args.voice == "нет" else Voice(speaker=args.voice),
                  None if args.no_voiceprints else Voiceprints(рядом / "голоса.json"))
 

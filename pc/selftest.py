@@ -649,6 +649,31 @@ def test_unthink() -> None:
     check("один ответ без тега не отменяет доказанного", привычка.get("м"), True)
 
 
+def test_wake_hint() -> None:
+    """Имя робота подсказывается распознаванию заранее.
+
+    Без подсказки Whisper превращал «Кузя» в «Уйди», «Кулям», «Кудяка»,
+    «Кульдер» — и робот отвечал «не мне» на прямое обращение. Человек звал,
+    робот молчал, и оба считали виноватым другого. Имя — единственное слово,
+    по которому он понимает, что зовут его, и слышит он его хуже всего:
+    короткое и редкое.
+    """
+    section("подсказка имени распознаванию")
+    w = kuzya_pc.Whisper("small", wake="Кузя")
+    подсказка = w.hint
+    check("имя в подсказке есть", "Кузя" in подсказка, True)
+    check("подсказка — обычные фразы, а не список",
+          подсказка.count(",") >= 2, True)
+    # Длинная подсказка начинает вылезать в самом ответе — это известная
+    # беда initial_prompt, поэтому держим её короткой.
+    check("подсказка короткая", len(подсказка) < 200, True)
+    # Имя настраивается: робота могут звать иначе, и тогда подсказка обязана
+    # смениться вместе с ним, а не остаться про Кузю.
+    другой = kuzya_pc.Whisper("small", wake="Робик")
+    check("чужое имя подставилось", "Робик" in другой.hint, True)
+    check("и старого не осталось", "Кузя" in другой.hint, False)
+
+
 def test_stt_confidence() -> None:
     """Вместе с текстом наружу едет уверенность распознавания.
 
@@ -711,7 +736,7 @@ def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
     for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch,
                  test_tool_call, test_broken,
-                 test_unthink, test_stt_confidence, test_health):
+                 test_unthink, test_wake_hint, test_stt_confidence, test_health):
         test()
         print("   ...")
     if FAILED:
