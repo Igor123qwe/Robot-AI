@@ -676,6 +676,13 @@ def test_gigaam() -> None:
           '"--stt", default="whisper"' in исходник, True)
     check("и если GigaAM не встанет — не оглохнем",
           "распознаю Whisper" in исходник, True)
+    # Шапка при запуске обязана называть того, кто и правда слушает. Стояло имя
+    # из командной строки, и она сообщала про Whisper, когда работал GigaAM —
+    # то есть врала ровно там, где человек проверяет, что всё завелось.
+    check("шапка берёт имя у настоящего распознавателя",
+          "cfg.whisper.size.rsplit" in исходник, True)
+    check("а не у аргумента командной строки",
+          "args.whisper.rsplit" in исходник, False)
 
 
 def test_no_initial_prompt() -> None:

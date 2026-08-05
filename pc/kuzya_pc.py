@@ -1781,11 +1781,12 @@ def main() -> int:
     рядом = Path(os.environ.get("HF_HOME", Path.home() / ".cache")) / "кузя"
     слух = Whisper(args.whisper, wake=args.wake)
     if args.stt == "gigaam":
-        # Пробуем поднять сразу: если GigaAM не встал, честнее узнать об этом
-        # при запуске, чем на первой же фразе, когда человек уже говорит.
+        # Проверяем, что он вообще поднимется, прямо здесь: узнать об этом при
+        # запуске честнее, чем на первой же фразе, когда человек уже говорит.
+        # Сам прогрев дальше сделает общий поток — иначе он идёт дважды.
         кандидат = GigaAM(args.gigaam_model)
         try:
-            кандидат.warm()
+            import gigaam                      # noqa: F401
             слух = кандидат
         except Exception as e:                  # noqa: BLE001
             log.warning("GigaAM не поднялся (%s) — распознаю Whisper'ом", e)
@@ -1808,7 +1809,10 @@ def main() -> int:
     srv.daemon_threads = True
     log.info("мозг на %s:%d | модель %s | распознавание %s | голос %s | "
              "сборка %s", args.host, args.port, args.model,
-             args.whisper.rsplit("/", 1)[-1],
+             # Имя берём у того, кто и правда будет слушать: раньше здесь
+             # стоял аргумент командной строки, и шапка бодро сообщала про
+             # Whisper, когда работал GigaAM.
+             cfg.whisper.size.rsplit("/", 1)[-1],
              args.voice if cfg.voice is not None else "робота", _build())
     log.info("на роботе: ROBOT_PC_URL=http://<адрес этого ПК>:%d", args.port)
 
