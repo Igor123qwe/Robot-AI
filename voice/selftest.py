@@ -1166,6 +1166,69 @@ def прогон_фраз(схема, шумно: bool = False) -> list[float]:
     return [round((len(w) - 44) / 2 / 16000, 1) for w in l.utterances()]
 
 
+def test_odometry() -> None:
+    """Движение кончается по одометрии, а не по секундомеру.
+
+    По секундомеру «полметра» — это «две с половиной секунды на такой-то
+    скорости». Разгон при этом никто не считает, шасси недобирает скорость, и
+    робот проезжает меньше обещанного: разворот «на сто восемьдесят» выходит
+    градусов на сто двадцать. На живом роботе это и выглядело как
+    «разворачивается чуть-чуть».
+    """
+    import math
+    import types as _t
+
+    from robot_voice.ros import Ros
+
+    section("движение по одометрии")
+
+    class Шасси(Ros):
+        """Шасси, которое даёт шесть десятых от заказанной скорости."""
+
+        def __init__(self) -> None:
+            super().__init__("ws://нет")
+            self.x = self.yaw = 0.0
+            self._шаг = time.monotonic()
+            self._odom, self._odom_at = (0.0, 0.0, 0.0), time.monotonic()
+
+        def _send(self, что) -> None:
+            pass
+
+        def publish_twist(self, x=0.0, y=0.0, wz=0.0) -> None:
+            сейчас = time.monotonic()
+            прошло, self._шаг = сейчас - self._шаг, сейчас
+            self.x += x * 0.6 * прошло
+            self.yaw += wz * 0.6 * прошло
+            self._odom, self._odom_at = (self.x, 0.0, self.yaw), сейчас
+
+    робот = Шасси()
+    робот.drive(0.0, 0.0, 1.0, 3.14, угол=math.pi)
+    робот._motion.join(15)
+    повернулся = math.degrees(робот.yaw)
+    check("развернулся на сто восемьдесят, а не на сто двадцать",
+          170 <= повернулся <= 195, True)
+
+    поездка = Шасси()
+    поездка.drive(0.2, 0.0, 0.0, 10.0, путь=2.0)
+    поездка._motion.join(40)
+    check("проехал два метра, а не полтора",
+          1.9 <= поездка.x <= 2.2, True)
+
+    # Одометрии нет — едем по секундомеру, как раньше. Молчащее шасси не
+    # должно останавливать робота навсегда.
+    class Немой(Шасси):
+        @property
+        def odom(self):
+            return None
+
+    немой = Немой()
+    начало = time.monotonic()
+    немой.drive(0.2, 0.0, 0.0, 0.5, путь=2.0)
+    немой._motion.join(10)
+    check("без одометрии кончает по секундомеру",
+          time.monotonic() - начало < 3.0, True)
+
+
 def test_slicing() -> None:
     """Нарезка на фразы: что уезжает в распознавание, а что нет.
 
@@ -2983,7 +3046,7 @@ def main() -> int:
                  test_alarms, test_survives_restart, test_alarm_rules,
                  test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
-                 test_slicing, test_stop_while_thinking,
+                 test_odometry, test_slicing, test_stop_while_thinking,
                  test_speech_streams,
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,

@@ -553,7 +553,11 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         duration = distance / DRIVE_SPEED
         log.info("еду %s на %.2f м (%.1f с)", key, distance, duration)
         # Не блокируем: пока едем, робот должен слышать «стоп».
-        ros.drive(fx * DRIVE_SPEED, fy * DRIVE_SPEED, 0.0, duration)
+        # Расстояние передаём отдельно: если шасси докладывает одометрию,
+        # поездка кончится по ней, а не по секундомеру. Разницу видно на глаз —
+        # по времени робот всегда недоезжает, потому что разгон не в счёт.
+        ros.drive(fx * DRIVE_SPEED, fy * DRIVE_SPEED, 0.0, duration,
+                  путь=distance)
         return f"Еду {key} {_say_distance(distance)}."
 
     def turn(direction: str, degrees: float = 90.0) -> str:
@@ -570,9 +574,10 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             return blocked
 
         degrees = max(5.0, min(MAX_ANGLE, abs(float(degrees))))
-        duration = (degrees * 3.14159265 / 180.0) / TURN_SPEED
+        радиан = degrees * 3.14159265 / 180.0
+        duration = радиан / TURN_SPEED
         log.info("разворачиваюсь %s на %.0f° (%.1f с)", key, degrees, duration)
-        ros.drive(0.0, 0.0, sign * TURN_SPEED, duration)
+        ros.drive(0.0, 0.0, sign * TURN_SPEED, duration, угол=радиан)
         turn_words = ru.count(int(round(degrees)), "градус", "градуса", "градусов")
         return f"Разворачиваюсь {key} на {turn_words}."
 
