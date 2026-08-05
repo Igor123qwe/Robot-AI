@@ -607,6 +607,36 @@ def test_repair() -> None:
     check("пункт списка не тронут", m.args["item"] if m else None, "сгущенку")
 
 
+def test_looped() -> None:
+    """Зацикленный бред не должен доходить до модели.
+
+    На живом роботе пришло «Ууууу…» на двести двадцать знаков — с ВЫСОКОЙ
+    уверенностью (−0.07), поэтому барьер по уверенности его пропустил. Дальше
+    мусор ушёл в языковую модель, та выдала восемь тысяч токенов, робот молчал
+    полминуты и потерял две тысячи кадров звука. Одна мусорная фраза выводила
+    его из строя.
+    """
+    from robot_voice.stt import зациклилось
+
+    section("зацикливание распознавания")
+    for текст, ждём, имя in (
+        ("У" * 220, True, "петля из живого лога"),
+        ("сантиметров, " * 30, True, "повтор подсказки"),
+        ("а" * 60, True, "одна буква до упора"),
+        ("х" * 45 + " вперёд", True, "склеенное слово"),
+        # А это настоящая речь, и терять её нельзя.
+        ("Кузя, привет!", False, "обычная фраза"),
+        ("Ммм, дай подумать", False, "мычание"),
+        ("Ааа, понял!", False, "восклицание"),
+        ("стоп стоп стоп", False, "повтор слова — так и говорят"),
+        ("нет нет нет", False, "и ещё один"),
+        ("Кузя, проедь вперёд два метра и потом развернись налево",
+         False, "длинная команда целиком"),
+        ("", False, "пусто"),
+    ):
+        check(f"«{имя}»", зациклилось(текст), ждём)
+
+
 def test_made_up() -> None:
     """Заученные концовки роликов — это не речь, а память Whisper.
 
@@ -1492,6 +1522,7 @@ def test_endpoints() -> None:
         b.endpoints[1].client = client(cloud)
         return b
 
+    cfg_общий = Config()
     b = brain(pc="с ПК", cloud="из облака")
     check("ПК включён — отвечает он", b.reply("привет", lambda s: None), "с ПК")
     check("бесплатный ответ в деньги не пишем", (b.total_in, b.total_out), (0, 0))
@@ -1553,6 +1584,19 @@ def test_endpoints() -> None:
     # повторит и получит то же самое.
     check("про нашу ошибку сказано честно",
           "Повторять бесполезно" in _failure_phrase(схема), True)
+
+    # У домашней модели свой предел ответа, и он маленький. Общий большой —
+    # потому что облачная модель размышляет, и размышления идут в тот же счёт.
+    # Домашней столько не нужно: на зацикленную фразу она выдала восемь тысяч
+    # токенов и говорила полминуты, теряя звук.
+    from robot_voice.brain import МЕСТНЫЙ_ПРЕДЕЛ
+    b = brain(pc="с ПК", cloud="из облака")
+    свой = {e.name.startswith("ПК"): (e.max_tokens or cfg_общий.max_tokens)
+            for e in b.endpoints}
+    check("у домашней модели предел свой и маленький",
+          свой.get(True), МЕСТНЫЙ_ПРЕДЕЛ)
+    check("у облака остался общий", свой.get(False), cfg_общий.max_tokens)
+    check("и он заметно больше", cfg_общий.max_tokens > МЕСТНЫЙ_ПРЕДЕЛ * 4, True)
 
     # Без облачного ключа облачного собеседника быть не должно: вместо обрыва
     # связи оттуда прилетит отказ авторизации, и запасного пути не станет.
@@ -2915,7 +2959,7 @@ def test_pult_and_server_agree() -> None:
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
-                 test_weather, test_notes, test_repair, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
+                 test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,

@@ -649,29 +649,22 @@ def test_unthink() -> None:
     check("один ответ без тега не отменяет доказанного", привычка.get("м"), True)
 
 
-def test_wake_hint() -> None:
-    """Имя робота подсказывается распознаванию заранее.
+def test_no_initial_prompt() -> None:
+    """Подсказки распознаванию быть не должно, и это проверяется.
 
-    Без подсказки Whisper превращал «Кузя» в «Уйди», «Кулям», «Кудяка»,
-    «Кульдер» — и робот отвечал «не мне» на прямое обращение. Человек звал,
-    робот молчал, и оба считали виноватым другого. Имя — единственное слово,
-    по которому он понимает, что зовут его, и слышит он его хуже всего:
-    короткое и редкое.
+    Её уже пробовали и убрали: на шумной или тихой записи Whisper начинает
+    повторять слова из подсказки, разгоняя генерацию до предела, и секунда
+    звука разбирается полминуты. Написано в voice/robot_voice/stt.py, а
+    проверки не было — и подсказку вернули заново, не заметив. Теперь не выйдет.
     """
-    section("подсказка имени распознаванию")
-    w = kuzya_pc.Whisper("small", wake="Кузя")
-    подсказка = w.hint
-    check("имя в подсказке есть", "Кузя" in подсказка, True)
-    check("подсказка — обычные фразы, а не список",
-          подсказка.count(",") >= 2, True)
-    # Длинная подсказка начинает вылезать в самом ответе — это известная
-    # беда initial_prompt, поэтому держим её короткой.
-    check("подсказка короткая", len(подсказка) < 200, True)
-    # Имя настраивается: робота могут звать иначе, и тогда подсказка обязана
-    # смениться вместе с ним, а не остаться про Кузю.
-    другой = kuzya_pc.Whisper("small", wake="Робик")
-    check("чужое имя подставилось", "Робик" in другой.hint, True)
-    check("и старого не осталось", "Кузя" in другой.hint, False)
+    section("подсказки распознаванию нет")
+    исходник = (Path(__file__).resolve().parent / "kuzya_pc.py"
+                ).read_text(encoding="utf-8")
+    живой = [с for с in исходник.splitlines()
+             if "initial_prompt" in с and not с.strip().startswith("#")]
+    check("initial_prompt не передаётся в модель", живой, [])
+    check("и почему — записано рядом",
+          "initial_prompt" in исходник, True)
 
 
 def test_stt_confidence() -> None:
@@ -736,7 +729,7 @@ def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
     for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch,
                  test_tool_call, test_broken,
-                 test_unthink, test_wake_hint, test_stt_confidence, test_health):
+                 test_unthink, test_no_initial_prompt, test_stt_confidence, test_health):
         test()
         print("   ...")
     if FAILED:
