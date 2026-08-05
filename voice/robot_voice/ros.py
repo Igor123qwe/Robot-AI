@@ -267,6 +267,29 @@ class Ros:
 
         Отмена осталась ровно там, где нужна, — в stop_motion по слову «стоп».
         """
+        self._пустить(self._motion_loop, (x, y, wz, duration),
+                      {"путь": путь, "угол": угол})
+
+    def run_route(self, шаги: list[dict]) -> None:
+        """Несколько движений подряд — одной программой, одним потоком.
+
+        Зачем отдельно от drive. Фигуру вроде зигзага или круга нельзя собрать
+        из отдельных вызовов drive: каждый ждёт предыдущий в ОЧЕРЕДЬ_ЖДЁМ, и
+        двенадцать шагов заняли бы главный цикл на всё время поездки — робот
+        перестал бы слышать «стоп» ровно тогда, когда он нужнее всего.
+
+        Здесь наоборот: управление возвращается сразу, а шаги отсчитывает
+        отдельный поток. Поток этот — тот же самый self._motion, поэтому
+        снаружи маршрут неотличим от обычной поездки: moving и busy правдивы,
+        а stop_motion обрывает не текущий шаг, а всю программу целиком.
+
+        Каждый шаг — словарь аргументов _motion_loop: x, y, wz, duration и,
+        если есть одометрия, путь с углом.
+        """
+        self._пустить(self._route_loop, (list(шаги),), {})
+
+    def _пустить(self, цель, args: tuple, kwargs: dict) -> None:
+        """Общее начало любого движения: дождаться прежнего и завести поток."""
         предыдущее = self._motion
         if (предыдущее is not None and предыдущее.is_alive()
                 and предыдущее is not threading.current_thread()):
@@ -282,10 +305,25 @@ class Ros:
         # всё хорошо.
         with self._lock:
             self._own_zero_at = 0.0
-        self._motion = threading.Thread(
-            target=self._motion_loop, args=(x, y, wz, duration),
-            kwargs={"путь": путь, "угол": угол}, daemon=True)
+        self._motion = threading.Thread(target=цель, args=args, kwargs=kwargs,
+                                        daemon=True)
         self._motion.start()
+
+    def _route_loop(self, шаги: list[dict]) -> None:
+        """Шаги маршрута по очереди, с оглядкой на «стоп» между ними.
+
+        Отмену проверяем и здесь, а не только внутри шага: _motion_loop от
+        неё выходит молча, и без этой проверки маршрут после «стоп» просто
+        поехал бы дальше со следующего колена.
+        """
+        всего = len(шаги)
+        for номер, шаг in enumerate(шаги, 1):
+            if self._motion_cancel.is_set():
+                log.info("маршрут прерван на шаге %d из %d", номер, всего)
+                return
+            log.info("маршрут: шаг %d из %d", номер, всего)
+            self._motion_loop(**шаг)
+        log.info("маршрут пройден, шагов %d", всего)
 
     def _motion_loop(self, x: float, y: float, wz: float, duration: float,
                      *, путь: float = 0.0, угол: float = 0.0) -> None:

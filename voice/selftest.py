@@ -1119,19 +1119,215 @@ def test_unsure_does_not_drive() -> None:
     addressed.sure = False
     check("расслышали плохо — не едем",
           tools["drive"]({"direction": "вперёд"}),
-          "Не уверен, что расслышал. Повтори, пожалуйста.")
+          "Не уверен, что расслышал. Повтори-ка.")
     check("и разворот тоже",
           tools["turn"]({"direction": "влево"}),
-          "Не уверен, что расслышал. Повтори, пожалуйста.")
+          "Не уверен, что расслышал. Повтори-ка.")
+    check("и маршрут тоже",
+          tools["route"]({"steps": [{"move": "вперёд"}, {"turn": "влево"}]}),
+          "Не уверен, что расслышал. Повтори-ка.")
 
     addressed.by_name, addressed.sure = False, True
-    check("без имени — прежний ответ",
+    check("без имени не едем",
           tools["drive"]({"direction": "вперёд"}),
-          "Для поездки позови меня по имени.")
+          "Позови меня по имени — тогда поеду.")
+    # Второй отказ подряд — коротко. Полную формулу робот уже произнёс,
+    # повторять её каждые полминуты и значит «говорить казённо».
+    check("а второй раз за минуту — в два слова",
+          tools["drive"]({"direction": "вперёд"}), "Только по имени.")
+    check("отказ виден снаружи", addressed.отказ, "Только по имени.")
 
     # «Стоп» не должен ни от чего зависеть: он останавливает, а не запускает.
     addressed.by_name = addressed.sure = False
     check("стоп работает всегда", tools["stop"]({}).endswith("."), True)
+
+
+def test_route() -> None:
+    """Фигуру робот собирает сам, а не ищет в списке готовых сценариев.
+
+    Правил на все случаи не напасёшься: «проедь кругом», «зигзагом», «обойди
+    стол», «нарисуй восьмёрку» — каждое новое правило ловит ровно одну
+    формулировку и молчит на соседней. Поэтому шаги придумывает модель, а код
+    отвечает только за пределы и за то, что «стоп» обрывает всё разом.
+    """
+    section("свобода движений: маршрут придумывает модель")
+    from robot_voice.app import Addressed
+    from robot_voice.tools import (DRIVE_SPEED, MAX_DISTANCE, TURN_SPEED,
+                                   ШАГОВ_МАКС)
+
+    store = Path(tempfile.mkdtemp())
+    маршруты: list[list[dict]] = []
+    ros = types.SimpleNamespace(
+        voltage=12.4, moving=False, busy=False, connected=True,
+        drive=lambda *a, **k: None, stop_motion=lambda: None,
+        run_route=lambda шаги: маршруты.append(шаги))
+    addressed = Addressed()
+    tools = {t.name: t for t in build_tools(
+        ros, Timers(lambda *a, **k: None, store=store / "t.json"),
+        addressed=addressed)}
+
+    зигзаг = [
+        {"move": "вперёд", "distance": 0.4},
+        {"turn": "влево", "degrees": 45},
+        {"move": "вперёд", "distance": 0.4},
+        {"turn": "вправо", "degrees": 45},
+    ]
+    ответ = tools["route"]({"steps": зигзаг, "name": "зигзаг"})
+    check("сказал словом человека, а не по-роботски",
+          ответ, "Делаю зигзаг, четыре шага.")
+    check("шаги ушли на шасси", len(маршруты[-1]), 4)
+    check("первый шаг едет вперёд", маршруты[-1][0]["x"] > 0, True)
+    check("второй шаг крутится влево", маршруты[-1][1]["wz"] > 0, True)
+    check("а вправо — в другую сторону", маршруты[-1][3]["wz"] < 0, True)
+
+    # Ехать и поворачивать одним шагом — это дуга, из дуг складывается круг.
+    # Ни колёса, ни разворот при этом не должны выйти за свой предел: иначе
+    # шасси упрётся в собственный потолок и фигура поедет вкривь.
+    tools["route"]({"steps": [{"move": "вперёд", "distance": 0.5,
+                               "turn": "влево", "degrees": 90}] * 4,
+                    "name": "круг"})
+    дуга = маршруты[-1][0]
+    check("дуга едет", дуга["путь"] > 0, True)
+    check("и одновременно крутится", дуга["угол"] > 0, True)
+    check("скорость хода в пределах", abs(дуга["x"]) <= DRIVE_SPEED + 1e-9, True)
+    check("скорость разворота тоже", abs(дуга["wz"]) <= TURN_SPEED + 1e-9, True)
+
+    # Пределы. Модель вольна придумать что угодно, но робот живёт в комнате.
+    длинный = tools["route"]({"steps": [{"move": "вперёд", "distance": 0.1}] * 30})
+    check("длинный маршрут обрезан", len(маршруты[-1]), ШАГОВ_МАКС)
+    check("и об этом сказано вслух", "предел" in длинный, True)
+    check("шаг длиннее предела укорочен",
+          tools["route"]({"steps": [{"move": "вперёд", "distance": 99},
+                                    {"turn": "влево"}]})
+          and маршруты[-1][0]["путь"], MAX_DISTANCE)
+
+    check("пустой маршрут — отказ",
+          tools["route"]({"steps": []}), "Маршрут пустой — перечисли шаги.")
+    check("шаг ни о чём — отказ",
+          tools["route"]({"steps": [{}]}),
+          "В шаге маршрута нет ни move, ни turn.")
+    check("непонятное направление — отказ",
+          tools["route"]({"steps": [{"move": "вверх"}]}).startswith("Не понял"),
+          True)
+    # Модель однажды пришлёт число строкой — падать на этом целым инструментом
+    # незачем, у шага есть разумное умолчание.
+    tools["route"]({"steps": [{"move": "вперёд", "distance": ""},
+                              {"turn": "влево", "degrees": "сорок"}]})
+    check("мусор вместо числа не роняет маршрут", len(маршруты[-1]), 2)
+
+    # Шаг уезжает в шасси как есть, распакованный по именам. Разойдись эти
+    # имена с _motion_loop — маршрут упадёт уже на живом роботе, в потоке,
+    # где ошибку видно только в журнале.
+    import inspect
+
+    from robot_voice.ros import Ros
+    поля = set(inspect.signature(Ros._motion_loop).parameters) - {"self"}
+    check("шаг маршрута подходит шасси по именам",
+          set(маршруты[-1][0]) <= поля, True)
+
+    # И то же самое, что у drive: без имени не едем никуда, даже фигурой.
+    addressed.by_name = False
+    было = len(маршруты)
+    check("без имени маршрут не поедет",
+          tools["route"]({"steps": зигзаг}), "Позови меня по имени — тогда поеду.")
+    check("и на шасси ничего не ушло", len(маршруты), было)
+
+
+def test_no_broken_promise() -> None:
+    """Обещание поездки и отказ в ней не звучат одной фразой.
+
+    Живой случай, из-за которого разговор выглядел глупее всего. Человек
+    сказал что-то в открытом окне разговора, не позвав робота по имени;
+    модель успела написать «Еду вперёд на метр», инструмент отказал, модель
+    пересказала отказ своими словами — и робот произнёс вслух «Еду вперёд на
+    метр. Похоже, нужно обратиться ко мне по имени». Поехал или нет — по этой
+    фразе понять нельзя.
+    """
+    import contextlib as _c
+
+    section("обещание поездки без поездки не звучит")
+    from robot_voice import app
+    from robot_voice.app import Addressed
+
+    произнесено: list[str] = []
+
+    class Поток:
+        def feed(self, текст: str) -> None:
+            произнесено.append(текст)
+
+        def close(self) -> None:
+            pass
+
+    class FakeVoice:
+        speaker = types.SimpleNamespace(stream=lambda **kw: Поток(), last_said="")
+
+        def say(self, text, **kw):
+            произнесено.append(text)
+            return 1
+
+        def hold(self):
+            return _c.nullcontext()
+
+        def quiet(self):
+            return _c.nullcontext()
+
+        def status(self, *a, **k):
+            pass
+
+    store = Path(tempfile.mkdtemp())
+    ros = types.SimpleNamespace(voltage=12.4, moving=False, busy=False,
+                                connected=True, drive=lambda *a, **k: None,
+                                stop_motion=lambda: None,
+                                run_route=lambda шаги: None)
+    addressed = Addressed()
+    tools = {t.name: t for t in build_tools(
+        ros, Timers(lambda *a, **k: None, store=store / "t.json"),
+        addressed=addressed)}
+
+    class Обещающий:
+        """Модель ровно с тем поведением, что было в журнале робота."""
+
+        last_talk = 0.0
+
+        def __init__(self) -> None:
+            self.позвал: list[str] = []
+
+        def reply(self, text, on_text, smart=False):
+            on_text("Еду вперёд на метр. ")
+            self.позвал = ["drive"]
+            tools["drive"]({"direction": "вперёд"})
+            on_text("Похоже, нужно обратиться ко мне по имени. ")
+            on_text("Скажи: «Кузя, поезжай вперёд».")
+            return ""
+
+        def reset(self) -> None:
+            pass
+
+    addressed.by_name, addressed.sure = False, True
+    addressed.отказ = ""
+    app._respond("а поезжай-ка вперёд", Обещающий(), FakeVoice(),
+                 addressed=addressed)
+    сказанное = " ".join(произнесено)
+    check("обещание поездки не прозвучало", "Еду вперёд" in сказанное, False)
+    check("нотация про имя — тоже", "обратиться" in сказанное, False)
+    check("а прозвучал ровно отказ, одной строкой",
+          [с.strip() for с in произнесено], ["Позови меня по имени — тогда поеду."])
+
+    # Когда ехать можно, ничего этого нет: ответ идёт как раньше, потоком.
+    произнесено.clear()
+    addressed.by_name = addressed.sure = True
+    addressed.отказ = ""
+
+    class Обычный(Обещающий):
+        def reply(self, text, on_text, smart=False):
+            self.позвал = ["drive"]
+            tools["drive"]({"direction": "вперёд"})
+            on_text("Еду вперёд на метр.")
+            return "Еду вперёд на метр."
+
+    app._respond("поезжай вперёд", Обычный(), FakeVoice(), addressed=addressed)
+    check("по имени робот говорит как обычно",
+          [с.strip() for с in произнесено], ["Еду вперёд на метр."])
 
 
 def прогон_фраз(схема, шумно: bool = False) -> list[float]:
@@ -1278,6 +1474,33 @@ def test_motion_queue() -> None:
     стоп.stop_motion()
     check("«стоп» не ждёт очереди", time.monotonic() - время < 3.0, True)
     check("и движение прекратилось", стоп.moving, False)
+
+    # --- маршрут: несколько шагов одной программой ---
+    #
+    # Собрать фигуру из отдельных вызовов drive нельзя: каждый ждёт предыдущий
+    # в очереди, и двенадцать шагов заняли бы главный цикл на всю поездку —
+    # робот перестал бы слышать «стоп» ровно там, где он нужнее всего.
+    def шаг(x: float, путь: float = 0.2) -> dict:
+        return {"x": x, "y": 0.0, "wz": 0.0, "duration": 5.0,
+                "путь": путь, "угол": 0.0}
+
+    фигура = Шасси()
+    фигура.run_route([шаг(0.2), шаг(-0.2), шаг(0.2)])
+    check("управление вернулось сразу, робот едет", фигура.moving, True)
+    фигура._motion.join(40)
+    check("все шаги проехались", sorted(set(фигура.куда)), [-1, 1])
+    check("и маршрут кончился сам", фигура.moving, False)
+
+    # «Стоп» посреди маршрута снимает всю программу, а не одно её колено.
+    # Иначе робот встанет на полсекунды и поедет дальше по своим делам —
+    # человек в этот момент уже кричит «стоп» второй раз.
+    оборвали = Шасси()
+    оборвали.run_route([шаг(0.2, путь=5.0), шаг(-0.2, путь=5.0)])
+    time.sleep(0.3)
+    оборвали.stop_motion()
+    оборвали._motion.join(5)
+    check("после «стоп» маршрут не продолжился", оборвали.moving, False)
+    check("и второе колено не поехало", -1 in оборвали.куда, False)
 
 
 def test_slicing() -> None:
@@ -2077,7 +2300,7 @@ def test_dialogue() -> None:
         transcribe=lambda wav: wav.decode()), brain, FakeVoice(), tools, addressed)
 
     check("поехал по имени", said[0].startswith("Еду вперёд"), True)
-    check("без имени не поехал", said[1], "Для поездки позови меня по имени.")
+    check("без имени не поехал", said[1], "Позови меня по имени — тогда поеду.")
     check("«отбой» остановил, а не усыпил", said[2], "Остановился.")
     check("колёса действительно встали", moved[-1], "stop")
     check("таймер поставлен", said[3], "Поставил таймер на пять минут.")
@@ -2121,7 +2344,7 @@ def test_dialogue() -> None:
     check("длинная чужая фраза не ушла модели",
           any("магазин" in s for s in said), False)
     check("модель без имени не поехала", said[-1],
-          "Для поездки позови меня по имени.")
+          "Позови меня по имени — тогда поеду.")
     check("колёса не тронулись", moved, [])
 
     # --- третий сценарий: имя не надо повторять в начатом разговоре ---
@@ -2146,6 +2369,36 @@ def test_dialogue() -> None:
     check("по имени поехал", said[0].startswith("Еду вперёд"), True)
     check("и следом без имени тоже", said[1], "Еду назад метр.")
     check("круги сделал, а не рассказал о них", said[2], "Кручусь два круга.")
+
+    # --- четвёртый сценарий: пустое «да» в окне разговора ---
+    #
+    # Живая жалоба: «нету живого диалога». В открытом окне слышно всё, что
+    # звучит в комнате, и человеческое «да» кому-то другому уходило модели.
+    # Та отвечала тем, чем отвечают на пустоту: «Понял, Игорь. Готов к
+    # следующему. Что нужно?» — три казённые фразы на ровном месте. Живой
+    # человек на чужое «да» молчит.
+    said.clear()
+    addressed = app.Addressed()
+    tools4 = build_tools(ros, timers, addressed=addressed)
+    молчун = FakeBrain()
+    app._listen_loop(cfg3, FakeListener([
+        "Кузя который час",
+        "да",                      # не роботу — молчим
+        "ага",                     # и на это тоже
+    ]), types.SimpleNamespace(transcribe=lambda wav: wav.decode()),
+        молчун, FakeVoice(), tools4, addressed)
+    check("пустое «да» не ушло модели", молчун.asked, [])
+
+    # Но если робот только что сам спросил — «да» это ответ ему, и молчать
+    # в этом месте было бы хуже прежнего.
+    спросили = FakeVoice()
+    спросили.speaker = types.SimpleNamespace(stream=lambda **kw: None,
+                                             last_said="Поставить таймер?")
+    отвечающий = FakeBrain()
+    app._listen_loop(cfg3, FakeListener(["Кузя да"]),
+                     types.SimpleNamespace(transcribe=lambda wav: wav.decode()),
+                     отвечающий, спросили, tools4, addressed)
+    check("а ответ на вопрос робота дошёл", отвечающий.asked, ["да"])
 
 
 def test_music_queue() -> None:
@@ -3192,8 +3445,14 @@ def test_chain() -> None:
     check("«что там впереди» — не требование ехать",
           просят_ехать("а что там впереди"), False)
 
-    check("движение — это drive, turn и stop", sorted(ДВИЖЕНИЕ),
-          ["drive", "stop", "turn"])
+    # route входит в движение наравне с drive: по этому списку решается, поехал
+    # робот на самом деле или только рассказал о поездке. Забыть его тут —
+    # значит на «проедь зигзагом» получить «Не понял, куда ехать» поверх уже
+    # начавшейся поездки.
+    check("движение — это drive, turn, stop и route", sorted(ДВИЖЕНИЕ),
+          ["drive", "route", "stop", "turn"])
+    from robot_voice.intents import ЦЕПОЧКОЙ
+    check("а цепочкой правил route не собирается", "route" in ЦЕПОЧКОЙ, False)
 
 
 def test_no_narration() -> None:
@@ -3327,7 +3586,8 @@ def main() -> int:
                  test_alarms, test_survives_restart, test_alarm_rules,
                  test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
-                 test_odometry, test_motion_queue, test_chain, test_no_narration,
+                 test_odometry, test_motion_queue, test_route,
+                 test_no_broken_promise, test_chain, test_no_narration,
                  test_one_voice,
                  test_slicing, test_stop_while_thinking,
                  test_speech_streams,
