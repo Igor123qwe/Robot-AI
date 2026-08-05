@@ -2079,6 +2079,23 @@ def test_degraded() -> None:
     ros = _t.SimpleNamespace(voltage=None)
     listener = _t.SimpleNamespace(pump=_t.SimpleNamespace(alive=True))
 
+    # Признак берём у НАСТОЯЩЕГО класса, а не у заглушки. Заглушка тут стояла
+    # раньше — и покрывала мёртвый код: свойство «сам_разбираю» было объявлено
+    # не на том классе и не работало ни разу за всю жизнь робота, а тест этого
+    # не видел, потому что проверял SimpleNamespace с нужным полем.
+    from robot_voice.stt import Recognizer as _Recognizer
+    from robot_voice.stt import Remote as _Remote
+
+    check("признак «разбираю сам» живёт на том, кто знает про ПК",
+          hasattr(_Remote("http://пк/stt", lambda: None), "сам_разбираю"), True)
+    # А getattr с умолчанием такую ошибку проглатывает молча — вот как это
+    # выглядело: свойство вроде есть, а читается как False.
+    check("и читается без исключения",
+          getattr(_Remote("http://пк/stt", lambda: None), "сам_разбираю", "нет"),
+          False)
+    check("у своего распознавания его нет вовсе",
+          hasattr(_Recognizer.__new__(_Recognizer), "сам_разбираю"), False)
+
     слух = _t.SimpleNamespace(сам_разбираю=False)
     мозг = _t.SimpleNamespace(ответил="", endpoints=[
         _t.SimpleNamespace(name="ПК"), _t.SimpleNamespace(name="облако")])
@@ -2129,6 +2146,12 @@ def test_degraded() -> None:
         return _t.SimpleNamespace(transcribe=lambda w: "", confidence=0.9)
 
     слух2 = Remote("http://пк:4000/stt", сделать_модель)
+    # И признак «разбираю сам» обязан загораться по-настоящему: ПК не ответил
+    # — робот перешёл на свои силы и должен об этом сказать вслух.
+    check("пока ПК жив — признак погашен", слух2.сам_разбираю, False)
+    слух2._down_until = time.monotonic() + 60
+    check("ПК замолчал — признак загорелся", слух2.сам_разбираю, True)
+    слух2._down_until = 0.0
     check("до прогрева модель не грузится", поднято, [])
     слух2.прогреть()
     check("прогрев поднял модель", поднято, [1])
