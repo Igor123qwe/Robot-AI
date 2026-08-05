@@ -912,7 +912,15 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # или нет, и начинает повторять всё громче. Но говорить это на
             # каждый шорох тоже нельзя — иначе шум на кухне зациклит робота
             # на одной фразе. Поэтому только на первый неразобранный подряд.
-            if time.monotonic() < awake_until and not deaf:
+            #
+            # И только если что-то действительно прозвучало. Пустой разбор —
+            # это тишина, а не неудачная фраза: отзываться на неё «не
+            # расслышал» значит спорить с человеком, который молчал. На живом
+            # роботе так и вышло — он говорил это после каждой поездки, потому
+            # что слышал собственные моторы и разбирал их в пустоту.
+            слышно = bool(text.strip())
+            занят = ros is not None and ros.busy
+            if слышно and not занят and time.monotonic() < awake_until and not deaf:
                 voice.say("Не расслышал.")
                 awake_until = time.monotonic() + cfg.session_seconds
             deaf = True

@@ -1229,6 +1229,57 @@ def test_odometry() -> None:
           time.monotonic() - начало < 3.0, True)
 
 
+def test_motion_queue() -> None:
+    """Движения идут по очереди, а не отменяют друг друга.
+
+    «Проедь вперёд, а потом назад» кончалось одним движением назад: модель
+    звала оба инструмента в одну и ту же секунду, а второй вызов первым делом
+    отменял первый. Робот дёргался и уезжал не туда — человек видел, что
+    сложные просьбы он не выполняет.
+    """
+    import types as _t
+
+    from robot_voice.ros import Ros
+
+    section("очередь движений")
+
+    class Шасси(Ros):
+        def __init__(self) -> None:
+            super().__init__("ws://нет")
+            self.x = self.yaw = 0.0
+            self._шаг = time.monotonic()
+            self._odom, self._odom_at = (0.0, 0.0, 0.0), time.monotonic()
+            self.куда: list[int] = []
+
+        def _send(self, что) -> None:
+            pass
+
+        def publish_twist(self, x=0.0, y=0.0, wz=0.0) -> None:
+            сейчас = time.monotonic()
+            прошло, self._шаг = сейчас - self._шаг, сейчас
+            self.x += x * прошло
+            self._odom, self._odom_at = (self.x, 0.0, self.yaw), сейчас
+            if abs(x) > 1e-3:
+                self.куда.append(1 if x > 0 else -1)
+
+    робот = Шасси()
+    робот.drive(0.2, 0.0, 0.0, 5.0, путь=0.4)      # вперёд
+    робот.drive(-0.2, 0.0, 0.0, 5.0, путь=0.4)     # и следом назад
+    робот._motion.join(30)
+    check("вперёд робот всё-таки поехал", 1 in робот.куда, True)
+    check("и назад тоже", -1 in робот.куда, True)
+    check("и вернулся примерно на место", abs(робот.x) < 0.15, True)
+
+    # А «стоп» обязан обрывать движение немедленно, а не ждать очереди: это
+    # единственная команда, которую человек говорит, когда уже страшно.
+    стоп = Шасси()
+    стоп.drive(0.2, 0.0, 0.0, 30.0, путь=5.0)
+    время = time.monotonic()
+    стоп.stop_motion()
+    check("«стоп» не ждёт очереди", time.monotonic() - время < 3.0, True)
+    check("и движение прекратилось", стоп.moving, False)
+
+
 def test_slicing() -> None:
     """Нарезка на фразы: что уезжает в распознавание, а что нет.
 
@@ -3046,7 +3097,7 @@ def main() -> int:
                  test_alarms, test_survives_restart, test_alarm_rules,
                  test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
-                 test_odometry, test_slicing, test_stop_while_thinking,
+                 test_odometry, test_motion_queue, test_slicing, test_stop_while_thinking,
                  test_speech_streams,
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,
