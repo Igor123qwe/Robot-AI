@@ -2030,7 +2030,10 @@ def test_dialogue() -> None:
 
     class FakeBrain:
         last_talk = 0.0
-        def __init__(self): self.asked: list[str] = []
+        # Какие инструменты позваны на последнем ходу. По этому списку цикл
+        # отличает поездку от рассказа о поездке, поэтому у заглушки он тоже
+        # должен быть — иначе проверка молча уходит в исключение.
+        def __init__(self): self.asked: list[str] = []; self.позвал: list[str] = []
         def reply(self, text, on_text, smart=False):
             self.asked.append(text)
             on_text("Отвечаю модели.")
@@ -2066,6 +2069,10 @@ def test_dialogue() -> None:
     ]
     brain = FakeBrain()
     cfg = Config()
+    # Строгий порядок: имя обязательно на КАЖДОЙ команде движения. По
+    # умолчанию он мягче (см. ниже), но выключать строгость человек вправе, и
+    # она должна работать.
+    cfg.motion_name_once = False
     app._listen_loop(cfg, FakeListener(phrases), types.SimpleNamespace(
         transcribe=lambda wav: wav.decode()), brain, FakeVoice(), tools, addressed)
 
@@ -2093,6 +2100,7 @@ def test_dialogue() -> None:
     class DrivingBrain(FakeBrain):
         def reply(self, text, on_text, smart=False):
             self.asked.append(text)
+            self.позвал = ["drive"]
             answer = by_name["drive"]({"direction": "вперёд"})
             on_text(answer)
             said.append(answer)     # чтобы увидеть, что ответил инструмент
@@ -2115,6 +2123,29 @@ def test_dialogue() -> None:
     check("модель без имени не поехала", said[-1],
           "Для поездки позови меня по имени.")
     check("колёса не тронулись", moved, [])
+
+    # --- третий сценарий: имя не надо повторять в начатом разговоре ---
+    #
+    # Живая жалоба: «команды по движению делает через раз». Человек говорит
+    # «Кузя, вперёд», робот едет, а через три секунды на «теперь назад»
+    # слышит «позови меня по имени» — хотя звал секунду назад. Послабление
+    # даётся только команде, разобранной ПРАВИЛОМ: «поезжай на кухню» уходит
+    # модели, и там имя по-прежнему обязательно (это проверено выше).
+    said.clear()
+    moved.clear()
+    addressed = app.Addressed()
+    tools3 = build_tools(ros, timers, addressed=addressed)
+    cfg3 = Config()
+    app._listen_loop(cfg3, FakeListener([
+        "Кузя вперёд",             # по имени — едет
+        "метр назад",              # без имени, но правилом и в разговоре
+        "два круга вокруг себя",   # и круги тоже
+    ]), types.SimpleNamespace(transcribe=lambda wav: wav.decode()),
+        FakeBrain(), FakeVoice(), tools3, addressed)
+
+    check("по имени поехал", said[0].startswith("Еду вперёд"), True)
+    check("и следом без имени тоже", said[1], "Еду назад метр.")
+    check("круги сделал, а не рассказал о них", said[2], "Кручусь два круга.")
 
 
 def test_music_queue() -> None:
@@ -3092,12 +3123,213 @@ def test_pult_and_server_agree() -> None:
     check("каждый адрес пульта есть на сервере", несуществующие, [])
 
 
+def test_chain() -> None:
+    """Составные команды движения — правилами, а не моделью.
+
+    На живом роботе «метр вперёд и метр назад» ушло домашней модели, и та
+    ответила «Приехал вперёд. Теперь назад. Готов к следующему!», не позвав ни
+    одного инструмента. Робот не сдвинулся, а человек услышал отчёт о двух
+    поездках. Составные команды моделям такого размера не даются, поэтому
+    разбираем их сами.
+    """
+    from robot_voice.intents import ДВИЖЕНИЕ, parse_chain, просят_ехать
+
+    section("цепочки движений")
+
+    цепь = parse_chain("Метр вперёд и метр назад.")
+    check("«метр вперёд и метр назад» разобрано в два движения",
+          [(m.tool, m.args) for m in цепь or []],
+          [("drive", {"direction": "вперёд", "distance": 1.0}),
+           ("drive", {"direction": "назад", "distance": 1.0})])
+
+    # «Направо» у робота на меканум-колёсах — это движение боком, а не
+    # разворот: так же понимает его и одиночное правило.
+    цепь = parse_chain("проедь вперёд на два метра, потом направо")
+    check("«вперёд на два метра, потом направо» — тоже цепочка",
+          [(m.tool, m.args) for m in цепь or []],
+          [("drive", {"direction": "вперёд", "distance": 2.0}),
+           ("drive", {"direction": "вправо"})])
+
+    цепь = parse_chain("развернись и метр вперёд")
+    check("разворот с поездкой в одной фразе",
+          [(m.tool, m.args) for m in цепь or []],
+          [("turn", {"direction": "влево", "degrees": 180.0}),
+           ("drive", {"direction": "вперёд", "distance": 1.0})])
+
+    # Самое важное: цепочкой считаем ТОЛЬКО движения. Иначе длительность
+    # таймера «два часа и тридцать минут» развалилась бы на два таймера.
+    check("таймер с «и» внутри цепочкой не считается",
+          parse_chain("поставь таймер на 2 часа и 30 минут"), None)
+    check("разговор с «и» внутри цепочкой не считается",
+          parse_chain("расскажи про кошек и собак"), None)
+    check("одиночная команда — не цепочка", parse_chain("вперёд"), None)
+
+    # Расстояние впереди направления: так говорят не реже, а правило этого
+    # не знало, и фраза уходила модели.
+    check("«метр вперёд» разбирается и в одиночку",
+          (parse("метр вперёд").tool, parse("метр вперёд").args),
+          ("drive", {"direction": "вперёд", "distance": 1.0}))
+    check("«полметра назад» тоже",
+          parse("полметра назад").args,
+          {"direction": "назад", "distance": 0.5})
+    check("«два метра влево» тоже",
+          parse("два метра влево").args,
+          {"direction": "влево", "distance": 2.0})
+
+    # Круги. «Сделай два круга» отвечало «Два круга сделано» — и не крутилось.
+    check("«сделай два круга вокруг себя» — это 720 градусов",
+          parse("сделай два круга вокруг себя").args.get("degrees"), 720.0)
+    check("«круг» без числа — один оборот",
+          parse("сделай круг").args.get("degrees"), 360.0)
+
+    # Признак «требуют ехать»: по нему ответ придерживается до конца хода,
+    # чтобы враньё про поездку не прозвучало вслух.
+    check("«поезжай вперёд» — требование ехать",
+          просят_ехать("поезжай вперёд"), True)
+    check("«развернись» — тоже", просят_ехать("Кузя, развернись"), True)
+    check("«два дня назад» — не требование ехать",
+          просят_ехать("это было два дня назад"), False)
+    check("«что там впереди» — не требование ехать",
+          просят_ехать("а что там впереди"), False)
+
+    check("движение — это drive, turn и stop", sorted(ДВИЖЕНИЕ),
+          ["drive", "stop", "turn"])
+
+
+def test_no_narration() -> None:
+    """Робот не отчитывается о том, чего не сделал.
+
+    Проверяем два независимых заслона. Первый — в постоянной части промпта не
+    должно быть готовых фраз об исполненном действии: как только там появились
+    «Приехал», «Готово», «Развернулся» в качестве примеров живой речи, модель
+    стала произносить их ВМЕСТО вызова инструмента. Второй — сам код: ответ на
+    команду движения придерживается, пока не станет видно, позван ли drive.
+    """
+    section("никакой отчётности вместо дела")
+
+    for фраза in ("«Приехал»", "«Развернулся»", "«Готово»"):
+        check(f"в промпте нет готового отчёта {фраза}",
+              фраза in SYSTEM_PROMPT, False)
+    check("в промпте сказано, что слова не заменяют инструмент",
+          "соврать" in SYSTEM_PROMPT, True)
+    check("и что на два действия зовут два инструмента",
+          "два инструмента" in SYSTEM_PROMPT, True)
+
+    источник = (Path(__file__).resolve().parent
+                / "robot_voice" / "app.py").read_text(encoding="utf-8")
+    check("ответ на команду движения придерживается",
+          "придержать = intents.просят_ехать" in источник, True)
+    check("и проверяется, позван ли инструмент движения",
+          "brain.позвал" in источник, True)
+
+
+def test_one_voice() -> None:
+    """Голос не должен меняться от фразы к фразе.
+
+    Кэш готовых фраз назывался тем голосом, что записан в настройках робота, а
+    выбирается голос на ПК ключом --voice. После смены голоса на ПК заготовки
+    («Да?», «Не расслышал.») продолжали звучать прежним голосом, а всё
+    остальное — новым: человек слышал, как посреди разговора прорезается
+    чужой голос, и понять причину было нельзя.
+    """
+    import io as _io
+    import wave as _wave
+
+    from robot_voice.tts import PC_DOWN, PC_DOWN_FIRST, RemoteVoice
+
+    section("один голос на весь разговор")
+
+    def wav(байт: int = 480) -> bytes:
+        буфер = _io.BytesIO()
+        with _wave.open(буфер, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(b"\0" * байт)
+        return буфер.getvalue()
+
+    class Ответ:
+        def __init__(self, голос: str) -> None:
+            self.headers = {"X-Voice": голос}
+            self._тело = wav()
+
+        def read(self) -> bytes:
+            return self._тело
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    class Здоровье:
+        def __init__(self, голос: str) -> None:
+            self._тело = json.dumps({"голос_чей": голос}).encode()
+
+        def read(self) -> bytes:
+            return self._тело
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        кэш = PhraseCache(Path(tmp), "пк-неизвестно")
+        пк = RemoteVoice("http://пк", "", кэш)
+        голос = {"чей": "eugene"}
+
+        def запрос(req, timeout=0):
+            адрес = req if isinstance(req, str) else req.full_url
+            return (Здоровье(голос["чей"]) if адрес.endswith("/health")
+                    else Ответ(голос["чей"]))
+
+        старый = tts_urlopen(запрос)
+        try:
+            первый = пк.raw("Да?")
+            check("голос ПК узнан", пк.голос, "eugene")
+            check("кэш назван по нему", кэш.voice, "пк-eugene")
+            check("звук получен", bool(первый), True)
+            check("и лёг в кэш", кэш.get("Да?") == первый, True)
+
+            # Меняем голос на ПК — так делает человек, перезапуская сервер с
+            # другим --voice. Заготовка старого голоса всплыть не должна, даже
+            # если эта фраза давно лежит в кэше и до ПК не доходит.
+            голос["чей"] = "aidar"
+            пк._голос_в = 0.0            # прошло пять минут
+            пк.raw("Да?")
+            check("кэш переименован вслед за голосом", кэш.voice, "пк-aidar")
+            check("заготовка прежнего голоса больше не всплывает",
+                  PhraseCache(Path(tmp), "пк-eugene").get("Да?") is not None
+                  and кэш.voice == "пк-aidar", True)
+        finally:
+            tts_urlopen(старый)
+
+    # Осечка связи не должна уводить робота на свой piper на целую минуту:
+    # голоса разные, и минута чужого голоса слышна отчётливо.
+    check("первая осечка стоит недолго", PC_DOWN_FIRST <= 10.0, True)
+    check("но выключенный ПК всё равно доберётся до минуты",
+          PC_DOWN >= 60.0, True)
+
+
+def tts_urlopen(новый):
+    """Подменяет urlopen внутри tts.py и возвращает прежний."""
+    from robot_voice import tts as _tts
+
+    старый = _tts.urllib.request.urlopen
+    _tts.urllib.request.urlopen = новый
+    return старый
+
+
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
                  test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
-                 test_odometry, test_motion_queue, test_slicing, test_stop_while_thinking,
+                 test_odometry, test_motion_queue, test_chain, test_no_narration,
+                 test_one_voice,
+                 test_slicing, test_stop_while_thinking,
                  test_speech_streams,
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,

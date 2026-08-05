@@ -580,6 +580,24 @@ def _dump_audio(wav: bytes, text: str) -> None:
         log.warning("не смог сохранить запись: %s", e)
 
 
+def _разобрать(command: str) -> tuple:
+    """Что робот умеет сделать по этой фразе сам, без модели.
+
+    Одиночное правило либо цепочка движений («метр вперёд и метр назад»).
+    Считаем один раз за реплику: разбор нужен и до решения «моё ли это», и
+    после — а regexp-ов тут на две сотни строк.
+    """
+    m = intents.parse(command)
+    return m, (None if m is not None else intents.parse_chain(command))
+
+
+def _команда_движения(rule, цепочка) -> bool:
+    """Разобрано ли правилом именно движение — а не разговор и не таймер."""
+    if цепочка:
+        return True
+    return rule is not None and rule.tool in intents.ДВИЖЕНИЕ
+
+
 def _is_sleep_word(command: str, sleep_words: tuple[str, ...]) -> bool:
     """Отпустили ли робота. Сравниваем фразу целиком, а не по вхождению:
     «спасибо» — прощание, «спасибо что напомнил про таймер» — нет."""
@@ -934,11 +952,8 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
 
         awake = time.monotonic() < awake_until
         command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
-        # Инструменты движения смотрят на эти два признака: ехать можно только
-        # по имени и только если фразу разобрали уверенно — кто бы ни попросил,
-        # правило или модель.
-        addressed.by_name = command is not None or not cfg.motion_needs_name
-        addressed.sure = sure is None or sure >= UNSURE_BELOW
+        по_имени = command is not None
+        разбор: tuple | None = None
 
         if command is None:
             if not awake:
@@ -949,18 +964,31 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # другим человеком. Длинную фразу без имени считаем не своей —
             # иначе робот платит модели за чужие реплики.
             command = text.strip()
-            rule = intents.parse(command)
-            if len(command.split()) > IN_SESSION_WORDS and rule is None:
+            разбор = _разобрать(command)
+            rule, цепочка = разбор
+            свои = rule is not None or цепочка is not None
+            if len(command.split()) > IN_SESSION_WORDS and not свои:
                 log.info("в окне, но длинно и не команда — не моё (%r)", command)
                 continue
             # Обращаются по имени, и имя не моё. Команду при этом слушаемся:
             # «Рома, стой» роботу тоже адресовано, если он едет.
             other = _VOCATIVE.match(command)
-            if rule is None and other and _clean_token(other.group(1)) not in _NOT_A_NAME:
+            if not свои and other and _clean_token(other.group(1)) not in _NOT_A_NAME:
                 log.info("зовут не меня, а %s — молчу (%r)", other.group(1), command)
                 continue
+            # Внутри начатого разговора имя можно не повторять, если движение
+            # разобрано правилом: почему именно так — в config.motion_name_once.
+            if cfg.motion_name_once and _команда_движения(rule, цепочка):
+                log.info("движение в открытом разговоре — имя не переспрашиваю")
+                по_имени = True
         elif not awake:
             log.info("проснулся по имени")
+
+        # Инструменты движения смотрят на эти два признака: ехать можно только
+        # по имени и только если фразу разобрали уверенно — кто бы ни попросил,
+        # правило или модель.
+        addressed.by_name = по_имени or not cfg.motion_needs_name
+        addressed.sure = sure is None or sure >= UNSURE_BELOW
 
         voice.heard(command or text)
 
@@ -997,7 +1025,9 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
 
         # Простые команды разбираем правилами: мгновенно, бесплатно и без
         # риска, что модель поймёт «влево» как «вправо». Всё остальное — модели.
-        match = intents.parse(command)
+        if разбор is None:
+            разбор = _разобрать(command)
+        match, цепочка = разбор
 
         # «Стоп» не должен ни за чем стоять в очереди. Раньше «отбой» на ходу
         # усыплял робота, а «стой» во время переспроса про таймеры считалось
@@ -1031,6 +1061,15 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         elif match is not None and match.tool in by_name:
             _run_direct(by_name[match.tool], match.args, voice, pending, turn)
             undo.remember(match.tool, match.args)
+        elif цепочка:
+            # Движения выполняем по очереди и вслух отчитываемся о каждом.
+            # Второй вызов ждёт, пока доедет первый (см. Ros.drive), поэтому
+            # «Еду назад» звучит ровно тогда, когда робот и правда поехал
+            # назад, — а не в ту же секунду, что и «Еду вперёд».
+            for шаг in цепочка:
+                инструмент = by_name.get(шаг.tool)
+                if инструмент is not None:
+                    _run_direct(инструмент, шаг.args, voice, turn=turn)
         else:
             # Помечаем явно: по этим строкам в логе видно, каких формулировок
             # не хватает правилам. Это лучший источник для их пополнения —
@@ -1239,7 +1278,20 @@ def _caught_stop(wav: bytes, recognizer, ros) -> bool:
 
 def _respond(command: str, brain: Brain, voice: Voice,
              recognizer=None, ros=None, turn=None) -> None:
-    """Отвечает вслух, проговаривая предложения по мере генерации."""
+    """Отвечает вслух, проговаривая предложения по мере генерации.
+
+    С одним исключением: если человек велел ехать, ответ придерживается до
+    конца хода. Причина в живом случае. На «метр вперёд и метр назад» домашняя
+    модель ответила «Приехал вперёд. Теперь назад. Готов к следующему!» — и не
+    позвала ни одного инструмента. Робот не сдвинулся, а человек услышал отчёт
+    о двух поездках и узнал правду, только обернувшись. Такое враньё хуже
+    отказа, и произносить его нельзя вовсе: сказанное вслух не вернёшь.
+
+    Поэтому на командах движения потоковость отключается — и это дёшево.
+    Ответ на «поезжай вперёд» это одна короткая фраза, а не рассказ: терять
+    тут нечего, кроме доли секунды.
+    """
+    придержать = intents.просят_ехать(command)
     buffer = SentenceBuffer()
     # Хвост снимаем в момент, когда робот собирается заговорить: дальше в нём
     # будет уже его собственный голос, и искать в этом «стоп» бессмысленно.
@@ -1266,14 +1318,22 @@ def _respond(command: str, brain: Brain, voice: Voice,
                 stack.enter_context(voice.quiet())
                 speaking = True
 
+        придержанное: list[str] = []
+
+        def произнести(sentence: str) -> None:
+            log.info("робот: %s", sentence)
+            start_speaking()
+            if turn is not None:
+                turn.spoke("модель")
+            if speech:
+                speech.feed(sentence)
+
         def on_text(chunk: str) -> None:
             for sentence in buffer.push(chunk):
-                log.info("робот: %s", sentence)
-                start_speaking()
-                if turn is not None:
-                    turn.spoke("модель")
-                if speech:
-                    speech.feed(sentence)
+                if придержать:
+                    придержанное.append(sentence)
+                else:
+                    произнести(sentence)
 
         said = ""
         try:
@@ -1287,10 +1347,25 @@ def _respond(command: str, brain: Brain, voice: Voice,
             said = brain.reply(command, on_text, smart)
             tail = buffer.flush()
             if tail:
-                log.info("робот: %s", tail)
-                start_speaking()
-                if speech:
-                    speech.feed(tail)
+                if придержать:
+                    придержанное.append(tail)
+                else:
+                    произнести(tail)
+
+            if придержать:
+                # Ход кончился — теперь видно, поехал робот или только сказал.
+                поехал = any(и in intents.ДВИЖЕНИЕ for и in brain.позвал)
+                if not поехал:
+                    log.warning("просили ехать (%r), а инструмент не позван; "
+                                "модель хотела сказать %r — не говорю",
+                                command, " ".join(придержанное)[:120])
+                    придержанное = [
+                        "Не понял, куда ехать.",
+                        "Скажи попроще: вперёд на метр или направо.",
+                    ]
+                for предложение in придержанное:
+                    произнести(предложение)
+                said = " ".join(придержанное)
         except Exception as e:
             log.exception("не смог ответить")
             start_speaking()

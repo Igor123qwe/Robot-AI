@@ -92,7 +92,10 @@ DRIVE_SPEED = 0.20   # м/с
 TURN_SPEED = 1.00    # рад/с
 
 MAX_DISTANCE = 3.0   # м за одну команду
-MAX_ANGLE = 360.0    # градусов
+# Три полных оборота. Раньше стояло 360, и «сделай два круга» молча
+# превращалось в один: робот бодро отвечал «разворачиваюсь», крутился вдвое
+# меньше просимого и об усечении не говорил ни слова.
+MAX_ANGLE = 1080.0   # градусов
 
 # Ниже этого напряжения не едем вообще: 3S li-ion уже на грани.
 CUTOFF_VOLT = 10.2
@@ -548,7 +551,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if blocked:
             return blocked
 
-        distance = max(0.05, min(MAX_DISTANCE, float(distance)))
+        просили = float(distance)
+        distance = max(0.05, min(MAX_DISTANCE, просили))
         fx, fy = _DIRECTIONS[key]
         duration = distance / DRIVE_SPEED
         log.info("еду %s на %.2f м (%.1f с)", key, distance, duration)
@@ -558,7 +562,14 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         # по времени робот всегда недоезжает, потому что разгон не в счёт.
         ros.drive(fx * DRIVE_SPEED, fy * DRIVE_SPEED, 0.0, duration,
                   путь=distance)
-        return f"Еду {key} {_say_distance(distance)}."
+        ответ = f"Еду {key} {_say_distance(distance)}."
+        if просили > MAX_DISTANCE:
+            # Молча укоротить поездку втрое — значит соврать. Человек просил
+            # десять метров, слышал «еду», а робот проезжал три и вставал; со
+            # стороны это выглядело как заглохший робот, а не как предел.
+            метров = ru.count(int(MAX_DISTANCE), "метр", "метра", "метров")
+            ответ += f" {метров.capitalize()} за раз — мой предел, скажи ещё раз."
+        return ответ
 
     def turn(direction: str, degrees: float = 90.0) -> str:
         key = direction.strip().lower()
@@ -573,13 +584,27 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if blocked:
             return blocked
 
-        degrees = max(5.0, min(MAX_ANGLE, abs(float(degrees))))
+        просили = abs(float(degrees))
+        degrees = max(5.0, min(MAX_ANGLE, просили))
         радиан = degrees * 3.14159265 / 180.0
         duration = радиан / TURN_SPEED
         log.info("разворачиваюсь %s на %.0f° (%.1f с)", key, degrees, duration)
         ros.drive(0.0, 0.0, sign * TURN_SPEED, duration, угол=радиан)
-        turn_words = ru.count(int(round(degrees)), "градус", "градуса", "градусов")
-        return f"Разворачиваюсь {key} на {turn_words}."
+        # Круги считаем кругами: «разворачиваюсь на семьсот двадцать градусов»
+        # человек в уме не переводит, а «два круга» понятно сразу.
+        if degrees >= 360.0 and abs(degrees % 360.0) < 1.0:
+            кругов = int(degrees // 360)
+            сколько = ("круг" if кругов == 1
+                       else ru.count(кругов, "круг", "круга", "кругов"))
+            ответ = f"Кручусь {сколько}."
+        else:
+            turn_words = ru.count(int(round(degrees)), "градус", "градуса",
+                                  "градусов")
+            ответ = f"Разворачиваюсь {key} на {turn_words}."
+        if просили > MAX_ANGLE:
+            предел = ru.count(int(MAX_ANGLE // 360), "круг", "круга", "кругов")
+            ответ += f" {предел.capitalize()} за раз — мой предел."
+        return ответ
 
     def stop() -> str:
         # moving — это «едем ли по СВОЕЙ команде». Когда робота гонят

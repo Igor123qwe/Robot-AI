@@ -303,6 +303,11 @@ class Brain:
         # сказать человеку, когда робот съехал на запасного: сам он это
         # заметит только по скорости и по счёту за облако.
         self.ответил: str = ""
+        # Какие инструменты модель позвала на последнем ходу. Нужно, чтобы
+        # поймать самое обидное враньё: на «поезжай вперёд» модель отвечает
+        # «Приехал», не позвав drive. Слова робота при этом безупречны, а
+        # робот стоит на месте, и человек об этом не догадывается.
+        self.позвал: list[str] = []
         self.endpoints: list[Endpoint] = []
         if cfg.local_api_base:
             # Основной. Ключ тут формальность: своя машина в своей сети пароля
@@ -516,6 +521,7 @@ class Brain:
         smart — спросили умного: этот ход идёт в облако, за деньги.
         """
         messages = self.history + [{"role": "user", "content": user_text}]
+        self.позвал = []
         spoken: list[str] = []
         used_in = used_out = cached = written = 0
         truncated = False
@@ -562,6 +568,7 @@ class Brain:
 
                 results = []
                 for call in calls:
+                    self.позвал.append(call.name)
                     tool = self.tools.get(call.name)
                     if tool is None:
                         log.warning("модель зовёт несуществующий инструмент %s",

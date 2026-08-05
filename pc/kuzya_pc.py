@@ -931,8 +931,24 @@ class Voiceprints:
 
     # Короче этого фразу для завода нового голоса не берём. Узнать по «ага»
     # ещё можно, а вот заводить по нему нового человека — верный способ
-    # расплодить призраков.
-    ENOUGH = 1.5
+    # расплодить призраков. Полторы секунды оказалось мало: за вечер разговора
+    # Игорь всё равно развалился на «Игорь, голос 1, голос 2, голос 3».
+    ENOUGH = 2.0
+
+    # Сколько раз ПОДРЯД надо услышать незнакомца, чтобы завести ему слепок,
+    # и насколько эти разы должны быть похожи друг на друга.
+    #
+    # Одна фраза для этого решения — слишком мало. Голос уплывает: человек
+    # отвернулся, сказал тише, простыл, микрофон телефона подавился — и
+    # похожесть на собственный слепок падает ниже NEW. Раньше этого хватало,
+    # чтобы завести нового человека, и хозяин дома размножался кличками, а
+    # робот при следующей фразе узнавал его уже как чужого.
+    #
+    # Двух подряд достаточно: случайный провал так не повторяется, а
+    # настоящий новый человек говорит не одной фразой. Требуем ещё и чтобы обе
+    # фразы были похожи между собой, иначе двое чужих подряд (гости в комнате)
+    # склеились бы в одного.
+    ПОДРЯД = 2
 
     RATE = 16000
     MODEL = "speechbrain/spkrec-ecapa-voxceleb"
@@ -952,6 +968,9 @@ class Voiceprints:
         # Слепки последних фраз: /stt их только считает, а запоминает отдельный
         # вызов — когда робот убедился, что говорили с ним.
         self._recent: dict[str, tuple] = {}
+        # Незнакомец, услышанный подряд: слепок и сколько раз. См. ПОДРЯД.
+        self._чужак = None
+        self._чужака_раз = 0
         self._read()
 
     # --- хранение --------------------------------------------------------
@@ -1162,11 +1181,36 @@ class Voiceprints:
                 self._rename(best, name)
             return self._absorb(name, mine)
         if score >= self.SAME:
+            self._чужак, self._чужака_раз = None, 0
             return self._absorb(best, mine)
         if score < self.NEW and seconds >= self.ENOUGH:
-            return self._absorb(self._new_name(), mine)
+            return self._может_новый(mine)
         # Серая зона: похоже, но не точно. Не приписываем и не заводим.
+        # Счётчик незнакомца тоже сбрасываем: «подряд» значит подряд.
+        self._чужак, self._чужака_раз = None, 0
         return ""
+
+    def _может_новый(self, mine) -> str:
+        """Заводит слепок незнакомцу, но только услышав его ПОДРЯД. См. ПОДРЯД."""
+        import numpy as np
+
+        тот_же = (self._чужак is not None
+                  and float(np.dot(mine, self._чужак)) >= self.SAME)
+        if тот_же:
+            self._чужака_раз += 1
+        else:
+            self._чужак, self._чужака_раз = mine, 1
+        if self._чужака_раз < self.ПОДРЯД:
+            log.info("незнакомый голос (%d из %d) — подожду ещё фразу, "
+                     "прежде чем заводить нового",
+                     self._чужака_раз, self.ПОДРЯД)
+            return ""
+        # Заводим по накопленному, а не по последней фразе: среднее из двух
+        # устойчивее одной, а именно по этому слепку человека будут узнавать.
+        смесь = (np.asarray(self._чужак, dtype="float32") + mine) / 2
+        смесь = смесь / (float(np.linalg.norm(смесь)) or 1.0)
+        self._чужак, self._чужака_раз = None, 0
+        return self._absorb(self._new_name(), смесь)
 
     def _absorb(self, name: str, mine) -> str:
         """Вливает фразу в слепок человека, уточняя его."""
@@ -1313,6 +1357,17 @@ class Voice:
         log.info("голос %s готов, прогрев занял %.0f с",
                  self.speaker, time.monotonic() - started)
 
+    def кто(self, speaker: str = "") -> str:
+        """Каким голосом на самом деле прозвучит эта фраза.
+
+        Робот называет этим именем свой кэш готовых фраз. Без него он называл
+        кэш тем, что записано в его собственных настройках, — а голос
+        выбирается здесь, ключом --voice. Стоило поменять голос на ПК, и робот
+        продолжал доставать частые заготовки прежним голосом: половина фраз
+        звучала одним голосом, половина другим.
+        """
+        return speaker if speaker in self.VOICES else self.speaker
+
     def say(self, text: str, speaker: str = "") -> bytes:
         """Синтезирует фразу и отдаёт её готовым wav-файлом."""
         import numpy as np
@@ -1322,7 +1377,7 @@ class Voice:
                 self._model = self._load()
                 self.ready = True
             started = time.monotonic()
-            who = speaker if speaker in self.VOICES else self.speaker
+            who = self.кто(speaker)
             audio = self._model.apply_tts(text=text, speaker=who,
                                           sample_rate=self.RATE)
 
@@ -1397,6 +1452,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Робот спрашивает это при старте: есть голос на ПК или
                 # говорить своим piper.
                 "голос": getattr(getattr(cfg, "voice", None), "ready", False),
+                "голос_чей": getattr(getattr(cfg, "voice", None), "speaker", ""),
                 "узнаю_по_голосу": sorted(
                     getattr(getattr(cfg, "who", None), "people", {})),
                 # Часы. Робот сверяет их со своими: на его SBC нет батарейки
@@ -1498,6 +1554,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")
         self.send_header("Content-Length", str(len(wav)))
+        # Каким голосом это прозвучало. Робот называет этим именем свой кэш:
+        # иначе после смены --voice заготовки продолжают звучать прежним
+        # голосом, а новые фразы — новым, и голос «прорезается» через раз.
+        self.send_header("X-Voice", voice.кто(req.get("voice") or ""))
         self.end_headers()
         try:
             self.wfile.write(wav)
@@ -1795,7 +1855,10 @@ def main() -> int:
                         "инструментами, но ответ идёт в разы дольше")
     p.add_argument("--voice", default=Voice.VOICES[0],
                    help="голос синтеза: " + "|".join(Voice.VOICES) +
-                        " либо «нет», чтобы робот говорил своим piper")
+                        " либо «нет», чтобы робот говорил своим piper. "
+                        "eugene — мужской ровный, aidar — мужской мягче и "
+                        "теплее, baya — женский спокойный, kseniya и xenia — "
+                        "женские, xenia самый живой")
     p.add_argument("--no-voiceprints", action="store_true",
                    help="не узнавать людей по голосу")
     p.add_argument("--debug", action="store_true")
