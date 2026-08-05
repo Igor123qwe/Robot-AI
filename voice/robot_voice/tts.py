@@ -42,6 +42,8 @@ from typing import Callable
 
 import numpy as np
 
+from .net import почему
+
 log = logging.getLogger(__name__)
 
 # Запас на дорогу до браузера и запуск воспроизведения. Реплика уходит по
@@ -265,7 +267,9 @@ class RemoteVoice:
             self._осечек += 1
             пауза = min(PC_DOWN, PC_DOWN_FIRST * 2 ** (self._осечек - 1))
             self._down_until = time.monotonic() + пауза
-            log.warning("ПК не озвучил (%s) — говорю своим голосом %.0f с", e, пауза)
+            log.warning("ПК не озвучил: %s — говорю своим голосом %.0f с",
+                        почему(e), пауза)
+            log.debug("ПК не озвучил, целиком", exc_info=True)
             return None
         self._осечек = 0
         log.debug("ПК озвучил за %.2f с: %r", time.monotonic() - started, text[:60])

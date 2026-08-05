@@ -216,6 +216,13 @@ class Pump:
     для диалога свежесть важнее полноты.
     """
 
+    # Сколько звука можно потерять молча. Меньше секунды — это икота, а не
+    # беда: разбор чуть не уложился в буфер и тут же догнал.
+    ПОТЕРЯ_МОЛЧА = 1.0
+    # Пока отставание длится, напоминаем о себе не чаще этого. Молчать всё
+    # время нельзя: намертво вставший разбор иначе не признается никогда.
+    НАПОМИНАТЬ = 30.0
+
     # Хвост должен пережить самый долгий ход модели: пока она думает, главный
     # цикл фраз не читает, и всё сказанное человеком копится здесь. Трёх
     # секунд, как было раньше, не хватало даже на быстрый ответ — «стоп»,
@@ -226,7 +233,14 @@ class Pump:
         maxlen = max(10, int(keep_seconds * 1000 / FRAME_MS))
         self._frames: deque[np.ndarray] = deque(maxlen=maxlen)
         self._ready = threading.Condition()
+        # Отставание считаем не в кадрах за всё время, а приступами: когда
+        # начали не успевать и сколько звука на этом потеряли. Сплошной
+        # счётчик отвечал не на тот вопрос — «выброшено 6500 кадров» за
+        # вечер не говорит ни когда это было, ни надолго ли, а ругаться
+        # каждые 500 кадров он не переставал уже никогда.
         self._dropped = 0
+        self._drop_since: float | None = None
+        self._drop_said = 0.0
         self._stop = False
         self._thread: threading.Thread | None = None
         # Живой ли сейчас источник — чтобы наверху было что показать человеку.
@@ -265,13 +279,9 @@ class Pump:
                     delay = 1.0
                     with self._ready:
                         if len(self._frames) == self._frames.maxlen:
-                            self._dropped += 1
-                            # Каждые 500 кадров — это 10 секунд выброшенного
-                            # звука. Обычно значит, что Whisper не успевает:
-                            # рядом говорит телевизор и режется по 20 секунд.
-                            if self._dropped % 500 == 0:
-                                log.warning("аудио: не успеваю разбирать, "
-                                            "выброшено %d кадров", self._dropped)
+                            self._отстаю()
+                        elif self._drop_since is not None:
+                            self._догнал()
                         self._frames.append(frame)
                         self._ready.notify()
             except Exception as e:      # noqa: BLE001 — обрыв не повод умирать
@@ -287,6 +297,33 @@ class Pump:
             with self._ready:
                 self._ready.wait(timeout=delay)
             delay = min(10.0, delay * 2)
+
+    def _отстаю(self) -> None:
+        """Буфер полон: самый старый кадр уходит в никуда."""
+        сейчас = time.monotonic()
+        if self._drop_since is None:
+            self._drop_since = self._drop_said = сейчас
+        self._dropped += 1
+        if сейчас - self._drop_said >= self.НАПОМИНАТЬ:
+            self._drop_said = сейчас
+            log.warning("аудио: не успеваю разбирать уже %.0f с, потеряно %.0f с "
+                        "звука — робот сейчас глухой",
+                        сейчас - self._drop_since, self._потеряно)
+
+    def _догнал(self) -> None:
+        """Разбор нагнал звук. Рассказываем, чего это стоило, и забываем."""
+        потеряно = self._потеряно
+        шло = time.monotonic() - self._drop_since if self._drop_since else 0.0
+        self._drop_since = None
+        self._dropped = 0
+        if потеряно >= self.ПОТЕРЯ_МОЛЧА:
+            log.warning("аудио: догнал за %.0f с, мимо прошло %.0f с звука",
+                        шло, потеряно)
+
+    @property
+    def _потеряно(self) -> float:
+        """Потерянный звук в секундах: кадры человек в уме не переводит."""
+        return self._dropped * FRAME_MS / 1000
 
     def frames(self):
         while not self._stop:

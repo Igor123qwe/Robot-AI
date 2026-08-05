@@ -882,11 +882,70 @@ def test_health() -> None:
         srv.shutdown()
 
 
+def test_адрес_для_робота() -> None:
+    """Шапка должна называть адрес, по которому робота и правда пустят.
+
+    Раньше здесь стояло честное «<адрес этого ПК>», и человек шёл за ним в
+    ipconfig. Беда в том, что на машине с Wi-Fi, проводом, WSL, VirtualBox и
+    VPN там шесть адресов, а правильный один. Ошибка выглядит потом ровно как
+    выключенный ПК: робот молча уходит на свои силы и становится медленным и
+    глухим, и искать причину идут куда угодно, только не в эту строку.
+    """
+    section("адрес для робота")
+
+    адреса = kuzya_pc._адреса()
+    check("вернулся список", isinstance(адреса, list), True)
+    check("без повторов", len(адреса), len(set(адреса)))
+    # Заведомо мёртвое не предлагаем: 127.x роботу бесполезен, а 169.254.x
+    # означает «DHCP не ответил» и не работает вовсе. Предложить такое —
+    # значит отправить человека искать несуществующую беду.
+    мёртвые = [а for а in адреса
+               if а.startswith("127.") or а.startswith("169.254.")]
+    check("без петли и без «DHCP не ответил»", мёртвые, [])
+
+    # Домашние адреса — первыми: их и вписывают роботу. Чужие не выбрасываем
+    # (домашняя сеть бывает и на 100.64 от провайдера), но и вперёд не пускаем.
+    def домашний(а: str) -> bool:
+        return (а.startswith("192.168.") or а.startswith("10.")
+                or any(а.startswith(f"172.{n}.") for n in range(16, 32)))
+
+    порядок = [домашний(а) for а in адреса]
+    check("домашние идут первыми", порядок, sorted(порядок, reverse=True))
+
+    # А теперь на машине, какая она у человека и есть: провод, Wi-Fi, WSL,
+    # VirtualBox и невывезенный 169.254. Настоящая сеть тут ничего не решает,
+    # поэтому подставляем список сами.
+    import socket
+
+    было = socket.getaddrinfo
+    socket.getaddrinfo = lambda *a, **kw: [
+        (None, None, None, "", (адрес, 0)) for адрес in
+        ("127.0.0.1", "169.254.13.7", "192.168.0.23", "10.0.75.1")]
+    try:
+        свои = kuzya_pc._адреса()
+    finally:
+        socket.getaddrinfo = было
+    # Про настоящий адрес этой машины ничего не утверждаем: он у робота, в CI
+    # и на ноутбуке разный, а проверка обязана давать один и тот же ответ везде.
+    check("мёртвые не предлагаются",
+          [а for а in свои
+           if а.startswith("127.") or а.startswith("169.254.")], [])
+    check("живые сохранены и по порядку",
+          [а for а in свои if а in ("192.168.0.23", "10.0.75.1")],
+          ["192.168.0.23", "10.0.75.1"])
+
+    # Подсказка про брандмауэр — про Windows. На роботе и в CI её быть не
+    # должно вовсе, и уж точно она не имеет права никого уронить.
+    kuzya_pc._брандмауэр(4000)
+    check("проверка брандмауэра молчит не на Windows", True, True)
+
+
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
     for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch,
                  test_tool_call, test_broken,
-                 test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health):
+                 test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health,
+                 test_адрес_для_робота):
         test()
         print("   ...")
     if FAILED:

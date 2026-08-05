@@ -24,6 +24,7 @@ from typing import Callable
 import anthropic
 
 from .config import SYSTEM_PROMPT, Config
+from .net import почему
 from .tools import Tool
 
 log = logging.getLogger(__name__)
@@ -510,7 +511,9 @@ class Brain:
                               "это наша ошибка, а не его", ep.name, e)
                     continue
                 ep.down_until = time.monotonic() + DOWN_SECONDS
-                log.warning("%s не отвечает (%s) — иду к следующему", ep.name, e)
+                log.warning("%s не отвечает: %s — иду к следующему",
+                            ep.name, почему(e))
+                log.debug("%s не отвечает, целиком", ep.name, exc_info=True)
         raise failure
 
     # --- один ход --------------------------------------------------------
