@@ -18,6 +18,7 @@ import io
 import logging
 import struct
 import threading
+import time
 import wave
 from collections import deque
 from typing import Iterator
@@ -28,6 +29,11 @@ import webrtcvad
 log = logging.getLogger(__name__)
 
 FRAME_MS = 20  # webrtcvad принимает только 10, 20 или 30 мс
+
+# Сколько «микрофон считается живым» после последнего настоящего звука.
+# Пять секунд: человек молчит между фразами дольше, чем можно подумать,
+# а вот закрытая вкладка молчит навсегда.
+REAL_AUDIO_TTL = 5.0
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +154,20 @@ class BrowserSource:
         self.url = web_url.rstrip("/") + "/listen/stream"
         self.sample_rate = sample_rate
         self.frame_len = sample_rate * FRAME_MS // 1000
+        # Когда последний раз приходил НАСТОЯЩИЙ звук. Сервер робота держит
+        # соединение живым, подсыпая ровные нули, и по «кадры идут» источник
+        # выглядел живым всегда: робот бодро сообщал «микрофон на связи» и
+        # при закрытой вкладке, и при выключенной кнопке микрофона.
+        # Минус бесконечность, а не ноль: monotonic() считает от загрузки
+        # машины, и с нулём первые пять секунд после включения выглядели бы
+        # как «звук только что был» — то есть ровно то враньё, против
+        # которого эта отметка и заведена. Сервис поднимается из systemd как
+        # раз в эти секунды.
+        self._real_at = float("-inf")
+
+    def live(self) -> bool:
+        """Идёт ли настоящий звук, а не одна тишина-заполнитель."""
+        return time.monotonic() - self._real_at < REAL_AUDIO_TTL
 
     def frames(self) -> Iterator[np.ndarray]:
         import requests
@@ -162,6 +182,10 @@ class BrowserSource:
         for buf in resp.iter_content(chunk_size=self.frame_len * 2):
             if not buf:
                 continue
+            # Ровные нули — это заполнитель сервера, а не звук: настоящий
+            # микрофон всегда шумит хотя бы младшим битом.
+            if any(buf):
+                self._real_at = time.monotonic()
             samples = np.frombuffer(buf[: len(buf) // 2 * 2], dtype="<i2")
             tail = np.concatenate([tail, samples])
             n = len(tail) // self.frame_len
@@ -192,12 +216,31 @@ class Pump:
     для диалога свежесть важнее полноты.
     """
 
-    def __init__(self, source, keep_seconds: float = 3.0) -> None:
+    # Сколько звука можно потерять молча. Меньше секунды — это икота, а не
+    # беда: разбор чуть не уложился в буфер и тут же догнал.
+    ПОТЕРЯ_МОЛЧА = 1.0
+    # Пока отставание длится, напоминаем о себе не чаще этого. Молчать всё
+    # время нельзя: намертво вставший разбор иначе не признается никогда.
+    НАПОМИНАТЬ = 30.0
+
+    # Хвост должен пережить самый долгий ход модели: пока она думает, главный
+    # цикл фраз не читает, и всё сказанное человеком копится здесь. Трёх
+    # секунд, как было раньше, не хватало даже на быстрый ответ — «стоп»,
+    # сказанный на ходу, выбрасывался, не будучи ни разу услышанным.
+    # Тридцать секунд звука — это меньше мегабайта памяти.
+    def __init__(self, source, keep_seconds: float = 30.0) -> None:
         self.source = source
         maxlen = max(10, int(keep_seconds * 1000 / FRAME_MS))
         self._frames: deque[np.ndarray] = deque(maxlen=maxlen)
         self._ready = threading.Condition()
+        # Отставание считаем не в кадрах за всё время, а приступами: когда
+        # начали не успевать и сколько звука на этом потеряли. Сплошной
+        # счётчик отвечал не на тот вопрос — «выброшено 6500 кадров» за
+        # вечер не говорит ни когда это было, ни надолго ли, а ругаться
+        # каждые 500 кадров он не переставал уже никогда.
         self._dropped = 0
+        self._drop_since: float | None = None
+        self._drop_said = 0.0
         self._stop = False
         self._thread: threading.Thread | None = None
         # Живой ли сейчас источник — чтобы наверху было что показать человеку.
@@ -236,13 +279,9 @@ class Pump:
                     delay = 1.0
                     with self._ready:
                         if len(self._frames) == self._frames.maxlen:
-                            self._dropped += 1
-                            # Каждые 500 кадров — это 10 секунд выброшенного
-                            # звука. Обычно значит, что Whisper не успевает:
-                            # рядом говорит телевизор и режется по 20 секунд.
-                            if self._dropped % 500 == 0:
-                                log.warning("аудио: не успеваю разбирать, "
-                                            "выброшено %d кадров", self._dropped)
+                            self._отстаю()
+                        elif self._drop_since is not None:
+                            self._догнал()
                         self._frames.append(frame)
                         self._ready.notify()
             except Exception as e:      # noqa: BLE001 — обрыв не повод умирать
@@ -259,6 +298,33 @@ class Pump:
                 self._ready.wait(timeout=delay)
             delay = min(10.0, delay * 2)
 
+    def _отстаю(self) -> None:
+        """Буфер полон: самый старый кадр уходит в никуда."""
+        сейчас = time.monotonic()
+        if self._drop_since is None:
+            self._drop_since = self._drop_said = сейчас
+        self._dropped += 1
+        if сейчас - self._drop_said >= self.НАПОМИНАТЬ:
+            self._drop_said = сейчас
+            log.warning("аудио: не успеваю разбирать уже %.0f с, потеряно %.0f с "
+                        "звука — робот сейчас глухой",
+                        сейчас - self._drop_since, self._потеряно)
+
+    def _догнал(self) -> None:
+        """Разбор нагнал звук. Рассказываем, чего это стоило, и забываем."""
+        потеряно = self._потеряно
+        шло = time.monotonic() - self._drop_since if self._drop_since else 0.0
+        self._drop_since = None
+        self._dropped = 0
+        if потеряно >= self.ПОТЕРЯ_МОЛЧА:
+            log.warning("аудио: догнал за %.0f с, мимо прошло %.0f с звука",
+                        шло, потеряно)
+
+    @property
+    def _потеряно(self) -> float:
+        """Потерянный звук в секундах: кадры человек в уме не переводит."""
+        return self._dropped * FRAME_MS / 1000
+
     def frames(self):
         while not self._stop:
             with self._ready:
@@ -269,10 +335,36 @@ class Pump:
                 frame = self._frames.popleft()
             yield frame
 
+    @property
+    def alive(self) -> bool:
+        """Идёт ли настоящий звук, а не только строки, держащие связь.
+
+        Сам факт «кадры приходят» ничего не значит для браузерного источника:
+        сервер робота подсыпает ровные нули, чтобы соединение не уснуло. Робот
+        поэтому бодро сообщал «микрофон на связи» и при закрытой вкладке, и
+        при выключенной кнопке микрофона.
+        """
+        live = getattr(self.source, "live", None)
+        return self.online and (live() if callable(live) else True)
+
     def drop_pending(self) -> None:
         """Выбросить накопленное — например, всё, что робот наговорил сам."""
         with self._ready:
             self._frames.clear()
+
+    def peek(self) -> bytes:
+        """Копия накопленного, не забирая его из очереди.
+
+        Нужна ровно для одного: пока робот думает над ответом, главный цикл
+        висит в разговоре с моделью и фраз не читает. Если человек в этот
+        момент сказал «стоп», а модель уже отправила робота ехать, узнать об
+        этом больше неоткуда. Забирать кадры нельзя — они ещё пригодятся
+        обычному разбору.
+        """
+        with self._ready:
+            if not self._frames:
+                return b""
+            return b"".join(f.tobytes() for f in self._frames)
 
 
 # --------------------------------------------------------------------------
@@ -288,18 +380,62 @@ class Listener:
         self.sample_rate = sample_rate
         self.vad = webrtcvad.Vad(vad_level)
         self.silence_frames = max(1, silence_ms // FRAME_MS)
-        self.min_speech_frames = max(1, min_speech_ms // FRAME_MS)
+        self._min_speech = max(1, min_speech_ms // FRAME_MS)
         self.max_speech_frames = max(1, max_speech_ms // FRAME_MS)
         # Начинаем запись только после нескольких подряд речевых кадров:
         # одиночный щелчок или стук посуды VAD принимает за речь.
-        self.start_frames = max(1, start_frames)
+        self._start = max(1, start_frames)
+        # Играет ли рядом музыка. Детектор речи её за речь и принимает: на
+        # живом роботе под включённое радио каждая пауза уезжала в
+        # распознавание отдельным куском, тот возвращался пустым, и полсекунды
+        # ПК уходило в никуда — по нескольку раз в минуту.
+        self._noisy = False
         # Небольшой предбуфер, чтобы не отрезать начало слова.
         self.preroll = deque(maxlen=max(1, 300 // FRAME_MS))
         self._muted = threading.Event()
 
+    # Во сколько раз дольше должен звучать звук, чтобы под музыку считаться
+    # началом фразы. Двух хватает: 40 мс подряд речевых кадров превращаются в
+    # 80, а предбуфер в 300 мс всё равно донесёт начало слова целиком.
+    NOISY = 2
+
+    def background(self, шумно: bool) -> None:
+        """Стало шумно или снова тихо. Зовётся, когда включают музыку."""
+        if шумно != self._noisy:
+            log.info("фон: %s", "играет музыка" if шумно else "тихо")
+        self._noisy = шумно
+
+    @property
+    def start_frames(self) -> int:
+        return self._start * self.NOISY if self._noisy else self._start
+
+    @property
+    def min_speech_frames(self) -> int:
+        """Минимальная длина фразы. Под музыку НЕ поднимается — намеренно.
+
+        Соблазн был: поднять оба порога и отсечь музыкальный мусор разом. Но
+        этот порог отбраковывает уже записанный кусок по длине, а мусор под
+        музыку был длинный — в логе куски по 2.6–3.6 секунды. То есть пользы
+        никакой, а вред прямой: «стоп» — это меньше полусекунды речи, и
+        удвоенный порог выбросил бы ровно ту команду, ради которой всё
+        останавливается.
+        """
+        return self._min_speech
+
     # Пока робот говорит — не слушаем: иначе он расслышит сам себя.
     def mute(self) -> None:
         self._muted.set()
+
+    def unheard(self) -> bytes:
+        """Звук, который накопился, пока его никто не разбирал — как WAV.
+
+        Отдаётся именно копия: разбор на фразы этот же звук ещё получит.
+        Пусто — значит и слушать нечего.
+        """
+        raw = self.pump.peek()
+        if not raw:
+            return b""
+        return to_wav(np.frombuffer(raw, dtype=np.int16), self.sample_rate)
 
     def unmute(self) -> None:
         self._muted.clear()
@@ -312,12 +448,18 @@ class Listener:
         speech: list[np.ndarray] = []
         silence = 0
         voiced_run = 0
+        # Речевых кадров в куске — именно речевых, а не «всего минус хвост
+        # тишины». Раньше считалось вторым способом, и в счёт попадали
+        # предбуфер и семьсот миллисекунд тишины на конце: одиночный щелчок
+        # набирал ровно порог и уезжал в распознавание как секунда почти
+        # тишины. Порог при этом не работал вообще ни на чём.
+        voiced_total = 0
         talking = False
 
         for frame in self.pump.frames():
             if self._muted.is_set():
                 speech.clear()
-                silence = voiced_run = 0
+                silence = voiced_run = voiced_total = 0
                 talking = False
                 continue
 
@@ -330,25 +472,41 @@ class Listener:
                     talking = True
                     speech = list(self.preroll)
                     silence = 0
+                    voiced_total = voiced_run
                 continue
 
             speech.append(frame)
+            if is_speech:
+                voiced_total += 1
             silence = 0 if is_speech else silence + 1
 
             # Либо человек замолчал, либо говорит слишком долго — режем.
             too_long = len(speech) >= self.max_speech_frames
-            if silence >= self.silence_frames or too_long:
-                if too_long:
-                    log.info("аудио: фраза длиннее %d с, режу", self.max_speech_frames * FRAME_MS // 1000)
+            if too_long:
+                # Такой кусок в распознавание не отдаём вовсе. Домашняя
+                # команда столько не длится — это шум или чужой разговор, а
+                # цена ошибки высока: распознавание идёт втрое дольше самого
+                # звука и в это время робот не реагирует ни на что, включая
+                # «стоп». Двадцать секунд шума превращались в минуту немоты.
+                log.info("аудио: непрерывный звук дольше %d с — не речь, отбрасываю",
+                         self.max_speech_frames * FRAME_MS // 1000)
+                speech = []
+                silence = voiced_run = voiced_total = 0
+                talking = False
+                self.preroll.clear()
+                continue
+
+            if silence >= self.silence_frames:
                 talking = False
                 voiced_run = 0
-                voiced = len(speech) - silence
                 payload, speech = speech, []
+                voiced, voiced_total = voiced_total, 0
                 self.preroll.clear()
                 if voiced >= self.min_speech_frames:
                     yield to_wav(np.concatenate(payload), self.sample_rate)
                 else:
-                    log.debug("аудио: слишком короткий фрагмент, пропускаю")
+                    log.debug("аудио: слишком короткий фрагмент (%d кадров речи), "
+                              "пропускаю", voiced)
 
 
 def to_wav(samples: np.ndarray, sample_rate: int) -> bytes:

@@ -84,6 +84,12 @@
   }
   #micBtn.on { color: var(--ok); border-color: var(--ok); }
   #micBtn.talking { color: var(--bad); border-color: var(--bad); }
+  #earBtn {
+    flex: none; width: 30px; height: 26px; padding: 0;
+    background: var(--panel); color: var(--dim);
+    border: 1px solid var(--line); border-radius: 6px; font-size: 14px;
+  }
+  #earBtn.on { color: var(--ok); border-color: var(--ok); }
 
   /* --- колёса --- */
   .wheels {
@@ -167,6 +173,7 @@
   <span id="conn"></span>
   <span id="status">подключение…</span>
   <button id="micBtn" title="Говорить с роботом в микрофон этого компьютера">🎤</button>
+  <button id="earBtn" title="Я в наушниках — не подавлять эхо (робота слышно лучше)">🎧</button>
   <button id="sndBtn" title="Разрешить роботу говорить через этот браузер">🔇</button>
   <span class="batt">
     <span class="batt-shell"><span id="battFill"></span></span>
@@ -278,6 +285,11 @@ function makeJoystick(pad, onMove) {
   };
 
   const release = () => {
+    // Захват снимаем раньше, чем забываем pointerId: иначе отпустить будет
+    // уже нечего, и палец останется «прижатым» к пэду до конца жизни страницы.
+    if (pointerId !== null && pad.hasPointerCapture(pointerId)) {
+      pad.releasePointerCapture(pointerId);
+    }
     pointerId = null;
     place(0, 0);
     onMove(0, 0);
@@ -295,7 +307,14 @@ function makeJoystick(pad, onMove) {
   for (const t of ['pointerup', 'pointercancel', 'pointerleave']) {
     pad.addEventListener(t, ev => { if (ev.pointerId === pointerId) release(); });
   }
+  // Отдаём наружу: аварийный стоп обязан отпустить и сам джойстик. Иначе
+  // палец остаётся на пэде, и первое же его шевеление возвращает команду —
+  // робот поедет снова, хотя человек нажал СТОП.
+  joysticks.push(release);
 }
+
+// Все созданные джойстики — чтобы стоп мог отпустить их разом.
+const joysticks = [];
 
 // Левый: ход во все стороны. Вверх = вперёд (+x), вправо = вправо.
 // В ROS linear.y положительная — влево, поэтому знак инвертируем.
@@ -334,7 +353,12 @@ function drawWheels() {
 }
 
 // ── rosbridge ────────────────────────────────────────────────────────────
-const ROSBRIDGE = 'ws://' + (location.hostname || '192.168.0.50') + ':9090';
+// По https обращаться к ws:// нельзя — браузер блокирует это как смешанное
+// содержимое, и молча: джойстик просто перестал бы двигать робота. Поэтому
+// с защищённой страницы идём к rosbridge через сам сервер пульта, /ros.
+const ROSBRIDGE = location.protocol === 'https:'
+  ? 'wss://' + location.host + '/ros'
+  : 'ws://' + (location.hostname || '192.168.0.50') + ':9090';
 let ws = null, wsReady = false, reconnectTimer = null;
 
 function setStatus(text, ok) {
@@ -342,17 +366,36 @@ function setStatus(text, ok) {
   elConn.classList.toggle('on', !!ok);
 }
 
+// Только текст, без индикатора. Точка слева показывает связь с rosbridge, и
+// микрофон к ней отношения не имеет: раньше она гасла от тишины в микрофоне
+// при полностью живом соединении и так и оставалась красной — а по этой точке
+// человек заранее понимает, сработает ли СТОП.
+function setNote(text) {
+  elStatus.textContent = text;
+}
+
 function connect() {
   clearTimeout(reconnectTimer);
-  setStatus('подключение к ' + ROSBRIDGE + ' …', false);
+  // Пока не доставлен стоп, шапку не трогаем: переподключение идёт каждые
+  // две секунды и затирало единственное сообщение о том, что робот не
+  // остановлен. Человек видел зелёное «подключено» и был уверен в обратном.
+  if (!stopPending) setStatus('подключение к ' + ROSBRIDGE + ' …', false);
   try { ws = new WebSocket(ROSBRIDGE); }
   catch (e) { scheduleReconnect(); return; }
 
   ws.onopen = () => {
     wsReady = true;
-    setStatus('подключено', true);
     send({ op: 'advertise', topic: '/cmd_vel', type: 'geometry_msgs/msg/Twist' });
     send({ op: 'subscribe', topic: '/PowerVoltage', type: 'std_msgs/msg/Float32', throttle_rate: 1000 });
+    if (stopPending) {
+      // Человек жал СТОП, когда связи не было. Связь появилась — досылаем,
+      // прежде чем сообщать, что всё хорошо.
+      stopPending = false;
+      for (const ms of [0, 60, 120, 180, 240]) setTimeout(sendZero, ms);
+      setStatus('связь вернулась — стоп отправлен', true);
+      return;
+    }
+    setStatus('подключено', true);
   };
 
   ws.onmessage = ev => {
@@ -363,8 +406,14 @@ function connect() {
     }
   };
 
-  ws.onclose = () => { wsReady = false; setStatus('связь потеряна', false); scheduleReconnect(); };
-  ws.onerror = () => { setStatus('ошибка соединения', false); };
+  // Про недоставленный стоп в шапке важнее, чем про состояние связи: связь
+  // человек и так видит по индикатору, а несработавшую кнопку — нет.
+  ws.onclose = () => {
+    wsReady = false;
+    if (!stopPending) setStatus('связь потеряна', false);
+    scheduleReconnect();
+  };
+  ws.onerror = () => { if (!stopPending) setStatus('ошибка соединения', false); };
 }
 
 function scheduleReconnect() {
@@ -404,25 +453,53 @@ function publishCmdVel() {
 
 // Аварийный стоп: работает, даже когда робот едет по голосовой команде и
 // физически не слышит «стоп» — пока говорит, микрофон заглушён.
+// Пока взведён — в шапке висит «СТОП НЕ УШЁЛ», и переподключение не смеет
+// написать поверх бодрое «подключено». Снимается только фактом отправки.
+let stopPending = false;
+
+function sendZero() {
+  send({
+    op: 'publish',
+    topic: '/cmd_vel',
+    msg: { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } },
+  });
+}
+
 function emergencyStop() {
   cmd.x = cmd.y = cmd.wz = 0;
   idleZeros = 0;
+  // Отпускаем и сами джойстики: палец, оставшийся на пэде, вернёт команду
+  // первым же шевелением, и робот поедет снова.
+  for (const release of joysticks) release();
+
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    // Кнопка мигнула, а робот едет дальше — молчать об этом нельзя.
+    // Кнопка мигнула, а робот едет дальше — молчать об этом нельзя. И забыть
+    // тоже нельзя: дошлём, как только связь вернётся.
+    stopPending = true;
     setStatus('СТОП НЕ УШЁЛ — нет связи с роботом', false);
     return;
   }
-  for (let i = 0; i < 5; i++) {
-    send({
-      op: 'publish',
-      topic: '/cmd_vel',
-      msg: { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } },
-    });
-  }
+  stopPending = false;
+
+  // Пять нулей, разложенных по времени. Залпом в один тик их съедала
+  // подписка робота, а эхо собственной поездки идёт каждые 66 мс и держало
+  // окно занятым — кнопка не срабатывала вовсе. Четверти секунды хватает,
+  // чтобы попасть между эхо; дольше растягивать нельзя, иначе заглушим и
+  // новую команду, отданную сразу после стопа.
+  for (const ms of [0, 60, 120, 180, 240]) setTimeout(sendZero, ms);
 }
 
 // ── Батарея ──────────────────────────────────────────────────────────────
+// Когда в последний раз приходило напряжение. Показания обязаны протухать:
+// если умерло шасси, а rosbridge жив, сообщения просто перестают идти — и
+// раньше в шапке навсегда застывало бодрое «12.3 В, 90 %». Голосовая часть
+// эту ошибку уже знает (ros.py, VOLTAGE_TTL), пульт — нет, а смотрят на заряд
+// именно по нему, и сборку 3S нельзя переразряжать.
+let battAt = 0;
+const BATT_TTL = 10000;
+
 function updateBattery(volt) {
+  battAt = Date.now();
   const pct = voltToPercent(volt);
   elBattFill.style.width = pct.toFixed(0) + '%';
   elBattText.textContent = pct.toFixed(0) + ' %';
@@ -430,6 +507,19 @@ function updateBattery(volt) {
   elBattFill.style.background =
     volt < 10.8 ? 'var(--bad)' : volt < 11.4 ? 'var(--warn)' : 'var(--ok)';
 }
+
+function forgetBattery() {
+  elBattFill.style.width = '0%';
+  elBattText.textContent = '— %';
+  elBattVolt.textContent = '— В';
+}
+
+setInterval(() => {
+  if (battAt && Date.now() - battAt > BATT_TTL) {
+    battAt = 0;
+    forgetBattery();
+  }
+}, 1000);
 
 // ── Камера (IP Webcam) ───────────────────────────────────────────────────
 const camUrl = $('camUrl'), camBtn = $('camBtn'), videoBox = $('videoBox'), videoHint = $('videoHint');
@@ -488,8 +578,22 @@ camBtn.click();
 // присылает по SSE ссылку на реплику, мы её проигрываем. Браузеры не дают
 // запускать звук без действия пользователя — отсюда кнопка.
 const sndBtn = $('sndBtn'), caption = $('caption');
+// Своё имя вкладки. Микрофон может быть только один: две открытые вкладки
+// шлют звук в общий буфер, куски перемешиваются, и робот перестаёт разбирать
+// речь. Сервер по этому имени решает, чья очередь.
+const MIC_ID = Math.random().toString(36).slice(2, 10);
 const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=';
 const player = new Audio();
+// Радио — отдельный проигрыватель: реплики робота идут очередью и кончаются, а
+// поток играет, пока не выключат. Смешивать их в одном нельзя.
+const radio = new Audio();
+radio.preload = 'none';
+let radioLoud = 0.7;        // обычная громкость, робот меняет её голосом
+const RADIO_QUIET = 0.12;   // пока робот говорит или человек: слышно, но не мешает
+// Радио — бесконечный поток, трек из Яндекса кончается. Разница только в
+// этом, но она принципиальная: после трека кто-то должен поставить
+// следующий, и этот кто-то — робот. Пульт обязан сказать ему «доиграл».
+let trackMode = false;
 const speechQueue = [];
 let soundOn = false, playing = false, captionTimer = null;
 let speech = null;
@@ -513,14 +617,84 @@ function setSound(on) {
 
 sndBtn.addEventListener('click', () => setSound(!soundOn));
 
+// Приглушать музыку надо в двух случаях: когда говорит робот и когда говорит
+// человек. Второе — не удобство, а слух: под музыку распознавание сыпалось
+// с уверенности −0.25 до −0.75, а половина фраз возвращалась пустыми.
+// Автомагнитола делает то же самое под навигатор, только здесь навигатор —
+// это сам разговор.
+let duckUntil = 0, learnUntil = 0;
+// Во сколько раз сейчас тише играет музыка, чем на полной громкости. Единица
+// значит «приводить нечего»: музыки нет или она и так на полной.
+function долиМузыки() {
+  if (!radio || radio.paused || !radioLoud) return 1;
+  return Math.max(0.05, radio.volume / radioLoud);
+}
+function setRadioVolume() {
+  const duck = playing || Date.now() < duckUntil;
+  radio.volume = duck ? Math.min(RADIO_QUIET, radioLoud) : radioLoud;
+}
+// Микрофон тикает только когда он включён, а приглушение должно кончаться
+// само в любом случае — иначе выключенный микрофон оставит музыку тихой.
+setInterval(setRadioVolume, 300);
+
 function playNext() {
-  if (playing || !speechQueue.length) return;
+  if (playing || !speechQueue.length) {
+    if (!playing) setRadioVolume();
+    return;
+  }
   playing = true;
+  setRadioVolume();
   player.src = speechQueue.shift();
   player.play().catch(() => { playing = false; playNext(); });
 }
 player.addEventListener('ended', () => { playing = false; playNext(); });
 player.addEventListener('error', () => { playing = false; playNext(); });
+
+// «Доиграл» — единственное, что пульт сообщает роботу по своей воле. Ошибку
+// считаем тем же самым: битая ссылка не должна останавливать вечер, робот
+// просто поставит следующую песню.
+function trackDone(why) {
+  if (!trackMode) return;
+  trackMode = false;                 // одно сообщение на трек, не два
+  fetch('/music/ended', { method: 'POST', body: why || '' }).catch(() => {});
+}
+radio.addEventListener('ended', () => trackDone('конец'));
+// Поток может не пойти уже после запуска: кодек не тот, станция легла,
+// адрес переехал. Молчать об этом нельзя — робот-то отрапортовал «включаю»,
+// и человек будет думать, что оглох он, а не радио.
+radio.addEventListener('error', () => {
+  if (!radio.getAttribute('src')) return;
+  if (trackMode) { trackDone('ошибка'); return; }
+  showCaption('Радио не играет — станция молчит');
+});
+
+function playMusic(url) {
+  radio.src = url;
+  // Даём фону несколько секунд, чтобы подняться до уровня самой музыки, и всё
+  // это время не приглушаем. Иначе музыка глушит себя сама: она только что
+  // заиграла, фон ещё помнит тишину, и превышение над ним выглядит как
+  // «человек заговорил» — песня начиналась с трёх секунд шёпота.
+  learnUntil = Date.now() + FLOOR_LEARN;
+  duckUntil = 0;
+  setRadioVolume();
+  // Автовоспроизведение без жеста браузер запрещает. Звук в пульте включают
+  // кнопкой — этот жест и разрешает поток.
+  radio.play().catch(err => {
+    showCaption(err && err.name === 'NotAllowedError'
+      ? 'Нажмите 🔈, чтобы включить звук'
+      : 'Не пошло: ' + (err && err.message || 'неизвестно'));
+    // Отказ в проигрывании — тоже конец трека. Иначе робот будет ждать
+    // «доиграл» от песни, которая даже не начиналась.
+    trackDone('не пустили');
+  });
+}
+
+function stopMusic() {
+  trackMode = false;
+  radio.pause();
+  radio.removeAttribute('src');
+  radio.load();
+}
 
 function showCaption(text, mine) {
   if (!text) return;
@@ -544,6 +718,28 @@ function listen() {
       speechQueue.length = 0;
       player.pause();
       playing = false;
+      setRadioVolume();
+      return;
+    }
+    if (data['громкость'] !== undefined) {   // громкость музыки, не голоса
+      radioLoud = Math.min(1, Math.max(0, Number(data['громкость']) || 0));
+      setRadioVolume();
+      return;
+    }
+    if (data['трек'] !== undefined) {        // одна песня из Яндекса
+      const трек = data['трек'] || {};
+      if (!трек['адрес']) { stopMusic(); return; }
+      // Флаг ставим до play(): ошибка может прилететь синхронно, и без него
+      // робот не узнает, что песня не пошла, и будет ждать её вечно.
+      trackMode = true;
+      playMusic(трек['адрес']);
+      if (трек['название']) showCaption('♪ ' + трек['название']);
+      return;
+    }
+    if (data.radio !== undefined) {   // включить или выключить радио
+      trackMode = false;
+      if (!data.radio) { stopMusic(); return; }
+      playMusic(data.radio);
       return;
     }
     if (data.heard !== undefined) {   // что робот расслышал
@@ -591,13 +787,59 @@ if (localStorage.getItem('soundOn') === '1') {
 // getUserMedia работает только в защищённом контексте. По http://192.168…
 // браузер откажет — открывай пульт через localhost (см. README, туннель по
 // ssh) или разреши этот адрес в chrome://flags.
-const micBtn = $('micBtn');
+const micBtn = $('micBtn'), earBtn = $('earBtn');
 const MIC_RATE = 16000;                   // столько ждёт пайплайн робота
 const MIC_CHUNK = MIC_RATE / 4;           // четверть секунды в одном POST
 let micOn = false, micCtx = null, micStream = null, micNode = null;
 let micBuf = new Int16Array(0);           // готовый PCM, ждёт отправки
 let micRaw = new Float32Array(0);         // сырой вход, ждёт пересчёта
 let micPeak = 0, micSilentSince = 0;
+
+// Наушники. Эхоподавление браузера придумано против колонок: оно берёт то,
+// что играет система, и вычитает это из микрофона. Когда играет музыка, оно
+// работает непрерывно — и глушит заодно живой голос, потому что отличить
+// «остаток эха» от «человек говорит поверх» ему нечем. На живом роботе это
+// выглядело так: включили музыку — распознавание с −0.25 упало до −0.75, а
+// половина фраз вернулась пустыми, хотя человек был в наушниках и физически
+// эха не существовало.
+//
+// В наушниках подавлять нечего, поэтому просто выключаем. На колонках
+// оставляем: там эхо настоящее.
+// Телефон отличаем по грубому указателю: пальцем, а не мышью. На компьютере
+// пульт открывают в наушниках — тогда подавлять эхо вредно, оно съедает и
+// голос человека. На телефоне наушников нет, микрофон и динамик в одном
+// корпусе, и без подавления звук идёт сплошняком: робот не видит пауз, не
+// может нарезать фразы и выбрасывает всё как «непрерывный звук дольше 20 с».
+// Проверено на живом роботе — с телефона не разобралось ни одной фразы.
+const ЭТО_ТЕЛЕФОН = window.matchMedia('(pointer: coarse)').matches;
+const выбранное = localStorage.getItem('earsOn');
+let earsOn = выбранное === null ? !ЭТО_ТЕЛЕФОН : выбранное !== '0';
+
+function setEars(on) {
+  earsOn = on;
+  earBtn.textContent = on ? '🎧' : '🔈';
+  earBtn.classList.toggle('on', on);
+  earBtn.title = on
+    ? 'Я в наушниках: эхоподавление выключено, робот слышит чище'
+    : 'Звук из колонок: эхоподавление включено';
+  localStorage.setItem('earsOn', on ? '1' : '0');
+  // Правку можно применить на лету, не роняя поток: пересоздание микрофона
+  // на три секунды отдало бы его другой вкладке (см. X-Mic-Id).
+  const track = micStream && micStream.getAudioTracks()[0];
+  if (track) {
+    track.applyConstraints(micConstraints().audio).catch(() => {
+      if (micOn) { micStop(); micStart(); }
+    });
+  }
+}
+
+function micConstraints() {
+  return { audio: { channelCount: 1, echoCancellation: !earsOn,
+                    noiseSuppression: true, autoGainControl: true } };
+}
+
+earBtn.addEventListener('click', () => setEars(!earsOn));
+setEars(earsOn);
 
 // Браузер отдаёт микрофон на своей частоте (обычно 48 кГц) и просьбу про
 // 16 кГц может проигнорировать — проверено: приходило 31 кГц вместо 16, то
@@ -621,16 +863,13 @@ function downsample(input, inRate) {
 
 async function micStart() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    setStatus('микрофон запрещён: открой пульт через localhost', false);
+    setNote('микрофон запрещён: открой пульт через localhost');
     return;
   }
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true,
-               noiseSuppression: true, autoGainControl: true },
-    });
+    micStream = await navigator.mediaDevices.getUserMedia(micConstraints());
   } catch (e) {
-    setStatus('микрофон не дали: ' + e.name, false);
+    setNote('микрофон не дали: ' + e.name);
     return;
   }
   micCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -666,7 +905,17 @@ async function micStart() {
     while (micBuf.length >= MIC_CHUNK) {
       const part = micBuf.slice(0, MIC_CHUNK);
       micBuf = micBuf.slice(MIC_CHUNK);
-      fetch('/listen', { method: 'POST', body: part.buffer }).catch(() => {});
+      fetch('/listen', {
+        method: 'POST', body: part.buffer, headers: { 'X-Mic-Id': MIC_ID },
+      }).then(r => {
+        // 409 — микрофоном занята другая вкладка. Замолкаем и говорим об этом:
+        // молча слать звук в никуда хуже всего, человек будет думать, что
+        // робот оглох, и повторять всё громче.
+        if (r.status === 409 && micOn) {
+          micStop();
+          setNote('микрофон занят другой вкладкой пульта — закрой лишнюю');
+        }
+      }).catch(() => {});
     }
   };
 
@@ -675,10 +924,53 @@ async function micStart() {
   micOn = true;
   micPeak = 0;
   micSilentSince = Date.now();
+  // Микрофон часто включают под уже играющую песню, и тогда фону неоткуда
+  // узнать её уровень: быстрое доучивание заводится только при пуске музыки.
+  // Без этого первые полминуты музыка качалась тихо-громко впустую. Когда
+  // музыки нет, окна не открываем: оно бы выучило саму речь, и приглушение
+  // перестало бы срабатывать.
+  if (radio && !radio.paused) learnUntil = Date.now() + FLOOR_LEARN;
   micBtn.textContent = '🎙';
   micBtn.classList.add('on');
-  setStatus('микрофон включён (' + rate + ' Гц) — говори «Кузя, …»', true);
+  setNote('микрофон включён (' + rate + ' Гц, '
+          + (earsOn ? 'наушники' : 'колонки') + ') — говори «Кузя, …»');
 }
+
+// Фон: то, что микрофон слышит просто так — комната, вентилятор, а когда
+// играет музыка, то и она. Растёт медленно, падает быстро: иначе собственная
+// речь человека затянула бы фон наверх и приглушение перестало бы срабатывать.
+//
+// Держим его в пересчёте на полную громкость музыки, и это главное. Пока фон
+// мерился как есть, приглушение кормило само себя: убавили музыку — фон уехал
+// вниз вслед за ней — музыка вернулась на полную — это прочиталось как «кто-то
+// заговорил» — убавили снова. В тишине музыка качалась тихо-громко больше
+// восьмидесяти процентов времени, и выхода из этого не было.
+let micFloor = 0.02;
+// Полминуты на подъём. Раньше стояла сотая доля за блок — это восемь секунд, и
+// собственная речь человека затягивала фон наверх за пару секунд: на длинной
+// фразе музыка возвращалась на полную прямо посреди разговора. Фон комнаты
+// так быстро не меняется, спешить ему некуда.
+const FLOOR_UP = 0.002, FLOOR_DOWN = 0.08;
+// Сразу после включения музыки фон догоняет её быстро и приглушение молчит:
+// см. playMusic. Полторы секунды — это меньше, чем вступление любой песни.
+const FLOOR_FAST = 0.25, FLOOR_LEARN = 1500;
+// Насколько громче ожидаемого — это уже человек, а не комната. Считаем запасом
+// над ожидаемым уровнем, а не разами от фона: разами порог обгонял единицу —
+// физический предел шкалы — уже при музыке чуть громче середины, и приглушение
+// не срабатывало вовсе. То есть рабочего режима не было ни одного: фон не
+// выучен — вечное качание, выучен — приглушение мертво.
+const VOICE_OVER = 3.5;
+const ЗАПАС_МИН = 0.06;   // чтобы в тишине не приглушать от скрипа стула
+const ЗАПАС_МАКС = 0.20;  // чтобы порог не уезжал за предел шкалы
+const DUCK_HOLD = 1500;   // мс: столько держим музыку тихой после последнего слова
+// Сколько блоков подряд должно быть громко, чтобы это считалось речью. Блок —
+// около 85 мс, так что четыре это треть секунды непрерывного звука. Звон
+// посуды, хлопок двери и скрип стула в это не укладываются, а слово — да.
+// Без счётчика музыка приглушалась на каждый шорох в комнате: на живом роботе
+// это выглядело как «при каждом звуке уменьшает громкость», и правильно
+// выглядело — приглушал я, а не Яндекс.
+const VOICE_RUN = 4;
+let loudRun = 0;
 
 // Видимый уровень: без него «робот меня не слышит» проверяется только
 // командами на роботе. Кнопка краснеет, когда в микрофон реально говорят.
@@ -686,11 +978,29 @@ function micLevel(peak) {
   micPeak = Math.max(micPeak * 0.9, peak);
   micBtn.classList.toggle('talking', micPeak > 0.02);
   micBtn.title = 'уровень микрофона: ' + Math.round(micPeak * 100) + ' %';
+
+  const учимся = Date.now() < learnUntil;
+  const вверх = учимся ? FLOOR_FAST : FLOOR_UP;
+  const доля = долиМузыки();
+  // Приводим услышанное к полной громкости музыки — иначе фон поедет вслед за
+  // приглушением. Комнатный шум при этом слегка завышается, но он мал.
+  const приведённый = peak / доля;
+  micFloor += (приведённый - micFloor)
+              * (приведённый > micFloor ? вверх : FLOOR_DOWN);
+  // Сколько микрофон должен слышать прямо сейчас, при нынешней громкости.
+  const ожидаем = micFloor * доля;
+  const запас = Math.min(ЗАПАС_МАКС,
+                         Math.max(ЗАПАС_МИН, ожидаем * (VOICE_OVER - 1)));
+  const громко = peak > ожидаем + запас;
+  loudRun = громко && !учимся ? loudRun + 1 : 0;
+  if (loudRun >= VOICE_RUN) duckUntil = Date.now() + DUCK_HOLD;
+  setRadioVolume();
+
   if (micPeak > 0.02) {
     micSilentSince = Date.now();
   } else if (micSilentSince && Date.now() - micSilentSince > 5000) {
     micSilentSince = 0;
-    setStatus('микрофон отдаёт тишину — проверь устройство записи в Windows', false);
+    setNote('микрофон отдаёт тишину — проверь устройство записи в Windows');
   }
 }
 
@@ -698,6 +1008,12 @@ function micStop() {
   micOn = false;
   micBuf = new Int16Array(0);
   micRaw = new Float32Array(0);
+  micFloor = 0.02;
+  // Счётчик громких блоков тоже на ноль. Без этого микрофон, выключившийся сам
+  // (сервер отвечает 409, когда слушает кто-то другой), при следующем включении
+  // приглушал музыку от первого же звука вместо положенных четырёх блоков.
+  loudRun = 0;
+  duckUntil = 0;
   if (micNode) { micNode.disconnect(); micNode.onaudioprocess = null; micNode = null; }
   if (micCtx) { micCtx.close(); micCtx = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
@@ -719,11 +1035,18 @@ window.addEventListener('keydown', ev => {
   if (ev.code === 'Space') { ev.preventDefault(); emergencyStop(); }
 });
 
-// Отпустили всё при уходе со страницы — робот не должен уехать.
+// Отпустили всё при уходе со страницы — робот не должен уехать. Обнулить
+// команду мало: пока пэд считает палец прижатым, он вернёт её обратно, едва
+// человек вернётся на вкладку и шевельнёт мышью.
+function releaseAll() {
+  for (const release of joysticks) release();
+  cmd.x = cmd.y = cmd.wz = 0;
+  publishCmdVel();
+}
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { cmd.x = cmd.y = cmd.wz = 0; publishCmdVel(); }
+  if (document.hidden) releaseAll();
 });
-window.addEventListener('blur', () => { cmd.x = cmd.y = cmd.wz = 0; publishCmdVel(); });
+window.addEventListener('blur', releaseAll);
 </script>
 </body>
 </html>

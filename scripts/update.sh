@@ -41,7 +41,12 @@ fi
 
 # --- код -------------------------------------------------------------------
 BEFORE="$(git rev-parse HEAD)"
-if ! git fetch -q origin; then
+# Ограничение по времени обязательно. Молча потерянный TCP до GitHub вешает
+# fetch навсегда; юнит oneshot своего таймаута не имеет, таймер новый проход
+# не запускает, пока висит старый, — и обновления перестают приезжать до
+# перезагрузки, ни строчкой не пожаловавшись. А это единственный штатный путь
+# доставки кода на робота.
+if ! timeout 60 git fetch -q origin; then
   echo "==> нет связи с GitHub, попробую в следующий раз"
   exit 0
 fi
@@ -56,7 +61,16 @@ if ! git merge --ff-only -q '@{u}' 2>/dev/null; then
   echo "==> локальные изменения расходятся с GitHub, откладываю их как $MARK"
   # Незакоммиченное — в stash, коммиты — в ветку. Достать: git stash list,
   # git log local-*. Ничего не удаляется, но робот встаёт на код с GitHub.
-  git stash push -u -q -m "$MARK" || true
+  # Личность задаём явно: stash делает коммит и без user.name/user.email
+  # падает, а на роботе их обычно никто не настраивал. Раньше падение
+  # глоталось, и следующий reset --hard уносил правку, которую обещали
+  # сохранить.
+  if ! git -c user.name=robot -c user.email=robot@local \
+       stash push -u -q -m "$MARK"; then
+    echo "!! не смог отложить локальные правки — обновление подождёт"
+    echo "   разберитесь вручную: git -C $REPO status"
+    exit 0
+  fi
   git branch "$MARK" HEAD || true
   git reset -q --hard '@{u}'
 fi
@@ -99,7 +113,10 @@ done
 # (он же прокси камеры) — это код, его надо перезапускать.
 # robot-base и robot-bridge живут вне этого репозитория — дёргаем их только
 # если поменялся сам юнит. Иначе таймер остановит робота посреди команды.
-if echo "$CHANGED" | grep -q '^voice/'; then
+# Ровно то, что сервис исполняет. README и selftest.py лежат в той же папке,
+# меняются почти в каждом коммите, а перезапуск не бесплатен: заново
+# поднимается Whisper и теряется контекст разговора — посреди разговора.
+if echo "$CHANGED" | grep -qE '^voice/(robot_voice/|requirements\.txt$)'; then
   RESTART="$RESTART robot-voice"
 fi
 if echo "$CHANGED" | grep -q '^web/server\.py$'; then

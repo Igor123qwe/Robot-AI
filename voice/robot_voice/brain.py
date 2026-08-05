@@ -5,6 +5,11 @@ SDK. Причина в том, что робот может ходить не т
 через сторонний роутер: tool_runner живёт на beta-эндпоинте, а прокси такое
 обычно не пропускает. Обычный /v1/messages поддерживается везде.
 
+Собеседников может быть двое. Основной — модель на домашнем ПК: она отвечает
+за секунду, не стоит денег и работает без интернета. Запасной — облако: умнее,
+но платное и медленное. Робот сам ходит к тому, кто отвечает: ПК выключили —
+разговор продолжается через облако, и человек этого даже не замечает.
+
 Ответ отдаётся кусками, чтобы синтез речи начинался, не дожидаясь конца
 генерации.
 """
@@ -12,11 +17,14 @@ SDK. Причина в том, что робот может ходить не т
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import dataclass, field
 from typing import Callable
 
 import anthropic
 
 from .config import SYSTEM_PROMPT, Config
+from .net import почему
 from .tools import Tool
 
 log = logging.getLogger(__name__)
@@ -30,32 +38,310 @@ HISTORY_LIMIT = 8
 # Предохранитель от зацикливания: модель не должна дёргать инструменты вечно.
 MAX_TOOL_ROUNDS = 6
 
+# Предел ответа домашней модели. Общий предел в настройках большой, потому что
+# облачная модель размышляет и размышления идут в тот же счёт. Домашней столько
+# не нужно: реплика вслух — сорок-восемьдесят токенов, с вызовом инструмента
+# вдвое больше. А вред от большого предела живой: на зацикленную фразу модель
+# однажды выдала восемь тысяч токенов, робот говорил полминуты, и всё это время
+# звук копился и выбрасывался — две тысячи потерянных кадров.
+МЕСТНЫЙ_ПРЕДЕЛ = 384
+
 # Сколько ждём ответа. Умолчание SDK — десять минут: для голосового робота это
 # вечность, потому что микрофон всё это время заглушён, а если модель успела
 # вызвать drive — робот в это время едет и не слышит «стоп».
 TIMEOUT_SECONDS = 25.0
+
+# Сколько ждём, пока установится связь с ПК. Читать ответ можно долго —
+# генерация идёт секунды, — а вот дозваниваться нельзя: если ПК выключен или
+# спит, каждая фраза упрётся в это ожидание, и робот будет молчать вместо того
+# чтобы ответить через облако.
+CONNECT_SECONDS = 2.0
+
+# Столько не трогаем собеседника, который не отозвался. Иначе робот будет
+# проверять выключенный ПК на каждой фразе и каждый раз терять на этом время.
+DOWN_SECONDS = 60.0
+
+
+# По чему видно, что запрос неправилен сам по себе, а не разошёлся с этим
+# собеседником. Ошибка указывает на устройство запроса — на инструменты, на
+# переписку, на предел длины, — и такой запрос отвергнет кто угодно.
+#
+# Различать это важно, а по коду ответа не выходит. «400» бывает и про то, и
+# про другое: опечатка в имени модели — тоже 400, но она про одного
+# собеседника, и у следующего всё получится. Поэтому смотрим, на ЧТО ошибка
+# показывает пальцем. Про «model» здесь намеренно нет.
+_НАШИ_ПРОМАХИ = ("input_schema", "tools.", "tool_choice", "messages.",
+                 "system:", "max_tokens", "property keys", "properties:")
+
+
+def наша_вина(ошибка: Exception) -> bool:
+    """Отвергнут ли запрос за то, что он неправильно составлен.
+
+    Собеседник может лежать — тогда помогает следующий. Неправильный запрос
+    отвергнут будет везде одинаково, и перебор ничего не даст: он только
+    пометит здоровых мёртвыми и оставит робота без единого собеседника на
+    минуту вперёд.
+
+    В текст приходится смотреть и по второй причине. Шлюз между роботом и
+    моделью заворачивает чужие ошибки в свои: в живом случае пять провайдеров
+    подряд ответили «invalid_request_error» про схему инструментов, а наружу
+    это вышло как overloaded_error — «перегружен, попробуй позже». По коду и
+    по типу ошибки такое не отличить вовсе.
+
+    Сомневаешься — отвечай «нет»: тогда робот просто пойдёт к следующему, как
+    и раньше. Ошибиться в эту сторону дешевле.
+    """
+    текст = str(ошибка).lower()
+    return any(след in текст for след in _НАШИ_ПРОМАХИ)
+
+
+# Сколько ждём соединения с облаком. Больше, чем до ПК: интернет через
+# двойной NAT отзывается не мгновенно. Но не двадцать пять: одним числом
+# httpx задаёт ВСЕ таймауты сразу, включая дозвон, а с max_retries=1 это
+# давало до пятидесяти секунд молчания при пропавшем интернете.
+CLOUD_CONNECT_SECONDS = 5.0
+
+
+def _timeout(connect: float):
+    """Таймаут запроса: связь коротко, чтение долго.
+
+    Без httpx (так бывает в самопроверке, где клиент модели подменён
+    заглушкой) отдаём одно число — SDK его тоже понимает.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return TIMEOUT_SECONDS
+    return httpx.Timeout(TIMEOUT_SECONDS, connect=connect)
+
+
+class Thinkless:
+    """Не даёт роботу зачитать вслух ход мысли модели.
+
+    Две разные беды, и обе здесь.
+
+    Первая — обычная пара <think>…</think> посреди текста. Разбирается влёт,
+    с оглядкой на то, что тег легко разрывается между кусками потока: «<thi» в
+    одном, «nk>» в другом.
+
+    Вторая — закрывающий тег БЕЗ открывающего. Так делает Qwen3: открывающий
+    уже стоит в шаблоне запроса, поэтому ответ начинается сразу ВНУТРИ
+    размышлений, а наружу выходит только закрывающий. Фильтр, знающий только
+    про пары, пропускает такое целиком — на живом роботе он зачитал вслух
+    полторы страницы рассуждений о том, каким должен быть ответ.
+
+    Значит, пока не увидели </think>, про начало ответа ничего не известно, и
+    говорить нельзя. Первая версия придерживала начало на триста символов и
+    отпускала: мол, размышлений нет. На живом роботе размышления оказались в
+    пять раз длиннее — и он снова зачитал их вслух, до последнего слова.
+    Порога, который отличает «размышлений нет» от «размышления длинные», не
+    существует: и то и другое выглядит как текст без тега.
+
+    Поэтому порога нет. Зато есть привычка: думает модель вслух или нет —
+    свойство модели, а не отдельной реплики. Выясняется по первому же ответу и
+    запоминается в собеседнике (Endpoint.thinks) на весь запуск:
+
+      неизвестно — держим до </think> или до конца ответа, что раньше;
+      думает     — держим до </think>, сколько бы его ни ждать;
+      не думает  — отдаём сразу, с первого куска, потоком.
+
+    Платим одним нестримленным ответом на собеседника за запуск. Ответ робота —
+    одна-две фразы, так что цена этому — доли секунды, а не полторы страницы
+    рассуждений вслух.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self, emit: Callable[[str], None], habit=None) -> None:
+        self.emit = emit
+        self.habit = habit
+        self.buf = ""
+        self.inside = False
+        self.head = ""
+        # Известного молчуна не придерживаем совсем: он уже доказал делом.
+        self.holding = getattr(habit, "thinks", None) is not False
+
+    def _learn(self, thinks: bool) -> None:
+        if self.habit is None:
+            return
+        was = getattr(self.habit, "thinks", None)
+        if was is thinks:
+            return
+        # Учимся несимметрично. «Думает» — доказанный факт: тег видели своими
+        # глазами. «Не думает» — всего лишь отсутствие улики, и принимаем его
+        # только пока ничего не знаем. Иначе один короткий ответ без тега
+        # переубеждает фильтр, тот перестаёт держать начало — и следующие
+        # размышления едут прямиком в речь.
+        if not thinks and was is not None:
+            return
+        log.info("%s: модель %s вслух",
+                 getattr(self.habit, "name", "собеседник"),
+                 "думает" if thinks else "не думает")
+        self.habit.thinks = thinks
+
+    def feed(self, chunk: str) -> None:
+        if self.holding:
+            self.head += chunk
+            at = self.head.find(self.CLOSE)
+            if at < 0:
+                return
+            opened = self.head.find(self.OPEN)
+            if 0 <= opened < at:
+                # Обычная пара: начало ответа — настоящий текст, а размышления
+                # идут после него. Отдаём как есть, разберёт разбор пар.
+                rest, self.head, self.holding = self.head, "", False
+                self._pairs(rest)
+                return
+            # Закрывающий без открывающего: всё до него было размышлением.
+            self._learn(True)
+            rest = self.head[at + len(self.CLOSE):].lstrip()
+            self.head, self.holding = "", False
+            if rest:
+                self._pairs(rest)
+            return
+        self._pairs(chunk)
+
+    def _pairs(self, chunk: str) -> None:
+        """Обычный разбор пары тегов, когда начало ответа уже выяснено."""
+        self.buf += chunk
+        while self.buf:
+            tag = self.CLOSE if self.inside else self.OPEN
+            at = self.buf.find(tag)
+            if not self.inside:
+                # Одинокий закрывающий может прийти и сюда — если модель
+                # раньше не думала, мы ей поверили и отпустили поток. Тогда
+                # это ошибка привычки: запоминаем правду и бросаем всё, что
+                # успело накопиться. Сказанное вслух уже не вернуть, но
+                # остаток размышлений хотя бы не прозвучит.
+                lone = self.buf.find(self.CLOSE)
+                if lone >= 0 and (at < 0 or lone < at):
+                    self._learn(True)
+                    self.buf = self.buf[lone + len(self.CLOSE):].lstrip()
+                    continue
+            if at >= 0:
+                if not self.inside and at:
+                    self.emit(self.buf[:at])
+                self.buf = self.buf[at + len(tag):]
+                self.inside = not self.inside
+                continue
+            # Тега нет. Оставляем в буфере хвост, которым тег мог бы начаться,
+            # а остальное отдаём — иначе речь пойдёт рывками по одному куску.
+            keep = max(_tail_of(self.buf, self.OPEN), _tail_of(self.buf, self.CLOSE))
+            if not self.inside and len(self.buf) > keep:
+                self.emit(self.buf[:len(self.buf) - keep])
+            self.buf = self.buf[len(self.buf) - keep:]
+            return
+
+    def close(self) -> None:
+        """Ответ кончился: придержанное так и не оказалось размышлением."""
+        if self.holding:
+            # Ответ дошёл до конца, а закрывающего тега не было ни разу.
+            # Значит эта модель вслух не думает, и держать её впредь незачем.
+            self._learn(False)
+            rest, self.head, self.holding = self.head, "", False
+            if rest:
+                self._pairs(rest)
+        if self.buf and not self.inside:
+            self.emit(self.buf)
+        self.buf = ""
+
+
+def _tail_of(text: str, tag: str) -> int:
+    """Длина хвоста text, который является началом tag."""
+    for n in range(min(len(text), len(tag) - 1), 0, -1):
+        if tag.startswith(text[-n:]):
+            return n
+    return 0
+
+
+@dataclass
+class Endpoint:
+    """Один собеседник: куда идти, какой моделью и во сколько это обходится."""
+
+    name: str
+    client: object
+    model: str
+    effort: str
+    # Локальная модель ничего не стоит, и мешать её токены с облачными нельзя:
+    # счётчик расхода тогда перестанет показывать деньги.
+    paid: bool = True
+    # Кэширование постоянной части промпта. Облако его понимает, локальная
+    # модель — почти наверняка нет: отключим на первом же отказе.
+    use_cache: bool = True
+    # Предел ответа. У облака он общий и большой: там модель размышляет, и
+    # размышления идут в тот же счёт. Домашней модели столько не нужно и
+    # вредно: на мусорную фразу она однажды выдала восемь тысяч токенов,
+    # говорила полминуты, а звук в это время копился и выбрасывался. Реплика
+    # вслух — это сорок-восемьдесят токенов, с вызовом инструмента вдвое
+    # больше. None значит «брать общий предел из настроек».
+    max_tokens: int | None = None
+    # До какого момента не беспокоить: он только что не отозвался.
+    down_until: float = 0.0
+    # Думает ли эта модель вслух, вписывая рассуждения прямо в текст ответа.
+    # Свойство модели, а не реплики: выясняется по первому же ответу (см.
+    # Thinkless) и дальше экономит задержку на всех остальных.
+    thinks: bool | None = None
+    # Свой счётчик расхода — чтобы видеть, сколько разговора ушло мимо кассы.
+    spent_in: int = 0
+    spent_out: int = 0
 
 
 class Brain:
     def __init__(self, cfg: Config, tools: list[Tool]) -> None:
         self.cfg = cfg
         self.tools = {t.name: t for t in tools}
-        self.specs = [t.spec() for t in tools]
+        # Модели показываем не всё: постоянная часть промпта уезжает в каждом
+        # запросе и оплачивается каждый раз. Правила закрывают таймеры,
+        # список, громкость и прочее — модели эти схемы возить незачем.
+        self.specs = [t.spec() for t in tools if not t.hidden]
 
-        client_args = {
-            "api_key": cfg.api_key,
-            "timeout": TIMEOUT_SECONDS,
-            # Две попытки: сетевой сбой бывает, но ждать третью робот не может.
-            "max_retries": 1,
-        }
-        if cfg.api_base:
-            client_args["base_url"] = cfg.api_base
-        self.client = anthropic.Anthropic(**client_args)
+        # Кто сейчас говорит и что робот о нём помнит. Ставится главным циклом
+        # перед каждой репликой; пусто — человек не узнан.
+        self.about = ""
+
+        # Кто ответил в прошлый раз и кого мы предпочитаем. Нужно, чтобы
+        # сказать человеку, когда робот съехал на запасного: сам он это
+        # заметит только по скорости и по счёту за облако.
+        self.ответил: str = ""
+        # Какие инструменты модель позвала на последнем ходу. Нужно, чтобы
+        # поймать самое обидное враньё: на «поезжай вперёд» модель отвечает
+        # «Приехал», не позвав drive. Слова робота при этом безупречны, а
+        # робот стоит на месте, и человек об этом не догадывается.
+        self.позвал: list[str] = []
+        self.endpoints: list[Endpoint] = []
+        if cfg.local_api_base:
+            # Основной. Ключ тут формальность: своя машина в своей сети пароля
+            # не спрашивает, но SDK без ключа работать отказывается.
+            self.endpoints.append(Endpoint(
+                name=f"ПК ({cfg.local_api_base})",
+                client=self._client(cfg.local_api_key, cfg.local_api_base,
+                                    CONNECT_SECONDS, retries=0),
+                model=cfg.local_model,
+                # Маленькая модель этого параметра не знает, и слать его
+                # незачем: первый же запрос уйдёт в отказ и потеряет секунду.
+                effort="",
+                paid=False,
+                use_cache=False,
+                max_tokens=МЕСТНЫЙ_ПРЕДЕЛ,
+            ))
+        if cfg.api_key:
+            self.endpoints.append(Endpoint(
+                name=cfg.api_base or "api.anthropic.com",
+                client=self._client(cfg.api_key, cfg.api_base,
+                                    CLOUD_CONNECT_SECONDS),
+                model=cfg.model,
+                effort=cfg.effort,
+            ))
+        elif not self.endpoints:
+            raise SystemExit("Не задан ни ANTHROPIC_API_KEY, ни ROBOT_LOCAL_API_BASE "
+                             "— разговаривать не с кем.")
+        else:
+            # Без ключа облачный собеседник не запасной, а мина: вместо
+            # обрыва связи прилетит отказ авторизации на каждой фразе.
+            log.info("облачного ключа нет — работаю только через ПК")
 
         self.history: list[dict] = []
-        # Кэширование постоянной части промпта. Сторонний роутер может его не
-        # знать — тогда отключим на первом же отказе и продолжим без него.
-        self._use_cache = True
         # Расход с момента запуска — чтобы видеть цену вопроса, а не гадать.
         self.total_in = 0
         self.total_out = 0
@@ -63,21 +349,53 @@ class Brain:
         # перезапускается после сбоя, а разговор от этого не свежеет.
         self.last_talk = 0.0
 
+    @staticmethod
+    def _client(key: str, base: str, connect: float, retries: int = 1):
+        args = {
+            "api_key": key,
+            "timeout": _timeout(connect),
+            # Облаку — две попытки: сетевой сбой бывает, но ждать третью робот
+            # не может. Домашнему ПК — одна: за ним стоит облако, ради
+            # которого вся конструкция и написана, а повтор к выключенной
+            # машине стоил лишние две секунды плюс пауза на каждой первой
+            # фразе минуты.
+            "max_retries": retries,
+        }
+        if base:
+            args["base_url"] = base
+        return anthropic.Anthropic(**args)
+
+    # --- выбор собеседника ------------------------------------------------
+    def _live(self, smart: bool = False) -> list[Endpoint]:
+        """Кого сейчас имеет смысл спрашивать, в порядке предпочтения.
+
+        smart — человек попросил позвать умного. Тогда порядок переворачивается:
+        сначала облако, а домашняя модель остаётся запасной на случай, если
+        интернета нет. Платить за это решает человек, вслух и осознанно.
+        """
+        now = time.monotonic()
+        live = [e for e in self.endpoints if e.down_until <= now]
+        if smart:
+            live.sort(key=lambda e: not e.paid)
+        # Если отдыхают все — облако всё равно пробуем: лучше подождать, чем
+        # отказать человеку, пока идёт отсчёт.
+        return live or self.endpoints[-1:]
+
     # --- параметры запроса ----------------------------------------------
-    def _params(self, messages: list[dict]) -> dict:
+    def _params(self, ep: Endpoint, messages: list[dict]) -> dict:  # noqa: C901
         params = dict(
-            model=self.cfg.model,
-            max_tokens=self.cfg.max_tokens,
+            model=ep.model,
+            max_tokens=ep.max_tokens or self.cfg.max_tokens,
             system=SYSTEM_PROMPT,
             tools=self.specs,
             messages=messages,
         )
         # effort понимают не все: у роутера или у сторонней модели его может
         # не быть. Пустое значение — не отправлять.
-        if self.cfg.effort:
-            params["output_config"] = {"effort": self.cfg.effort}
+        if ep.effort:
+            params["output_config"] = {"effort": ep.effort}
 
-        if self._use_cache:
+        if ep.use_cache:
             # Промпт и схемы инструментов байт в байт одинаковы в каждом
             # запросе — около 1300 токенов, которые незачем оплачивать заново.
             # Отметка ставится на системный блок: инструменты идут перед ним,
@@ -87,120 +405,236 @@ class Brain:
                 "text": SYSTEM_PROMPT,
                 "cache_control": {"type": "ephemeral"},
             }]
+        if self.about:
+            # Справка о том, кто сейчас говорит, — отдельным блоком и ПОСЛЕ
+            # кэшируемого. Она меняется от человека к человеку, и если
+            # подмешать её в основной промпт, кэш перестанет совпадать: полторы
+            # тысячи токенов начнут оплачиваться заново в каждой реплике.
+            after = [{"type": "text", "text": self.about}]
+            params["system"] = (params["system"] if isinstance(params["system"], list)
+                                else [{"type": "text", "text": params["system"]}]) + after
         return params
 
-    def _degrade(self, error: Exception) -> bool:
+    @staticmethod
+    def _degrade(ep: Endpoint, error: Exception) -> bool:
         """Отключает необязательный параметр, который не понял собеседник.
 
-        Сторонний роутер может не знать ни кэширования, ни effort. Раньше
-        отступление стояло вокруг вызова messages.stream(), а он запрос не
-        делает — HTTP уходит только при входе в with. Поэтому отступление
-        не срабатывало никогда, и робот отвечал «что-то пошло не так» на
-        каждый разговорный вопрос до конца жизни процесса.
+        Ни сторонний роутер, ни модель на ПК могут не знать ни кэширования,
+        ни effort. Раньше отступление стояло вокруг вызова messages.stream(),
+        а он запрос не делает — HTTP уходит только при входе в with. Поэтому
+        отступление не срабатывало никогда, и робот отвечал «что-то пошло не
+        так» на каждый разговорный вопрос до конца жизни процесса.
+
+        Причину смотрим обязательно. Раньше гасилось на ЛЮБУЮ четырёхсотую —
+        а её даёт и слишком длинный контекст, и испорченная история. Кэш при
+        этом выключался навсегда, до перезапуска процесса: полторы тысячи
+        токенов постоянной части начинали оплачиваться целиком в каждой
+        реплике вместо десяти процентов. Плюс терялся effort, то есть ответы
+        становились медленнее — ровно там, где важнее всего скорость.
         """
-        if self._use_cache:
-            log.warning("кэширование промпта не принято (%s) — работаю без него", error)
-            self._use_cache = False
+        text = str(error).lower()
+        if ep.use_cache and ("cache" in text or "ephemeral" in text):
+            log.warning("%s: кэширование промпта не принято (%s) — работаю без него",
+                        ep.name, error)
+            ep.use_cache = False
             return True
-        if self.cfg.effort:
-            log.warning("параметр effort не принят (%s) — убираю", error)
-            self.cfg.effort = ""
+        if ep.effort and ("effort" in text or "output_config" in text):
+            log.warning("%s: параметр effort не принят (%s) — убираю", ep.name, error)
+            ep.effort = ""
             return True
         return False
 
-    def _round(self, messages: list[dict], on_text: Callable[[str], None]):
-        """Один запрос к модели: отдаёт текст кусками, возвращает ответ целиком."""
+    def _ask(self, ep: Endpoint, messages: list[dict], on_text: Callable[[str], None]):
+        """Один запрос к одному собеседнику.
+
+        Размышления режем здесь, а не выше по течению: думает модель вслух или
+        нет — свойство собеседника, и фильтру нужно знать, к кому он приставлен.
+        """
         while True:
             try:
-                with self.client.messages.stream(**self._params(messages)) as stream:
+                # Заводим на каждую попытку заново: отступление (_degrade)
+                # роняет запрос до первого куска текста, и нести в новый
+                # запрос полбуфера от старого нельзя.
+                thinkless = Thinkless(on_text, ep)
+                with ep.client.messages.stream(**self._params(ep, messages)) as stream:
                     for event in stream:
                         if (event.type == "content_block_delta"
                                 and getattr(event.delta, "type", "") == "text_delta"):
-                            on_text(event.delta.text)
+                            thinkless.feed(event.delta.text)
+                    thinkless.close()
                     return stream.get_final_message()
             except anthropic.BadRequestError as e:
-                if not self._degrade(e):
+                if not self._degrade(ep, e):
                     raise
 
+    def _round(self, messages: list[dict], on_text: Callable[[str], None],
+               smart: bool = False):
+        """Один запрос к модели: отдаёт текст кусками, возвращает ответ целиком.
+
+        Молчащего собеседника обходим и идём к следующему. Возвращаем ещё и
+        того, кто ответил: от этого зависит, писать ли расход в деньги.
+        """
+        said = False
+
+        def watch(chunk: str) -> None:
+            nonlocal said
+            said = True
+            on_text(chunk)
+
+        failure: Exception | None = None
+        for ep in self._live(smart):
+            try:
+                ответ = ep, self._ask(ep, messages, watch)
+                self.ответил = ep.name
+                return ответ
+            # Две сестринские ветки, и нужны обе. APIConnectionError — ПК
+            # выключен или сети нет. APIStatusError — ответил, но плохо:
+            # модель не скачана в Ollama (404), Ollama не запущена (500),
+            # опечатка в имени модели (400). Раньше ловилась только первая,
+            # и вторая убивала ход целиком: облако не пробовалось ни разу,
+            # ПК не откладывался, и робот отвечал «что-то пошло не так» на
+            # каждую фразу при полностью живом облаке.
+            except (anthropic.APIConnectionError, anthropic.APIStatusError) as e:
+                failure = e
+                if said:
+                    # Часть ответа уже прозвучала вслух. Начинать заново
+                    # нельзя: человек услышит начало фразы дважды.
+                    raise
+                if наша_вина(e):
+                    # Запрос неправилен сам по себе — его отвергнет кто угодно.
+                    # К следующему всё-таки сходим (вдруг он снисходительнее),
+                    # но мёртвым не помечаем: собеседник ни при чём. Иначе
+                    # одна наша ошибка выводит из строя всех разом, и следующую
+                    # минуту робот не спрашивает никого, хотя спросить есть
+                    # кого. Ровно так и вышло с русскими именами полей в схемах.
+                    log.error("%s отверг запрос как неправильный (%s) — "
+                              "это наша ошибка, а не его", ep.name, e)
+                    continue
+                ep.down_until = time.monotonic() + DOWN_SECONDS
+                log.warning("%s не отвечает: %s — иду к следующему",
+                            ep.name, почему(e))
+                log.debug("%s не отвечает, целиком", ep.name, exc_info=True)
+        raise failure
+
     # --- один ход --------------------------------------------------------
-    def reply(self, user_text: str, on_text: Callable[[str], None]) -> str:
-        """Отвечает на реплику. on_text вызывается на каждый кусок текста."""
+    def reply(self, user_text: str, on_text: Callable[[str], None],
+              smart: bool = False) -> str:
+        """Отвечает на реплику. on_text вызывается на каждый кусок текста.
+
+        smart — спросили умного: этот ход идёт в облако, за деньги.
+        """
         messages = self.history + [{"role": "user", "content": user_text}]
+        self.позвал = []
         spoken: list[str] = []
         used_in = used_out = cached = written = 0
         truncated = False
 
-        def collect(chunk: str) -> None:
+        def emit(chunk: str) -> None:
             spoken.append(chunk)
             on_text(chunk)
 
         rounds = 0
-        for rounds in range(1, MAX_TOOL_ROUNDS + 1):
-            message = self._round(messages, collect)
+        answered: Endpoint | None = None
+        try:
+            for rounds in range(1, MAX_TOOL_ROUNDS + 1):
+                answered, message = self._round(messages, emit, smart)
 
-            usage = getattr(message, "usage", None)
-            if usage is not None:
-                used_in += getattr(usage, "input_tokens", 0) or 0
-                used_out += getattr(usage, "output_tokens", 0) or 0
-                cached += getattr(usage, "cache_read_input_tokens", 0) or 0
-                # Запись в кэш тоже оплачивается и в input_tokens не попадает:
-                # без неё счётчик врал в меньшую сторону каждый раз, когда
-                # промпт клался в кэш заново.
-                written += getattr(usage, "cache_creation_input_tokens", 0) or 0
+                usage = getattr(message, "usage", None)
+                if usage is not None:
+                    used_in += getattr(usage, "input_tokens", 0) or 0
+                    used_out += getattr(usage, "output_tokens", 0) or 0
+                    cached += getattr(usage, "cache_read_input_tokens", 0) or 0
+                    # Запись в кэш тоже оплачивается и в input_tokens не
+                    # попадает: без неё счётчик врал в меньшую сторону каждый
+                    # раз, когда промпт клался в кэш заново.
+                    written += getattr(usage, "cache_creation_input_tokens", 0) or 0
 
-            if message.stop_reason == "max_tokens":
-                truncated = True
-                log.warning("ответ обрезан по лимиту в %d токенов", self.cfg.max_tokens)
+                if message.stop_reason == "max_tokens":
+                    truncated = True
+                    log.warning("ответ обрезан по лимиту в %d токенов",
+                                self.cfg.max_tokens)
 
-            if message.stop_reason == "refusal":
-                log.warning("модель отказалась отвечать: %s",
-                            getattr(message, "stop_details", None))
-                return "Извини, на это я ответить не могу."
+                if message.stop_reason == "refusal":
+                    log.warning("модель отказалась отвечать: %s",
+                                getattr(message, "stop_details", None))
+                    # Именно вслух: возвращаемое значение никто не
+                    # озвучивает, и раньше робот на отказ просто молчал —
+                    # человек не понимал, услышали его вообще или нет.
+                    emit("Извини, на это я ответить не могу.")
+                    break
 
-            messages.append({"role": "assistant", "content": message.content})
+                messages.append({"role": "assistant", "content": message.content})
 
-            calls = [b for b in message.content if b.type == "tool_use"]
-            if not calls:
-                break
+                calls = [b for b in message.content if b.type == "tool_use"]
+                if not calls:
+                    break
 
-            results = []
-            for call in calls:
-                tool = self.tools.get(call.name)
-                if tool is None:
-                    log.warning("модель зовёт несуществующий инструмент %s", call.name)
-                    output = f"Инструмента {call.name} не существует."
-                else:
-                    log.info("вызываю %s(%s)", call.name, call.input)
-                    output = tool(call.input or {})
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": call.id,
-                    "content": output,
-                })
-            # Все результаты — одним сообщением, иначе модель разучится
-            # вызывать инструменты пачкой.
-            messages.append({"role": "user", "content": results})
-        else:
-            log.warning("исчерпан лимит вызовов инструментов за один ход (%d)", rounds)
+                results = []
+                for call in calls:
+                    self.позвал.append(call.name)
+                    tool = self.tools.get(call.name)
+                    if tool is None:
+                        log.warning("модель зовёт несуществующий инструмент %s",
+                                    call.name)
+                        output = f"Инструмента {call.name} не существует."
+                    else:
+                        log.info("вызываю %s(%s)", call.name, call.input)
+                        output = tool(call.input or {})
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": output,
+                    })
+                # Все результаты — одним сообщением, иначе модель разучится
+                # вызывать инструменты пачкой.
+                messages.append({"role": "user", "content": results})
+            else:
+                log.warning("исчерпан лимит вызовов инструментов за один ход (%d)",
+                            rounds)
+                if not spoken:
+                    # Шесть оплаченных кругов и ни слова вслух — худший из
+                    # исходов: человек не понимает, услышали его или нет.
+                    # Седьмой запрос делать не станем: это ещё круг с самой
+                    # длинной историей ровно там, где всё уже пошло не так.
+                    emit("Что-то я запутался, скажи иначе.")
 
-        self.total_in += used_in + written
-        self.total_out += used_out
-        details = []
-        if cached:
-            details.append(f"из кэша {cached}")
-        if written:
-            details.append(f"в кэш {written}")
-        log.info("токены: %d вход + %d выход%s | всего за сеанс %d + %d",
-                 used_in + written, used_out,
-                 f" ({', '.join(details)})" if details else "",
-                 self.total_in, self.total_out)
+            if truncated:
+                # Иначе робот замолкает на полуслове, и понять почему нельзя:
+                # человек думает, что он отвлёкся, и повторяет вопрос.
+                emit(" Дальше не помещаюсь, спроси покороче.")
+        finally:
+            # Всё, что ниже, должно случиться и после сбоя.
+            #
+            # История — потому что инструменты первых кругов уже выполнились
+            # по-настоящему: будильник поставлен, робот поехал, пункт записан.
+            # Раньше при обрыве это в историю не попадало, человек слышал
+            # «сейчас я без интернета», повторял просьбу — и действие
+            # делалось дважды.
+            #
+            # Расход — потому что потраченные круги оплачены независимо от
+            # того, чем ход кончился, и счётчик, который их теряет, врёт.
+            self.history = _trim(messages)
 
-        if truncated:
-            # Иначе робот замолкает на полуслове, и понять почему нельзя:
-            # человек думает, что он отвлёкся, и повторяет вопрос.
-            collect(" Дальше не помещаюсь, спроси покороче.")
+            if answered is not None:
+                answered.spent_in += used_in + written
+                answered.spent_out += used_out
+                # В общий счёт идёт только платное. Иначе цифра «всего за
+                # сеанс» перестанет означать деньги, а ради неё она и заведена.
+                if answered.paid:
+                    self.total_in += used_in + written
+                    self.total_out += used_out
+            details = []
+            if cached:
+                details.append(f"из кэша {cached}")
+            if written:
+                details.append(f"в кэш {written}")
+            log.info("отвечал %s | токены: %d вход + %d выход%s | "
+                     "платных за сеанс %d + %d",
+                     answered.name if answered else "никто",
+                     used_in + written, used_out,
+                     f" ({', '.join(details)})" if details else "",
+                     self.total_in, self.total_out)
 
-        self.history = _trim(messages)
         return "".join(spoken).strip()
 
     def reset(self) -> None:
