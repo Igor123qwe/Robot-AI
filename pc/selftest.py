@@ -649,6 +649,35 @@ def test_unthink() -> None:
     check("один ответ без тега не отменяет доказанного", привычка.get("м"), True)
 
 
+def test_gigaam() -> None:
+    """GigaAM живёт рядом с Whisper и по тому же договору.
+
+    Он точнее на русском — семьсот тысяч часов против доли русского у Whisper,
+    и на коротких редких словах вроде имени робота это заметно. Но уверенности
+    он не отдаёт, и это не мелочь: по ней робот решает, можно ли по фразе
+    ехать. Поэтому выбор за человеком, а по умолчанию остаётся Whisper.
+    """
+    section("распознавание GigaAM")
+    g = kuzya_pc.GigaAM()
+    check("договор тот же, что у Whisper",
+          (hasattr(g, "transcribe"), hasattr(g, "warm"), hasattr(g, "size")),
+          (True, True, True))
+    check("модель по умолчанию — третья версия", g.size.startswith("v3"), True)
+    check("до прогрева ничего не грузит", g._model, None)
+
+    # Уверенности нет — и это должно быть сказано честно, а не выдумано числом.
+    исходник = (Path(__file__).resolve().parent / "kuzya_pc.py"
+                ).read_text(encoding="utf-8")
+    кусок = исходник[исходник.index("class GigaAM"):исходник.index("class Voiceprints")]
+    check("возвращает None вместо выдуманной уверенности",
+          "return text, None" in кусок, True)
+    # По умолчанию — Whisper: молча менять распознаватель нельзя.
+    check("по умолчанию остаётся whisper",
+          '"--stt", default="whisper"' in исходник, True)
+    check("и если GigaAM не встанет — не оглохнем",
+          "распознаю Whisper" in исходник, True)
+
+
 def test_no_initial_prompt() -> None:
     """Подсказки распознаванию быть не должно, и это проверяется.
 
@@ -729,7 +758,7 @@ def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
     for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch,
                  test_tool_call, test_broken,
-                 test_unthink, test_no_initial_prompt, test_stt_confidence, test_health):
+                 test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health):
         test()
         print("   ...")
     if FAILED:

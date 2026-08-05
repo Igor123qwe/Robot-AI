@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import contextlib
 import os
 import sys
 import threading
@@ -761,6 +762,84 @@ class Whisper:
                  spent, length, spent / length if length else 0,
                  f"{sure:.2f}" if sure is not None else "—", text)
         return text, sure
+
+
+class GigaAM:
+    """Русское распознавание от Сбера. Тот же договор, что у Whisper.
+
+    Зачем оно рядом с Whisper. Whisper многоязычен, и русский в нём — доля
+    общего корпуса; GigaAM учили на семистах тысячах часов русской речи, и на
+    коротких редких словах — вроде имени робота — это заметно. Ради этого он
+    сюда и добавлен.
+
+    Чем платим — сказать честно. GigaAM не отдаёт уверенность: у Whisper есть
+    avg_logprob, по которому робот решает, можно ли по фразе ехать, а здесь
+    такого числа нет. Значит с ним отключается защита «расслышал слишком
+    плохо». Текстовые сетки — заученные концовки роликов и зацикливание —
+    работают по-прежнему, а вот от «поехал не туда, потому что послышалось»
+    остаётся только узнавание по голосу.
+
+    Поэтому выбор остаётся за человеком: --stt gigaam включает, по умолчанию
+    Whisper. И если GigaAM не поднимется, робот не оглохнет — возьмётся Whisper.
+    """
+
+    def __init__(self, name: str = "v3_e2e_rnnt") -> None:
+        self.size = name
+        self.device = "не загружена"
+        self._model = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        import gigaam
+        import torch
+
+        # Видеокарта, если есть: на процессоре GigaAM тоже быстр, но зачем.
+        куда = "cuda" if torch.cuda.is_available() else "cpu"
+        модель = gigaam.load_model(self.size, device=куда)
+        self.device = куда
+        return модель
+
+    def warm(self) -> None:
+        started = time.monotonic()
+        with self._lock:
+            if self._model is None:
+                self._model = self._load()
+        log.info("gigaam: модель %s на %s", self.size, self.device)
+        log.info("распознавание готово, прогрев занял %.0f с",
+                 time.monotonic() - started)
+
+    def transcribe(self, wav: bytes) -> tuple[str, float | None]:
+        import tempfile
+
+        with self._lock:
+            if self._model is None:
+                self._model = self._load()
+            started = time.monotonic()
+            # GigaAM принимает путь к файлу, а не байты. Пишем во временный и
+            # сразу убираем: на Windows открытый файл повторно не открыть,
+            # поэтому закрываем до вызова.
+            имя = ""
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    f.write(wav)
+                    имя = f.name
+                text = (self._model.transcribe(имя) or "").strip()
+            finally:
+                if имя:
+                    with contextlib.suppress(OSError):
+                        os.unlink(имя)
+
+        if made_up(text):
+            log.info("выдумал концовку ролика (%r) — считаю тишиной", text)
+            text = ""
+        spent = time.monotonic() - started
+        length = len(wav) / (16000 * 2)      # 16 кГц, моно, int16
+        log.info("gigaam: %.2f с на %.1f с звука (×%.2f) | уверенности нет → %r",
+                 spent, length, spent / length if length else 0, text)
+        # Уверенности у GigaAM нет — так и говорим наверх, а не выдумываем
+        # число: робот по нему решает, ехать ли, и ложная уверенность опаснее
+        # честного «не знаю».
+        return text, None
 
 
 # --------------------------------------------------------------------------
@@ -1663,6 +1742,12 @@ def main() -> int:
     p.add_argument("--whisper", default=DEFAULT_WHISPER,
                    help="модель распознавания: имя размера (tiny|base|small|"
                         "medium|large-v3) или склад на HuggingFace")
+    p.add_argument("--stt", default="whisper", choices=("whisper", "gigaam"),
+                   help="чем распознавать речь: whisper (по умолчанию) или "
+                        "gigaam — русское распознавание Сбера, точнее на "
+                        "коротких словах, но без уверенности")
+    p.add_argument("--gigaam-model", default="v3_e2e_rnnt",
+                   help="какая модель GigaAM, если выбран --stt gigaam")
     p.add_argument("--wake", default="Кузя",
                    help="как зовут робота — подсказка распознаванию, "
                         "чтобы имя не превращалось в «Уйди» и «Кудяка»")
@@ -1694,7 +1779,17 @@ def main() -> int:
 
     ollama = Ollama(args.ollama, think=args.think)
     рядом = Path(os.environ.get("HF_HOME", Path.home() / ".cache")) / "кузя"
-    cfg = Config(args.model, Whisper(args.whisper, wake=args.wake), ollama,
+    слух = Whisper(args.whisper, wake=args.wake)
+    if args.stt == "gigaam":
+        # Пробуем поднять сразу: если GigaAM не встал, честнее узнать об этом
+        # при запуске, чем на первой же фразе, когда человек уже говорит.
+        кандидат = GigaAM(args.gigaam_model)
+        try:
+            кандидат.warm()
+            слух = кандидат
+        except Exception as e:                  # noqa: BLE001
+            log.warning("GigaAM не поднялся (%s) — распознаю Whisper'ом", e)
+    cfg = Config(args.model, слух, ollama,
                  None if args.voice == "нет" else Voice(speaker=args.voice),
                  None if args.no_voiceprints else Voiceprints(рядом / "голоса.json"))
 
