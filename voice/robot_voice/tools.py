@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ru, when
+from . import counting, ru, when
 from . import weather as weather_api
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,12 @@ ALARM = "будильник"
 # Сколько раз повторять объявление, если его никто не слышал, и с каким шагом.
 RING_TRIES = 3
 RING_RETRY = 45.0
+
+# Насколько просроченный таймер ещё стоит объявлять после перезапуска.
+# Полчаса — это «робот моргнул, пока ты выходил на кухню». Всё, что старше,
+# уже не новость, а испуг: робот стоял неделю и вдруг объявляет будильник
+# недельной давности.
+STALE_SECONDS = 1800.0
 
 
 def _ring(label: str) -> str:
@@ -70,9 +77,17 @@ def _free_label(base: str, taken: dict) -> str:
 # инструментов ниже: человек проверит первым делом именно это.
 ABILITIES = (
     "Я умею ездить по квартире и разворачиваться, могу остановиться по слову "
-    "стоп. Скажу, сколько заряда в батарее, который час и какое сегодня число. "
+    "стоп. Проеду кругом, зигзагом или квадратом — фигуру придумаю сам, "
+    "просто скажи какую. "
+    "Скажу, сколько заряда в батарее, который час и какое сегодня число. "
     "Ставлю таймеры и будильники, напоминаю о делах, веду список покупок. "
-    "Умею говорить тише и громче. Всё остальное — просто спроси, я отвечу."
+    "Расскажу погоду, новости и курс валют, скажу, который час в другом "
+    "городе, и переведу метры в футы или доллары в рубли. "
+    "Включу музыку — по исполнителю, "
+    "по жанру или просто твою волну. Громкость меняю по десятибалльной: "
+    "скажи «сделай на семь». Есть секундомер, считаю проценты и деление, "
+    "брошу монетку или кубик и загадаю число. "
+    "Всё остальное — просто спроси, я отвечу."
 )
 
 # Скорости для голосовых команд — заведомо ниже предела пульта.
@@ -80,10 +95,32 @@ DRIVE_SPEED = 0.20   # м/с
 TURN_SPEED = 1.00    # рад/с
 
 MAX_DISTANCE = 3.0   # м за одну команду
-MAX_ANGLE = 360.0    # градусов
+# Три полных оборота. Раньше стояло 360, и «сделай два круга» молча
+# превращалось в один: робот бодро отвечал «разворачиваюсь», крутился вдвое
+# меньше просимого и об усечении не говорил ни слова.
+MAX_ANGLE = 1080.0   # градусов
 
 # Ниже этого напряжения не едем вообще: 3S li-ion уже на грани.
 CUTOFF_VOLT = 10.2
+
+# --- маршрут: фигуры, которых нет в правилах ---------------------------------
+# Готовых сценариев на все случаи не напасёшься: «проедь кругом», «зигзагом»,
+# «обойди стол», «нарисуй восьмёрку» — список бесконечен, и каждое новое
+# правило под него ловит ровно одну формулировку. Поэтому фигуру собирает сама
+# модель из шагов, а робот проверяет только пределы. Это и есть свобода
+# действий: набор кубиков вместо списка готовых команд.
+#
+# Двенадцать шагов — это зигзаг из пяти колен или круг из двенадцати дуг.
+# Больше в комнате всё равно не уместится, а ошибиться в длинной программе
+# проще, чем её досмотреть.
+ШАГОВ_МАКС = 12
+# Сколько маршрут может ехать. Всё это время робот занят и слышит только
+# «стоп»: полторы минуты — уже долго, а дальше человек начинает беспокоиться.
+МАРШРУТ_СЕКУНД = 90.0
+# Повторять полную формулу отказа на каждую фразу — то самое занудство, из-за
+# которого разговор с роботом выглядит тупым: за полминуты он дважды объяснил
+# человеку, как его звать. Второй раз за это время — коротко.
+ПОВТОР_ОТКАЗА = 60.0
 
 # Разрядная кривая 3S li-ion — та же, что в веб-пульте.
 _CURVE = [
@@ -100,6 +137,71 @@ _DIRECTIONS = {
 
 EMPTY_SCHEMA = {"type": "object", "properties": {}}
 
+# Имена полей в схеме API принимает только латиницей: ^[a-zA-Z0-9_.-]{1,64}$.
+# Наши инструменты объявлены по-русски, как и весь остальной код, и один такой
+# ключ отклоняет ВЕСЬ список инструментов разом — то есть любой запрос к
+# модели, а не только этот инструмент. В журнале это выглядит как
+# «tools.5.custom.input_schema.properties», и по номеру инструмента ещё надо
+# догадаться. Робот при этом слышит и всё понимает, но ответить не может ничем.
+#
+# Поэтому переводим только на границе с API: наружу уходит латиница, обратно
+# приходит она же и превращается в наши имена. Ни правила, ни сами функции об
+# этом не знают — им по-прежнему приходит русское.
+_ПО_АНГЛИЙСКИ = {
+    "что": "query", "изменение": "change", "уровень": "level", "шаг": "step",
+    "вид": "kind", "снизу": "low", "сверху": "high", "сколько": "amount",
+    "из_чего": "from_unit", "во_что": "to_unit", "город": "city",
+    "варианты": "options",
+    "выражение": "expression", "вопрос": "question", "факт": "fact",
+    "действие": "action", "источник": "source",
+}
+# Запасная транслитерация — на случай, если кто-то заведёт новое русское имя и
+# забудет вписать его выше. Имя выйдет некрасивым, зато робот не онемеет.
+_БУКВЫ = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ж": "zh",
+    "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n",
+    "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f",
+    "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch", "ы": "y", "э": "e",
+    "ю": "yu", "я": "ya", "ъ": "", "ь": "", "ё": "e",
+}
+
+
+def _годная(буква: str) -> bool:
+    """Такую букву API в имени поля примет."""
+    return буква.isascii() and (буква.isalnum() or буква in "_.-")
+
+
+def _латиницей(имя: str) -> str:
+    """Имя поля, каким его примет API."""
+    готовое = _ПО_АНГЛИЙСКИ.get(имя)
+    if готовое:
+        return готовое
+    вышло = "".join(_БУКВЫ.get(б, б if _годная(б) else "_") for б in имя.lower())
+    return (вышло or "arg")[:64]
+
+
+def _наружу(схема: dict) -> dict:
+    """Схема для API: имена полей латиницей, всё остальное как было."""
+    свойства = схема.get("properties") or {}
+    if all(_годная(б) for имя in свойства for б in имя):
+        return схема
+    новая = dict(схема)
+    новая["properties"] = {_латиницей(и): з for и, з in свойства.items()}
+    if схема.get("required"):
+        новая["required"] = [_латиницей(и) for и in схема["required"]]
+    return новая
+
+
+def _внутрь(схема: dict, args: dict) -> dict:
+    """То, что вернула модель, — обратно именами этого инструмента.
+
+    Смотрим на схему самого инструмента, а не в общий список: у «volume» поле
+    и так называется change по-английски, и общая замена превращала его в
+    «изменение» — то есть чинила одно и ломала соседнее.
+    """
+    свои = {_латиницей(и): и for и in (схема.get("properties") or {})}
+    return {свои.get(и, и): з for и, з in (args or {}).items()}
+
 
 @dataclass
 class Tool:
@@ -109,18 +211,23 @@ class Tool:
     description: str
     input_schema: dict
     run: Callable[..., str]
+    # Инструменты, которые надёжно разбираются правилами, модели не показываем:
+    # каждая схема едет в КАЖДОМ запросе и оплачивается каждый раз. Вызвать
+    # такой инструмент модель не сможет, но ей это и не нужно — до неё эти
+    # фразы просто не доходят.
+    hidden: bool = False
 
     def spec(self) -> dict:
         """То, что уходит в API."""
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": self.input_schema,
+            "input_schema": _наружу(self.input_schema),
         }
 
     def __call__(self, args: dict[str, Any]) -> str:
         try:
-            return self.run(**args)
+            return self.run(**_внутрь(self.input_schema, args))
         except TypeError as e:
             # Модель придумала лишний или пропустила обязательный аргумент.
             log.warning("неверные аргументы для %s: %s", self.name, e)
@@ -146,6 +253,20 @@ def _say_distance(metres: float) -> str:
     if half >= 0.45:
         return f"на {ru.cardinal(whole)} с половиной метра"
     return "на " + ru.count(whole, "метр", "метра", "метров")
+
+
+def _число(значение: Any, по_умолчанию: float) -> float:
+    """Число из того, что прислала модель. Мусор — это «не задано».
+
+    Внутри маршрута полей много, и хоть одно из них модель однажды пришлёт
+    строкой или пустым: падать на этом целым инструментом незачем.
+    """
+    if значение is None or значение == "":
+        return по_умолчанию
+    try:
+        return float(str(значение).replace(",", "."))
+    except (TypeError, ValueError):
+        return по_умолчанию
 
 
 def _say_percent(pct: float) -> str:
@@ -189,8 +310,25 @@ class Timers:
         self._lock = threading.RLock()
         self.store = store
 
+    def _known(self, label: str) -> str:
+        """Уже заведённое имя с тем же ключом, иначе само label.
+
+        Хранились имена точной строкой, а искались нестрого — с приведением
+        регистра и ё к е. Из-за расхождения «Лапша» и «лапша» становились
+        двумя разными таймерами, но одним и тем же для поиска: робот отменял
+        первый попавшийся, бодро отвечал «отменил», а второй продолжал идти.
+        Приводим к одному имени здесь, в хранилище, а не в каждом месте, где
+        таймер ищут.
+        """
+        key = _key(label)
+        for name in list(self._items) + list(self._paused):
+            if _key(name) == key:
+                return name
+        return label
+
     def add(self, label: str, seconds: float, message: str = "") -> None:
         with self._lock:
+            label = self._known(label)
             self.cancel(label, _locked=True)
             timer = threading.Timer(seconds, self._fire, args=(label,))
             timer.daemon = True
@@ -204,6 +342,7 @@ class Timers:
         if not _locked:
             self._lock.acquire()
         try:
+            label = self._known(label)
             paused = self._paused.pop(label, None)
             item = self._items.pop(label, None)
             if item is not None:
@@ -220,7 +359,7 @@ class Timers:
     def pause(self, label: str) -> bool:
         """Останавливает отсчёт, запомнив остаток."""
         with self._lock:
-            item = self._items.pop(label, None)
+            item = self._items.pop(self._known(label), None)
             if item is None:
                 return False
             timer, due = item
@@ -231,6 +370,7 @@ class Timers:
 
     def resume(self, label: str) -> bool:
         with self._lock:
+            label = self._known(label)
             left = self._paused.pop(label, None)
             message = self._messages.get(label, "")
         if left is None:
@@ -254,6 +394,7 @@ class Timers:
             return dict(self._messages)
 
     def cancel_all(self) -> None:
+        """Человек попросил снять все таймеры. С диска — тоже."""
         with self._lock:
             for timer, _ in self._items.values():
                 timer.cancel()
@@ -263,11 +404,31 @@ class Timers:
             self._tries.clear()
             self._save()
 
+    def stop(self) -> None:
+        """Робот выключается. Таймеры при этом снимать НЕЛЬЗЯ.
+
+        Разница с cancel_all принципиальная, и раньше её не было: при
+        остановке звался cancel_all, а он вместе с потоками стирал и файл.
+        Автообновление перезапускает сервис при каждой правке, то есть
+        хранилище обнулялось по нескольку раз в день — и таймер на духовку
+        пропадал ровно в том случае, ради которого файл и заведён.
+
+        Гасить потоки строго говоря незачем, они daemon и умрут сами. Но
+        сделать это явно дешевле, чем однажды заговорить на полуслове.
+        """
+        with self._lock:
+            for timer, _ in self._items.values():
+                timer.cancel()
+
     def _fire(self, label: str) -> None:
         with self._lock:
             self._items.pop(label, None)
             message = self._messages.get(label, "")
             tries = self._tries.get(label, 1)
+            # Отметка «этот таймер сейчас звонит». По ней после объявления
+            # видно, не отменили ли его, пока замок был отпущен: cancel и
+            # cancel_all её снимают.
+            self._tries[label] = tries
             # На диске таймер пока остаётся: если сервис перезапустят прямо
             # сейчас (автообновление раз в две минуты), напоминание не должно
             # пропасть — restore() увидит просроченный и произнесёт его.
@@ -281,11 +442,23 @@ class Timers:
         # закрыта или с выключенным звуком. Прозвонить в пустоту и забыть —
         # это потерянный таймер на духовке, поэтому повторяем.
         if heard is not None and heard <= 0 and tries < RING_TRIES:
-            log.info("таймер %r никто не услышал, повторю через %.0f с",
-                     label, RING_RETRY)
             with self._lock:
+                # Объявление длится секунды, и замок на это время отпущен.
+                # За это время человек мог сказать «отмени все» — тогда
+                # повторять нечего. Раньше повтор просто создавал таймер
+                # заново, и отменённый будильник воскресал, да ещё и
+                # записывался обратно на диск.
+                if label not in self._tries:
+                    log.info("таймер %r отменили, пока он звонил", label)
+                    return
+                log.info("таймер %r никто не услышал, повторю через %.0f с",
+                         label, RING_RETRY)
+                # Счёт попыток ставим ПОСЛЕ add: он внутри зовёт cancel, а тот
+                # отметку снимает. Раньше строки шли наоборот, счётчик
+                # обнулялся на каждом круге, и таймер в закрытую вкладку звонил
+                # бы вечно вместо трёх раз.
+                self.add(label, RING_RETRY, message)
                 self._tries[label] = tries + 1
-            self.add(label, RING_RETRY, message)
             return
 
         with self._lock:
@@ -330,8 +503,16 @@ class Timers:
             if left > 1:
                 self.add(label, left, messages.get(label, ""))
                 log.info("восстановил таймер %r, осталось %.0f с", label, left)
-            else:
+            elif -left <= STALE_SECONDS:
                 late.append(label)
+            else:
+                # Слишком старое. Робот стоял неделю, а по возвращении
+                # объявлял недельной давности будильник — это не забота, это
+                # пугает. Плюс часы на этой плате врут при старте: сервис
+                # поднимается раньше, чем NTP их поправит, и «просроченным»
+                # может показаться таймер, который на самом деле идёт.
+                log.info("таймер %r просрочен на %.0f ч — молчу",
+                         label, -left / 3600)
         with self._lock:
             self._paused.update(data.get("paused") or {})
             # Текст напоминания, стоящего на паузе, тоже надо вернуть: иначе
@@ -347,7 +528,12 @@ class Timers:
 
 def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 place: tuple[float, float] | None = None,
-                addressed: Callable[[], bool] | None = None) -> list[Tool]:
+                addressed: Callable[[], bool] | None = None,
+                people=None, who: Callable[[], str] | None = None,
+                home: Callable[[], tuple[float, float] | None] | None = None,
+                set_place: Callable[[str, float, float], None] | None = None,
+                player=None,
+                news_url: str = "") -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
     speaker нужен для громкости и «повтори», notes — для списка покупок,
@@ -355,32 +541,74 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     по имени в текущей реплике. Всё необязательно: без этого соответствующие
     инструменты не появятся, и модель о них не узнает.
     """
+    секундомер = counting.Секундомер()
+
+    # Когда в последний раз отказывали в поездке. Нужно, чтобы не объяснять
+    # одно и то же по три раза подряд (см. ПОВТОР_ОТКАЗА).
+    #
+    # Минус бесконечность, а не ноль, и это не педантизм. time.monotonic()
+    # считает от загрузки машины, и в первую минуту после включения он сам
+    # меньше ПОВТОР_ОТКАЗА — с нулём выходило, что робот «уже отказывал»
+    # секунду назад, хотя не сказал ещё ни слова. Поймано на CI, где машина
+    # всегда свежая; на роботе это первая минута после включения питания,
+    # то есть ровно тот момент, когда человек проверяет, ожил ли он.
+    отказано = [float("-inf")]
 
     def name_guard() -> str | None:
-        """Ехать — только по имени, кто бы ни просил: правило или модель.
+        """Ехать — только по надёжной просьбе, кто бы ни просил.
 
         Проверка стоит здесь, а не в правилах, намеренно: «поезжай на кухню»
         правилами не разбирается и уходит модели, а именно такие формулировки
         и звучат из телевизора. Раньше страховка ловила только однозначное
         «вперёд» и пропускала всё остальное.
+
+        Условий два: робота позвали по имени И фразу разобрали уверенно.
+        Второе добавлено после того, как на живом роботе whisper услышал
+        «Кузяка идла», модель домыслила из этого «влево», и робот поехал —
+        имя совпало, и первого условия не хватило.
+
+        Отказ запоминается в addressed.отказ. Без этого он попадал модели
+        обычным результатом инструмента, та пересказывала его своими словами —
+        и получалось «Еду вперёд на метр. Похоже, нужно обратиться ко мне по
+        имени»: обещание поездки и отказ в ней одной фразой.
         """
         if addressed is None or addressed():
             return None
+        if getattr(addressed, "by_name", True):
+            log.info("расслышал неуверенно — не поеду")
+            return _отказать("Не уверен, что расслышал. Повтори-ка.")
         log.info("движение без имени — не поеду")
-        return "Для поездки позови меня по имени."
+        # Первый раз объясняем целиком, следующий за минуту — в два слова.
+        # Счётчик только у этого отказа: «не расслышал» — другая причина, и
+        # сокращать его из-за соседнего было бы враньём.
+        снова = time.monotonic() - отказано[0] < ПОВТОР_ОТКАЗА
+        отказано[0] = time.monotonic()
+        return _отказать("Только по имени." if снова
+                         else "Позови меня по имени — тогда поеду.")
+
+    def _отказать(фраза: str) -> str:
+        if addressed is not None:
+            # setattr, а не присваивание: addressed приходит снаружи, и
+            # заглушке в тесте необязательно знать про это поле.
+            setattr(addressed, "отказ", фраза)
+        return фраза
 
     def battery_guard() -> str | None:
         # Без связи с шасси команда просто утонет: rosbridge молча выбрасывает
         # публикацию. Раньше робот в этом случае бодро отвечал «Еду вперёд» и
         # не ехал — час подряд, пока не заметишь.
         if not getattr(ros, "connected", True):
-            return "Не могу: нет связи с шасси. Проверь, включён ли робот."
+            return _отказать("Не могу: нет связи с шасси. "
+                             "Проверь, включён ли робот.")
         volt = ros.voltage
         if volt is None:
             return None  # телеметрия ещё не пришла — не блокируем
         if volt < CUTOFF_VOLT:
-            return (f"Не поеду: батарея {ru.volts(volt)}, "
-                    f"это {_say_percent(volt_to_percent(volt))}. Нужна зарядка.")
+            # Тоже через _отказать: иначе модель успеет пообещать поездку, а
+            # потом пересказать отказ — и робот скажет то и другое разом.
+            return _отказать(f"Не поеду: батарея {ru.volts(volt)}, "
+                             f"это {_say_percent(volt_to_percent(volt))}. "
+                             "Нужна зарядка.")
         return None
 
     def drive(direction: str, distance: float = 0.5) -> str:
@@ -392,13 +620,25 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if blocked:
             return blocked
 
-        distance = max(0.05, min(MAX_DISTANCE, float(distance)))
+        просили = float(distance)
+        distance = max(0.05, min(MAX_DISTANCE, просили))
         fx, fy = _DIRECTIONS[key]
         duration = distance / DRIVE_SPEED
         log.info("еду %s на %.2f м (%.1f с)", key, distance, duration)
         # Не блокируем: пока едем, робот должен слышать «стоп».
-        ros.drive(fx * DRIVE_SPEED, fy * DRIVE_SPEED, 0.0, duration)
-        return f"Еду {key} {_say_distance(distance)}."
+        # Расстояние передаём отдельно: если шасси докладывает одометрию,
+        # поездка кончится по ней, а не по секундомеру. Разницу видно на глаз —
+        # по времени робот всегда недоезжает, потому что разгон не в счёт.
+        ros.drive(fx * DRIVE_SPEED, fy * DRIVE_SPEED, 0.0, duration,
+                  путь=distance)
+        ответ = f"Еду {key} {_say_distance(distance)}."
+        if просили > MAX_DISTANCE:
+            # Молча укоротить поездку втрое — значит соврать. Человек просил
+            # десять метров, слышал «еду», а робот проезжал три и вставал; со
+            # стороны это выглядело как заглохший робот, а не как предел.
+            метров = ru.count(int(MAX_DISTANCE), "метр", "метра", "метров")
+            ответ += f" {метров.capitalize()} за раз — мой предел, скажи ещё раз."
+        return ответ
 
     def turn(direction: str, degrees: float = 90.0) -> str:
         key = direction.strip().lower()
@@ -413,18 +653,129 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if blocked:
             return blocked
 
-        degrees = max(5.0, min(MAX_ANGLE, abs(float(degrees))))
-        duration = (degrees * 3.14159265 / 180.0) / TURN_SPEED
+        просили = abs(float(degrees))
+        degrees = max(5.0, min(MAX_ANGLE, просили))
+        радиан = degrees * 3.14159265 / 180.0
+        duration = радиан / TURN_SPEED
         log.info("разворачиваюсь %s на %.0f° (%.1f с)", key, degrees, duration)
-        ros.drive(0.0, 0.0, sign * TURN_SPEED, duration)
-        turn_words = ru.count(int(round(degrees)), "градус", "градуса", "градусов")
-        return f"Разворачиваюсь {key} на {turn_words}."
+        ros.drive(0.0, 0.0, sign * TURN_SPEED, duration, угол=радиан)
+        # Круги считаем кругами: «разворачиваюсь на семьсот двадцать градусов»
+        # человек в уме не переводит, а «два круга» понятно сразу.
+        if degrees >= 360.0 and abs(degrees % 360.0) < 1.0:
+            кругов = int(degrees // 360)
+            сколько = ("круг" if кругов == 1
+                       else ru.count(кругов, "круг", "круга", "кругов"))
+            ответ = f"Кручусь {сколько}."
+        else:
+            turn_words = ru.count(int(round(degrees)), "градус", "градуса",
+                                  "градусов")
+            ответ = f"Разворачиваюсь {key} на {turn_words}."
+        if просили > MAX_ANGLE:
+            предел = ru.count(int(MAX_ANGLE // 360), "круг", "круга", "кругов")
+            ответ += f" {предел.capitalize()} за раз — мой предел."
+        return ответ
+
+    def _шаг(шаг: dict) -> tuple[dict, float] | str:
+        """Один шаг маршрута → аргументы для шасси. Строка — это отказ.
+
+        Ехать и поворачивать в одном шаге можно вместе: тогда получается дуга,
+        а из дуг складывается круг. Длительность берём по тому, что дольше, и
+        от неё считаем обе скорости — так ни колёса, ни разворот не выходят за
+        свой предел, и оба заканчиваются одновременно.
+        """
+        куда = str(шаг.get("move") or "").strip().lower()
+        сторона = str(шаг.get("turn") or "").strip().lower()
+        if not куда and not сторона:
+            return "В шаге маршрута нет ни move, ни turn."
+
+        путь = угол = 0.0
+        fx = fy = знак = 0.0
+        if куда:
+            if куда not in _DIRECTIONS:
+                return (f"Не понял направление {куда!r} в маршруте. "
+                        "Можно: вперёд, назад, влево, вправо.")
+            fx, fy = _DIRECTIONS[куда]
+            путь = max(0.05, min(MAX_DISTANCE, abs(_число(шаг.get("distance"), 0.5))))
+        if сторона:
+            if сторона in ("влево", "left"):
+                знак = 1.0
+            elif сторона in ("вправо", "right"):
+                знак = -1.0
+            else:
+                return (f"Не понял сторону {сторона!r} в маршруте. "
+                        "Можно: влево или вправо.")
+            градусов = max(5.0, min(360.0, abs(_число(шаг.get("degrees"), 90.0))))
+            угол = градусов * math.pi / 180.0
+
+        duration = max(путь / DRIVE_SPEED, угол / TURN_SPEED)
+        return {
+            "x": fx * путь / duration,
+            "y": fy * путь / duration,
+            "wz": знак * угол / duration,
+            "duration": duration,
+            "путь": путь,
+            "угол": угол,
+        }, duration
+
+    def route(steps: Any, name: str = "") -> str:
+        """Своя фигура из нескольких шагов: круг, зигзаг, квадрат, обход.
+
+        Правил на все фигуры не напасёшься, поэтому шаги придумывает модель, а
+        робот отвечает только за пределы и за то, чтобы «стоп» обрывал всю
+        программу целиком, а не одно её колено.
+        """
+        if not isinstance(steps, list) or not steps:
+            return "Маршрут пустой — перечисли шаги."
+
+        blocked = name_guard() or battery_guard()
+        if blocked:
+            return blocked
+
+        программа: list[dict] = []
+        секунд = 0.0
+        обрезано = ""
+        for шаг in steps:
+            if not isinstance(шаг, dict):
+                return "Шаг маршрута — это объект с полями move, distance, turn, degrees."
+            разобран = _шаг(шаг)
+            if isinstance(разобран, str):
+                return разобран
+            аргументы, сколько = разобран
+            if len(программа) >= ШАГОВ_МАКС:
+                обрезано = " Дальше не помню, это мой предел за раз."
+                break
+            if секунд + сколько > МАРШРУТ_СЕКУНД:
+                обрезано = " Дальше вышло бы слишком долго, останови, если что."
+                break
+            программа.append(аргументы)
+            секунд += сколько
+
+        if not программа:
+            return "Так я маршрут не соберу — скажи попроще."
+
+        log.info("маршрут %r: %d шагов, %.0f с", name or "без названия",
+                 len(программа), секунд)
+        ros.run_route(программа)
+
+        сколько = ru.count(len(программа), "шаг", "шага", "шагов")
+        имя = _short(str(name or "").strip(), 24)
+        начало = f"Делаю {имя}" if имя else "Поехал по маршруту"
+        return f"{начало}, {сколько}.{обрезано}"
 
     def stop() -> str:
+        # moving — это «едем ли по СВОЕЙ команде». Когда робота гонят
+        # джойстиком с пульта, оно ложно, и робот отвечал «я и так стою»,
+        # продолжая ехать: наши три нуля тут же перебивал поток пульта,
+        # идущий пятнадцать раз в секунду. Врать в такой момент нельзя.
         was_moving = ros.moving
+        was_busy = getattr(ros, "busy", was_moving)
         ros.stop_motion()
         log.info("стоп")
-        return "Остановился." if was_moving else "Я и так стою."
+        if was_moving:
+            return "Остановился."
+        if was_busy:
+            return "Меня ведут с пульта — отпусти джойстик, сам я не встану."
+        return "Я и так стою."
 
     def battery() -> str:
         volt = ros.voltage
@@ -464,15 +815,31 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         return next(iter(pool)) if len(pool) == 1 else None
 
     def set_timer(minutes: float, label: str = NO_NAME) -> str:
-        minutes = max(0.1, min(600.0, float(minutes)))
+        # Ноль и минус — это не «шесть секунд», а недопонятая просьба. Раньше
+        # «поставь таймер» без числа превращалось в таймер на шесть секунд,
+        # который звонил раньше, чем человек успевал договорить.
+        try:
+            minutes = float(minutes)
+        except (TypeError, ValueError):
+            minutes = 0.0
+        if minutes <= 0:
+            return "На сколько ставить таймер?"
+        if minutes > 600.0:
+            return (f"Дольше десяти часов таймер не ставлю. "
+                    f"{ru.duration(600 * 60, accusative=True).capitalize()} — "
+                    f"это предел.")
+        minutes = max(0.1, minutes)
         label = label.strip() or NO_NAME
         extra = False
-        if label == NO_NAME:
-            # Второй безымянный таймер раньше молча затирал первый: имя одно,
-            # а add() заменяет по имени. Теперь второй зовётся по времени.
+        # Имена, которые робот раздаёт сам, повторяются — и add() заменяет по
+        # имени. Безымянный таймер раньше молча затирал предыдущий безымянный,
+        # а «будильник через двадцать минут» — уже стоящий подъём на семь утра,
+        # подтвердив вслух оба. Разводим имена, как это делает set_alarm.
+        if label in (NO_NAME, ALARM):
             taken = {**timers.remaining(), **timers.paused()}
-            if label in taken:
-                label = _free_label(ru.duration(minutes * 60), taken)
+            if _key(label) in {_key(name) for name in taken}:
+                base = ALARM if label == ALARM else ru.duration(minutes * 60)
+                label = _free_label(base, taken)
                 extra = True
         timers.add(label, minutes * 60)
         log.info("таймер %r на %.1f мин", label, minutes)
@@ -483,7 +850,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
     def set_alarm(at: str, label: str = "") -> str:
         """Будильник на конкретное время: «в семь утра», «на 7:30»."""
-        target = when.at_time(f"в {at.strip()}")
+        target = when.moment(at)
         if target is None:
             return f"Не понял время {at!r}. Скажи, например, в семь утра."
         minutes = when.minutes_until(target)
@@ -501,7 +868,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         if not text:
             return "О чём напомнить?"
         if at.strip():
-            target = when.at_time(f"в {at.strip()}")
+            target = when.moment(at)
             if target is None:
                 return f"Не понял время {at!r}."
             minutes = when.minutes_until(target)
@@ -584,8 +951,33 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         word = ru.plural(count, "он был", "их было", "их было")
         return f"Отменил все таймеры, {word} {ru.cardinal(count)}."
 
-    def time_now() -> str:
+    def time_now(город: str = "") -> str:
+        """Который час. С городом — там; своё время робот берёт из своих часов.
+
+        Который час в Москве, модель по памяти не знает вовсе: она выдумает
+        смещение и не будет знать текущего момента. Часы есть только здесь.
+        """
+        город = (город or "").strip()
+        if город:
+            ответ = counting.время_в(город)
+            if ответ:
+                return ответ
+            return (f"Не знаю, какой часовой пояс у города {город}. "
+                    f"Здесь сейчас {ru.clock()}.")
         return f"Сейчас {ru.clock()}."
+
+    def convert_units(сколько: float = 1, из_чего: str = "", во_что: str = "") -> str:
+        try:
+            число = float(сколько)
+        except (TypeError, ValueError):
+            return "Сколько переводить?"
+        # Деньги считаем по сегодняшнему курсу, а не по таблице: в метре
+        # сантиметров всегда сто, а доллар вчерашним не бывает.
+        from . import lookup
+        деньги = lookup.convert_money(число, из_чего, во_что)
+        if деньги:
+            return деньги
+        return counting.перевести(число, из_чего, во_что)
 
     def date_now() -> str:
         return f"Сегодня {ru.date()}."
@@ -594,10 +986,60 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         """Ответ на «что ты умеешь» — заранее известный, платить за него незачем."""
         return ABILITIES
 
-    def volume(change: str = "тише") -> str:
+    def calculate(выражение: str = "") -> str:
+        """Счёт разбором выражения, а не в уме модели и не через eval.
+
+        В уме модель путает проценты и деление, и ошибка звучит ровно так же
+        уверенно, как верный ответ. А eval на строке из микрофона — это запуск
+        чего угодно, что робот услышал.
+        """
+        try:
+            ответ = counting.посчитать(выражение)
+        except ValueError as e:
+            return f"Не посчитал: {e}."
+        return counting.вслух(ответ)
+
+    def stopwatch(действие: str = "сколько") -> str:
+        действие = (действие or "").strip().lower()
+        if действие in ("пуск", "старт", "начни", "засеки", "засечь"):
+            return секундомер.пуск()
+        if действие in ("стоп", "останови", "стой"):
+            return секундомер.стоп()
+        if действие in ("сброс", "сбрось", "обнули"):
+            return секундомер.сброс()
+        return секундомер.сколько()
+
+    def random_pick(вид: str = "монетка", снизу: int | None = None,
+                    сверху: int | None = None,
+                    варианты: list | None = None) -> str:
+        """Настоящий бросок. Модель на «загадай число от одного до десяти»
+        отвечает семёркой заметно чаще прочего — для игры это подделка."""
+        вид = (вид or "").strip().lower()
+        if вид.startswith("монет"):
+            return counting.монетка()
+        if вид.startswith("куб"):
+            return counting.кубик(6 if сверху is None else сверху)
+        if вид.startswith("выбор") or варианты:
+            return counting.выбрать(list(варианты or []))
+        # Ноль в границе — настоящий ноль, а не «границу не назвали». Через
+        # «or» он превращался в единицу и в десятку: «от нуля до трёх» никогда
+        # не давало нуля, а «от минус десяти до нуля» считало до десяти.
+        return counting.число(1 if снизу is None else снизу,
+                              10 if сверху is None else сверху)
+
+    def volume(change: str = "тише", про_голос: bool = False) -> str:
+        """Громкость голоса — но под музыку «сделай тише» почти всегда про неё.
+
+        Развилка та же, что в music_volume, только с другой стороны. Человек
+        говорит «сделай тише», не уточняя, и под играющую песню имеет в виду
+        песню: свой голос робот и так приглушает, когда играет музыка. Явное
+        «говори тише» правило помечает, и тогда это про голос.
+        """
+        change = (change or "").strip().lower()
+        if not про_голос and player is not None and player.играет:
+            return music_volume(change)
         if speaker is None:
             return "Громкостью я пока не управляю."
-        change = change.strip().lower()
         was = speaker.volume
         if change in ("тише", "потише", "тихо", "меньше"):
             level = max(0.2, round(was - 0.2, 2))
@@ -652,10 +1094,11 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         return f"Убрал {gone}."
 
     def weather(day: str = "сейчас") -> str:
-        if not place or not any(place):
-            return ("Я не знаю, где мы находимся. Впиши координаты дома "
-                    "в настройки, и буду говорить погоду.")
-        data = weather_api.fetch(*place)
+        где = home() if home is not None else place
+        if not где or not any(где):
+            return ("Я не знаю, в каком мы городе. Скажи «мы в Калининграде» — "
+                    "запомню и буду говорить погоду.")
+        data = weather_api.fetch(*где)
         if data is None:
             return "Не смог узнать погоду — интернета нет или сервис молчит."
         if day.strip().lower().startswith("завтра"):
@@ -673,8 +1116,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     tools = [
         Tool(
             name="drive",
-            description="Проехать в заданную сторону. Колёса меканум, поэтому "
-                        "робот может двигаться боком, не разворачиваясь.",
+            description="Проехать в сторону. Колёса меканум: может ехать боком.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -685,7 +1127,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                     },
                     "distance": {
                         "type": "number",
-                        "description": "Сколько метров проехать, от 0.05 до 3.0.",
+                        "description": "Метров, 0.05–3.0.",
                     },
                 },
                 "required": ["direction"],
@@ -705,7 +1147,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                     },
                     "degrees": {
                         "type": "number",
-                        "description": "На сколько градусов повернуться, от 5 до 360.",
+                        "description": "Градусов, 5–360.",
                     },
                 },
                 "required": ["direction"],
@@ -713,8 +1155,56 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             run=turn,
         ),
         Tool(
+            name="route",
+            description=(
+                "Своя фигура из нескольких шагов подряд: круг, зигзаг, "
+                "квадрат, восьмёрка, обход комнаты, «туда-сюда». Готовых "
+                "фигур у тебя нет — придумай шаги сам, как считаешь нужным. "
+                "В одном шаге можно ехать, поворачивать или делать то и "
+                "другое сразу: вместе получается дуга, из дуг — круг. "
+                "Один шаг — это drive или turn, маршрут нужен от двух."),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "Шаги по порядку, не больше двенадцати.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "move": {
+                                    "type": "string",
+                                    "enum": ["вперёд", "назад", "влево", "вправо"],
+                                    "description": "Куда ехать на этом шаге.",
+                                },
+                                "distance": {
+                                    "type": "number",
+                                    "description": "Метров на этом шаге, 0.05–3.0.",
+                                },
+                                "turn": {
+                                    "type": "string",
+                                    "enum": ["влево", "вправо"],
+                                    "description": "В какую сторону поворачивать на этом шаге.",
+                                },
+                                "degrees": {
+                                    "type": "number",
+                                    "description": "Градусов на этом шаге, 5–360.",
+                                },
+                            },
+                        },
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Как назвать вслух: «зигзаг», «круг», «квадрат».",
+                    },
+                },
+                "required": ["steps"],
+            },
+            run=route,
+        ),
+        Tool(
             name="stop",
-            description="Немедленно остановить движение.",
+            description="Немедленно остановить движение. Обрывает и маршрут.",
             input_schema=EMPTY_SCHEMA,
             run=stop,
         ),
@@ -726,17 +1216,17 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="set_timer",
-            description="Поставить таймер. Когда он сработает, робот скажет об этом вслух.",
+            description="Таймер на N минут. Сработает — робот скажет вслух.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "minutes": {
                         "type": "number",
-                        "description": "Через сколько минут сработает, от 0.1 до 600.",
+                        "description": "Через сколько минут, 0.1–600.",
                     },
                     "label": {
                         "type": "string",
-                        "description": "Короткое название, чтобы отличать таймеры друг от друга.",
+                        "description": "Короткое название, чтобы отличать таймеры.",
                     },
                 },
                 "required": ["minutes"],
@@ -745,27 +1235,54 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="time_now",
-            description="Узнать текущее время. Часов у тебя нет, поэтому "
-                        "спрашивай здесь, а не отвечай по памяти.",
-            input_schema=EMPTY_SCHEMA,
+            description="Текущее время — здесь или в другом городе. Часов у "
+                        "тебя нет, а смещение часового пояса по памяти ты "
+                        "выдумаешь: не отвечай сам.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "город": {
+                        "type": "string",
+                        "description": "Где смотреть время. Пусто — здесь, "
+                                       "дома.",
+                    },
+                },
+            },
             run=time_now,
         ),
         Tool(
+            name="convert_units",
+            description="Перевести меры: длину, вес, объём, время. Зови "
+                        "всегда, когда просят перевести одно в другое — в "
+                        "уме ты промахнёшься в делении.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "сколько": {"type": "number", "description": "Сколько переводим."},
+                    "из_чего": {"type": "string",
+                                "description": "Из какой меры: метр, грамм, "
+                                               "фут, литр, час…"},
+                    "во_что": {"type": "string", "description": "В какую меру."},
+                },
+                "required": ["сколько", "из_чего", "во_что"],
+            },
+            run=convert_units,
+        ),
+        Tool(
             name="date_now",
-            description="Узнать сегодняшнюю дату и день недели. Календаря у "
-                        "тебя нет, поэтому спрашивай здесь.",
+            description="Сегодняшняя дата и день недели. Календаря у тебя нет.",
             input_schema=EMPTY_SCHEMA,
             run=date_now,
         ),
         Tool(
             name="list_timers",
-            description="Показать, какие таймеры сейчас идут и сколько им осталось.",
+            description="Какие таймеры идут и сколько осталось.",
             input_schema=EMPTY_SCHEMA,
             run=list_timers,
         ),
         Tool(
             name="cancel_timer",
-            description="Снять таймер. Без названия — если таймер всего один.",
+            description="Снять таймер. Без названия — если он один.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -779,14 +1296,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="set_alarm",
-            description="Поставить будильник на конкретное время суток. "
-                        "Для «через сколько-то минут» есть set_timer.",
+            description="Будильник на время суток. Через N минут — это set_timer.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "at": {
                         "type": "string",
-                        "description": "Время: «7:30», «семь утра», «восемь вечера».",
+                        "description": "«7:30», «семь утра», «восемь вечера».",
                     },
                     "label": {
                         "type": "string",
@@ -799,15 +1315,14 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="set_reminder",
-            description="Напомнить о деле: робот произнесёт текст вслух в "
-                        "назначенное время. Нужно указать либо at, либо minutes.",
+            description="Напоминание: робот произнесёт текст в назначенное время. "
+                        "Нужно указать at или minutes.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "О чём напомнить, как это скажет человек: "
-                                       "«выключить плиту», «позвонить маме».",
+                        "description": "О чём напомнить: «выключить плиту».",
                     },
                     "at": {
                         "type": "string",
@@ -824,6 +1339,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="pause_timer",
+            hidden=True,
             description="Приостановить таймер, не сбрасывая его. Без названия — "
                         "если таймер всего один.",
             input_schema={
@@ -839,6 +1355,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="resume_timer",
+            hidden=True,
             description="Продолжить таймер, снятый с паузы.",
             input_schema={
                 "type": "object",
@@ -853,6 +1370,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="cancel_all_timers",
+            hidden=True,
             description="Отменить сразу все идущие таймеры. Если их несколько, "
                         "инструмент сначала переспросит — тогда повтори вызов "
                         "с confirmed, но только после согласия человека.",
@@ -869,10 +1387,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="weather",
-            description="Узнать погоду на улице там, где стоит робот. Своих "
-                        "датчиков у него нет, данные берутся из интернета — не "
-                        "отвечай по памяти. Про другой город этот инструмент "
-                        "ничего не знает: так и скажи, а его не вызывай.",
+            description="Погода там, где стоит робот. По памяти не отвечай. "
+                        "Города не знаешь — сначала set_home, потом это.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -887,6 +1403,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="abilities",
+            hidden=True,
             description="Рассказать, что робот умеет. Отвечай этим, а не своими "
                         "словами: список умений тут точный.",
             input_schema=EMPTY_SCHEMA,
@@ -898,6 +1415,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         tools += [
             Tool(
                 name="volume",
+                hidden=True,
                 description="Сделать голос тише или громче.",
                 input_schema={
                     "type": "object",
@@ -914,6 +1432,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="hush",
+                hidden=True,
                 description="Замолчать немедленно: перестать проговаривать то, "
                             "что уже отправлено, и ничего не отвечать.",
                 input_schema=EMPTY_SCHEMA,
@@ -921,9 +1440,415 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="repeat",
+                hidden=True,
                 description="Повторить последнюю сказанную фразу.",
                 input_schema=EMPTY_SCHEMA,
                 run=repeat,
+            ),
+        ]
+
+    def set_home(город: str) -> str:
+        """Запоминает город со слов человека — координаты ищутся сами.
+
+        Раньше широту и долготу полагалось вписать руками в файл настроек, и
+        на живом роботе это вышло глупо: человек сказал «я живу в
+        Калининграде», а робот ответил «я не знаю, где мы находимся».
+        """
+        if set_place is None:
+            return "Я не умею запоминать город."
+        найдено = weather_api.find_city(город)
+        if найдено is None:
+            return f"Не нашёл такого города — {город}. Скажи иначе."
+        имя, lat, lon = найдено
+        set_place(имя, lat, lon)
+        return f"Запомнил: мы в {имя}."
+
+    def look_up(вопрос: str) -> str:
+        from . import lookup
+        return lookup.find(вопрос)
+
+    def rates() -> str:
+        from . import lookup
+        return lookup.rates()
+
+    def play_music(что: str = "", источник: str = "") -> str:
+        """Музыка: сначала Яндекс, если он подключён, потом интернет-радио.
+
+        Порядок именно такой. Яндекс умеет то, чего радио не умеет в принципе:
+        «поставь Цоя» — это конкретный исполнитель, а не «что-нибудь рок».
+        Но он неофициальный и может отвалиться в любой день, поэтому радио
+        остаётся не запасным вариантом на будущее, а тем, что играет прямо
+        сейчас, если Яндекс промолчал.
+
+        Сказанное вслух слово «радио» этот порядок отменяет: человек попросил
+        радио — значит, радио. Иначе «включи радио» уезжало в «Мою волну», а
+        «включи радио Рекорд» искало в Яндексе песни со словом «Рекорд».
+        """
+        if player is None:
+            return "Мне некуда играть музыку: пульт не подключён."
+        что = " ".join((что or "").split())
+        if (источник or "").strip().lower() == "радио":
+            return _radio_music(что)
+        из_яндекса = _yandex_music(что)
+        if из_яндекса:
+            return из_яндекса
+        return _radio_music(что)
+
+    def _yandex_music(что: str) -> str:
+        музыка = getattr(player, "музыка", None)
+        if музыка is None or not музыка.possible:
+            return ""
+        from . import yandex as ya
+
+        if not что:
+            # «Включи музыку» без уточнения — это «Моя волна»: она сама
+            # подстраивается под лайки, и с каждым разом попадает точнее.
+            треки, партия = музыка.wave()
+            название = player.очередь(треки, ya.WAVE, партия)
+            return f"Ставлю твою волну. {название}." if название else ""
+
+        # Жанр («поставь джаз») Яндекс держит станцией, а не поиском: поиск по
+        # слову «джаз» вернул бы песни с этим словом в названии.
+        станция = музыка.station(что)
+        if станция:
+            треки, партия = музыка.wave(станция)
+            название = player.очередь(треки, станция, партия)
+            if название:
+                return f"Включаю {что}. {название}."
+
+        название = player.очередь(музыка.search(что))
+        return f"Включаю: {название}." if название else ""
+
+    def _radio_music(что: str) -> str:
+        from . import radio as radio_api
+        найдено = radio_api.find(что)
+        if найдено is None:
+            return _не_нашёл(что)
+        имя, поток = найдено
+        if not player.поток(имя, поток):
+            return "Пульт не отвечает, включить музыку некуда."
+        return f"Включаю {имя}."
+
+    def _не_нашёл(что: str) -> str:
+        """Окончательный отказ — и прямая просьба не подбирать замену.
+
+        На живом роботе просьба «включи музыку Грот» без Яндекса кончилась
+        так: радио исполнителя не нашло, ответ «скажи иначе» модель приняла за
+        приглашение попробовать ещё, и она подставила сначала «Группа крови»,
+        потом «джаз» — и человеку заиграл джаз вместо того, что он просил.
+        Четыре вызова инструмента и пятнадцать тысяч токенов на дорогу к
+        неверному ответу.
+
+        Поэтому здесь не «скажи иначе», а «это конец», и сказано, почему.
+        """
+        if not что:
+            return ("Каталог радио не отвечает, включить нечего. Скажи это "
+                    "человеку, другого способа у тебя нет.")
+        музыка = getattr(player, "музыка", None)
+        если_бы = ""
+        if музыка is None or not музыка.possible:
+            если_бы = (" Радиостанции с таким названием нет, а искать по "
+                       "исполнителям и песням я умею только через "
+                       "Яндекс.Музыку, а она не подключена.")
+        return (f"Не нашёл — {что}.{если_бы} Скажи это человеку прямо и НЕ "
+                f"подбирай ничего взамен: другой исполнитель или жанр вместо "
+                f"того, что просили, — это хуже, чем честное «не нашёл».")
+
+    def stop_music() -> str:
+        if player is None:
+            return "Музыка и так не играет."
+        return player.выключить()
+
+    def music_next() -> str:
+        if player is None or not player.играет:
+            return "Сейчас ничего не играет."
+        return player.дальше() or "Треки кончились."
+
+    def music_volume(изменение: str = "тише", уровень: int = 0,
+                     шаг: int = 0) -> str:
+        """Громкость музыки — или голоса, если музыки нет.
+
+        Развилка здесь, а не в правиле, намеренно: «убавь звук» человек
+        говорит одинаково и про то, и про другое, а что он имел в виду,
+        видно только по тому, играет ли сейчас музыка. На живом роботе «Кузя,
+        убавь музыку» кончилось тем, что робот её выключил совсем.
+
+        Уровень — по десятибалльной: 1 еле слышно, 10 во всю. Раньше на
+        «убавь звук до двух» робот отвечал «звук уменьшен до двух» и не
+        трогал ничего: числа передать было нечем, и модель просто повторяла
+        услышанное вслух.
+        """
+        изменение = (изменение or "").strip().lower()
+        if player is None or not player.играет:
+            return volume(изменение)
+        def целое(что) -> int:
+            try:
+                return int(что or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        номер, сдвиг = целое(уровень), max(0, целое(шаг))
+        if номер:
+            return player.на_ступень(номер)
+        if изменение in ("тише", "потише", "тихо", "меньше"):
+            return player.тише(сдвиг or 1)
+        if изменение in ("громче", "погромче", "громко", "больше"):
+            return player.громче(сдвиг or 1)
+        if изменение in ("обычная", "нормально", "как обычно", "средне"):
+            return player.обычная()
+        return (f"Могу сделать тише, громче или на любую ступень от 1 до "
+                f"{player.СТУПЕНЕЙ}. Сейчас {player.ступень}.")
+
+    def what_is_playing() -> str:
+        if player is None:
+            return "Сейчас ничего не играет."
+        return player.что_играет()
+
+    def news() -> str:
+        from . import news as news_api
+        return news_api.describe(news_api.headlines(news_url or news_api.URL))
+
+    # Новости и город модели ВИДНЫ, в отличие от таймеров и списка. Причина
+    # простая: спрашивают их как попало — «расскажи, какие новости последние
+    # были», «а живу я в городе Калининграде», — и правило такое не ловит. На
+    # живом роботе это вышло враньём: модель ответила «у меня нет доступа к
+    # новостям», хотя доступ есть, просто инструмент был от неё спрятан.
+    tools.append(Tool(
+        name="news",
+        description="Свежие заголовки новостей. Зови, когда спрашивают, что "
+                    "нового, что в мире, какие новости. По памяти не отвечай: "
+                    "твои новости старые.",
+        input_schema=EMPTY_SCHEMA,
+        run=news,
+    ))
+    if set_place is not None:
+        tools.append(Tool(
+            name="set_home",
+            description="Запомнить город, где стоит робот. Зови, когда человек "
+                        "сказал, где он живёт или где вы находитесь, — после "
+                        "этого заработает погода.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "город": {
+                        "type": "string",
+                        "description": "Название города так, как его назвал "
+                                       "человек. Падеж не важен.",
+                    },
+                },
+                "required": ["город"],
+            },
+            run=set_home,
+        ))
+
+    tools += [
+        Tool(
+            name="look_up",
+            description="Посмотреть справку в интернете: кто это, что это, "
+                        "когда было. Зови вместо ответа по памяти — твоя "
+                        "память устарела, а справка свежая.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "вопрос": {"type": "string",
+                               "description": "О чём справка: «Калининград», "
+                                              "«Юрий Гагарин», «меканум-колесо»."},
+                },
+                "required": ["вопрос"],
+            },
+            run=look_up,
+        ),
+        Tool(
+            name="rates",
+            description="Курс доллара и евро по Центробанку. Зови всегда, "
+                        "когда спрашивают про курс: по памяти ты назовёшь "
+                        "прошлогодний.",
+            input_schema=EMPTY_SCHEMA,
+            run=rates,
+        ),
+        Tool(
+            name="calculate",
+            description="Посчитать. Зови всегда, когда просят что-то "
+                        "сосчитать: проценты и деление в уме ты путаешь, а "
+                        "ошибка звучит так же уверенно, как верный ответ. "
+                        "Переведи услышанное в выражение: «пятнадцать "
+                        "процентов от двух тысяч» — это 15/100*2000.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "выражение": {
+                        "type": "string",
+                        "description": "Только числа и знаки + - * / % ** и "
+                                       "скобки. Слова не понимаю.",
+                    },
+                },
+                "required": ["выражение"],
+            },
+            run=calculate,
+        ),
+        Tool(
+            name="stopwatch",
+            description="Секундомер: пуск, стоп, сброс, «сколько прошло». "
+                        "Зови обязательно — сколько времени прошло между "
+                        "репликами, ты не знаешь, часов у тебя нет.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "действие": {
+                        "type": "string",
+                        "enum": ["пуск", "стоп", "сброс", "сколько"],
+                        "description": "Что сделать с секундомером.",
+                    },
+                },
+                "required": ["действие"],
+            },
+            run=stopwatch,
+        ),
+        Tool(
+            name="random_pick",
+            description="Жребий: монетка, кубик, случайное число, выбор из "
+                        "нескольких. Зови обязательно — сам ты случайное "
+                        "число не выдумаешь, у тебя выйдет одно и то же, а "
+                        "человек ждёт настоящего броска.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "вид": {
+                        "type": "string",
+                        "enum": ["монетка", "кубик", "число", "выбор"],
+                        "description": "Что бросаем.",
+                    },
+                    "снизу": {"type": "integer",
+                              "description": "Для «числа»: от. По умолчанию 1."},
+                    "сверху": {"type": "integer",
+                               "description": "Для «числа»: до. По умолчанию 10. "
+                                              "Для «кубика» — сколько граней."},
+                    "варианты": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Для «выбора»: между чем выбрать.",
+                    },
+                },
+                "required": ["вид"],
+            },
+            run=random_pick,
+        ),
+    ]
+    if player is not None:
+        tools += [
+            Tool(
+                name="play_music",
+                description="Включить музыку: конкретного исполнителя или "
+                            "песню, жанр, радиостанцию. Без уточнения — "
+                            "любимую волну. Зови всегда, когда просят "
+                            "что-нибудь включить или поставить из музыки. "
+                            "Передавай ровно то, что попросил человек. Если "
+                            "не нашлось — так и скажи; не зови этот "
+                            "инструмент второй раз с другим исполнителем или "
+                            "жанром, поставить не то хуже, чем не поставить.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "что": {"type": "string",
+                                "description": "Исполнитель, песня, жанр или "
+                                               "станция: «Кино», «Группа крови», "
+                                               "«джаз», «Рекорд». Пусто — на твой вкус."},
+                        "источник": {
+                            "type": "string",
+                            "enum": ["любой", "радио"],
+                            "description": "«радио» — если человек прямо "
+                                           "попросил радио или радиостанцию.",
+                        },
+                    },
+                },
+                run=play_music,
+            ),
+            Tool(
+                name="stop_music",
+                description="Выключить музыку или радио совсем.",
+                input_schema=EMPTY_SCHEMA,
+                run=stop_music,
+            ),
+            Tool(
+                name="music_next",
+                description="Следующая песня. Зови, когда просят переключить, "
+                            "поставить другое, пропустить эту.",
+                input_schema=EMPTY_SCHEMA,
+                run=music_next,
+            ),
+            Tool(
+                name="music_volume",
+                description="Сделать музыку тише или громче. Зови и когда "
+                            "просят убавить звук: если музыка играет, речь "
+                            "почти всегда про неё. Назвали число — передай "
+                            "его в «уровень»; сам громкость не меняй и не "
+                            "сообщай о смене, не вызвав этот инструмент.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "изменение": {
+                            "type": "string",
+                            "enum": ["тише", "громче", "обычная"],
+                            "description": "Куда менять громкость.",
+                        },
+                        "уровень": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 10,
+                            "description": "Громкость по десятибалльной: 1 "
+                                           "еле слышно, 10 во всю. Ставь, "
+                                           "когда назвали число («сделай на "
+                                           "семь», «убавь до двух»).",
+                        },
+                        "шаг": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 9,
+                            "description": "На сколько ступеней подвинуть — "
+                                           "для «убавь на два». «До двух» "
+                                           "это не сюда, а в «уровень».",
+                        },
+                    },
+                    "required": ["изменение"],
+                },
+                run=music_volume,
+            ),
+            Tool(
+                name="what_is_playing",
+                description="Что сейчас играет: исполнитель и название. "
+                            "По памяти не отвечай — ты этого не знаешь.",
+                input_schema=EMPTY_SCHEMA,
+                run=what_is_playing,
+            ),
+        ]
+
+    if people is not None and who is not None:
+        def remember_person(факт: str) -> str:
+            # asked=False: сюда модель приходит по своей воле, а не по просьбе
+            # «запомни». Прямые просьбы разбираются правилом и до модели не
+            # доходят вовсе — там и «Запомнил» вслух уместно, а здесь нет.
+            return people.remember(who(), факт, asked=False)
+
+        tools += [
+            Tool(
+                name="remember_person",
+                description=(
+                    "Записать в память факт о том, кто сейчас говорит: что "
+                    "любит, чем занят, что у него происходит. Зови сам, без "
+                    "просьбы, как только услышал о человеке что-то новое, что "
+                    "пригодится в следующем разговоре. Вслух об этом не "
+                    "объявляй и разрешения не спрашивай — просто запиши и "
+                    "продолжай разговор."),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "факт": {"type": "string",
+                                 "description": "Коротко, одной фразой: "
+                                                "«любит крепкий чай», «работает по ночам»."},
+                    },
+                    "required": ["факт"],
+                },
+                run=remember_person,
             ),
         ]
 
@@ -931,6 +1856,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         tools += [
             Tool(
                 name="notes_add",
+                hidden=True,
                 description="Добавить пункт в список покупок и дел.",
                 input_schema={
                     "type": "object",
@@ -944,12 +1870,14 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="notes_list",
+                hidden=True,
                 description="Прочитать вслух список покупок и дел.",
                 input_schema=EMPTY_SCHEMA,
                 run=notes_list,
             ),
             Tool(
                 name="notes_remove",
+                hidden=True,
                 description="Убрать один пункт из списка.",
                 input_schema={
                     "type": "object",
@@ -962,6 +1890,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="notes_clear",
+                hidden=True,
                 description="Стереть весь список целиком.",
                 input_schema=EMPTY_SCHEMA,
                 run=notes_clear,

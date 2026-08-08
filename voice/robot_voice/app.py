@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import difflib
 import logging
 import os
 import re
@@ -13,6 +12,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -23,12 +23,17 @@ from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
 from .config import Config
+from .music import LOUD as MUSIC_LOUD
+from .music import Колонка, Player, Pult
 from .notes import Notes
+from .people import People
 from .ros import Ros
 from .state import State
-from .stt import Recognizer
+from .stt import Recognizer, Remote
 from .tools import CUTOFF_VOLT, Timers, build_tools
 from .tts import SentenceBuffer, Speaker
+from .wake import clean_token, make_spotter, sounds_like_wake
+from .yandex import Music
 
 log = logging.getLogger("robot_voice")
 
@@ -45,6 +50,23 @@ _HALLUCINATION = re.compile(
 # Слова, которыми зовут перед именем: «эй, робот», «слушай, робот».
 _FILLERS = {"эй", "ей", "хэй", "слушай", "слушайте", "окей", "ok", "окэй", "привет"}
 
+# Границы предложений в распознанном тексте. Нужны, чтобы искать имя в начале
+# КАЖДОГО предложения куска, а не только первого: в живой комнате в одно
+# распознавание слипается по два-три, и обращение часто оказывается во втором.
+_SENTENCE = re.compile(r"[.!?…]+")
+
+# Обращение к кому-то другому: «Виктор, как дела?», «Рома, пиши!». Своё имя
+# сюда не попадает — его снимают раньше. Признак грубый, но в открытом окне
+# разговора цена ошибки мала: робот промолчит, и его позовут по имени.
+_VOCATIVE = re.compile(r"^([А-ЯЁ][а-яё]{2,})\s*[,!]")
+# Ими фразу начинают, а не зовут человека. Без этого списка «Ладно, поедем»
+# считалось бы обращением к некоему Ладно.
+_NOT_A_NAME = {
+    "ладно", "хорошо", "так", "ну", "слушай", "смотри", "давай", "значит",
+    "кстати", "нет", "да", "конечно", "правда", "может", "стоп", "стой",
+    "хватит", "тихо", "погоди", "подожди", "ага", "окей", "привет", "спасибо",
+}
+
 # Через сколько молчания забываем прошлый разговор. Иначе вечером «а повтори»
 # продолжает утреннюю тему, да и весь этот контекст оплачивается заново.
 FORGET_SECONDS = 600.0
@@ -59,6 +81,20 @@ GREET_SILENCE = 1800.0
 
 # Сколько времени «отмена» отменяет последнее действие, а не усыпляет робота.
 UNDO_SECONDS = 90.0
+
+# Насколько распознавание верит самому себе. Число отрицательное: около -0.2 —
+# уверенно, ниже -1 — почти наверняка выдумало. Пороги два, потому что цена
+# ошибки разная.
+#
+# Ниже GARBAGE_BELOW фраза не рассматривается вовсе: это шум, и отдавать его
+# модели — платить за разбор чужого кашля.
+#
+# Ниже UNSURE_BELOW разговаривать можно, а ехать нельзя. Разница принципиальна:
+# ошибиться в ответе не страшно, человек переспросит, а уехавшего робота
+# обратно не вернёшь. Ровно на этом мы и обожглись: whisper услышал «Кузяка
+# идла», модель домыслила «влево», робот поехал.
+GARBAGE_BELOW = -1.15
+UNSURE_BELOW = -0.85
 
 
 class Voice:
@@ -92,8 +128,10 @@ class Voice:
     def hold(self):
         """Занимает голос, не трогая микрофон.
 
-        Для потокового ответа: пока модель думает, робот молчит и должен
-        слышать «стоп» — особенно если модель уже успела вызвать drive.
+        Пока модель думает, робот молчит, и сказанное в этот момент копится в
+        буфере звука. Мгновенно он на «стоп» не среагирует — главный цикл в
+        это время висит в разговоре с моделью, — но и не потеряет: хвост
+        разбирается сразу после ответа, см. _caught_stop.
         """
         with self._lock:
             yield
@@ -120,6 +158,52 @@ class Voice:
                 log.debug("не смог показать %s в пульте", kind, exc_info=True)
 
 
+# Насколько часы могут разойтись, прежде чем это станет бедой. Полминуты —
+# сетевая задержка и округление, а вот минута и больше уже сдвигает будильник.
+CLOCK_SLACK = 60.0
+
+
+def _check_clock(cfg) -> None:
+    """Сверяет часы робота с часами ПК и кричит, если они разъехались.
+
+    У SBC робота нет батарейки часов: после выключения питания время берётся
+    из сети, а если сети в этот момент не было — остаётся каким попало. На
+    живом роботе разница с ПК дошла до пяти часов, и «поставь будильник на
+    восемнадцать» уехало на сутки вперёд. По поведению такое не диагностируется
+    вовсе: робот уверенно называет неверное время, а человек ему верит.
+
+    Сверяем СЕКУНДЫ, а не то, что показывают стрелки. Первая версия сравнивала
+    настенное время — и на живом доме сразу ошиблась: робот в Калининграде, ПК
+    по Москве, час разницы, а часы при этом идеально синхронны. Число секунд от
+    пояса не зависит, и только оно говорит о настоящем расхождении.
+
+    Часовой пояс — отдельная беда, и её эта проверка не ловит вовсе: часы могут
+    сойтись до секунды, а робот всё равно будет считать, что сейчас другой час.
+    Поэтому пояс печатаем рядом, чтобы человек увидел его глазами.
+    """
+    if not cfg.pc_url:
+        return
+    try:
+        with urllib.request.urlopen(cfg.pc_url.rstrip("/") + "/health",
+                                    timeout=3) as resp:
+            import json as _json
+            здоровье = _json.loads(resp.read() or b"{}") or {}
+    except Exception:
+        return          # ПК выключен — это не про часы, и молчать тут правильно
+    там = здоровье.get("секунд")
+    if not там:
+        return          # старая сборка на ПК: секунд не сообщает
+    разница = time.time() - float(там)
+    if abs(разница) < CLOCK_SLACK:
+        log.info("часы робота и ПК сходятся (пояс робота %s)",
+                 datetime.now().astimezone().tzname() or "не задан")
+        return
+    log.warning("ЧАСЫ РАЗОШЛИСЬ НА %+.0f МИНУТ — не поясом, а по-настоящему. "
+                "Будильники и напоминания уедут ровно на неё. "
+                "Проверить: timedatectl. Включить синхронизацию: "
+                "sudo timedatectl set-ntp true", разница / 60)
+
+
 def _setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -131,46 +215,67 @@ def _setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def _clean_token(token: str) -> str:
-    return token.lower().replace("ё", "е").strip(" ,.!?…—-\"'()")
-
-
-def _sounds_like_wake(token: str, wake_words: tuple[str, ...], ratio: float) -> bool:
-    """Похоже ли слово на имя робота.
-
-    Whisper пишет имя по-разному — «Кузя», «Кузь», «Куся», — поэтому сравниваем
-    нестрого. Порог держим высоким: имя короткое, а на четырёх буквах послабление
-    начинает ловить всё подряд.
-    """
-    if not token:
-        return False
-    for wake in wake_words:
-        if token == wake or token.startswith(wake):
-            return True
-        if difflib.SequenceMatcher(None, token, wake).ratio() >= ratio:
-            return True
-    return False
+# Нечёткое сравнение с именем живёт в wake.py: оно нужно и там, где имя ищут
+# в звуке, и там, где его ищут в тексте. Пусть будет в одном месте.
+_clean_token = clean_token
+_sounds_like_wake = sounds_like_wake
 
 
 def _strip_wake_word(text: str, wake_words: tuple[str, ...],
-                     ratio: float = 0.8) -> str | None:
+                     ratio: float = 0.8, anywhere: bool = False) -> str | None:
     """Возвращает текст без имени, либо None, если робота не звали.
 
     Имя ищется не только в начале: «Кузя, вперёд» и «а ну-ка Кузя вперёд»
     одинаково законны. Дальше первых трёх слов не смотрим — иначе случайное
     упоминание в середине разговора будет принято за обращение.
+
+    anywhere меняет правило и включается только для куска, нарезанного по
+    длине, а не по паузе. Такой кусок — это двадцать секунд комнаты, где
+    обращение может стоять на четырнадцатой секунде и оказаться сороковым
+    словом. Правило трёх слов писалось для реплик и здесь просто не работает:
+    человек звал, а робот молчал.
+
+    Берётся ПОСЛЕДНЕЕ вхождение и всё, что после него. Прозвучало имя дважды —
+    обращение то, что свежее; а слова до него принадлежат чужому разговору, и
+    тащить их в команду нельзя.
     """
     if not wake_words:
         return text
 
-    tokens = text.split()
-    for i, token in enumerate(tokens[:3]):
-        if _sounds_like_wake(_clean_token(token), wake_words, ratio):
-            rest = tokens[:i] + tokens[i + 1:]
-            # Слова перед именем — обращение («эй», «слушай»), а не команда.
-            if all(_clean_token(t) in _FILLERS for t in tokens[:i]):
-                rest = tokens[i + 1:]
-            return " ".join(rest).strip(" ,.!?…—-")
+    # По предложениям и с конца. Первых трёх слов КУСКА не хватало: в живой
+    # комнате в одно распознавание слипается по два-три предложения, и
+    # «Сойдите, пожалуйста, с кровати, Арина. Кузя, привет.» уходило в «не
+    # мне» — имя оказалось шестым словом. Внутри предложения правило трёх слов
+    # остаётся: оно и отделяет обращение от случайного упоминания.
+    #
+    # С конца — потому что человек часто зовёт несколько раз подряд, не
+    # дождавшись ответа: «Кузя, сделай звук на пять. Кузя, включи музыку.»
+    # Свежее обращение и есть настоящее, а первое робот уже проспал.
+    предложения = _SENTENCE.split(text)
+    for н in range(len(предложения) - 1, -1, -1):
+        tokens = предложения[н].split()
+        for i, token in enumerate(tokens[:3]):
+            if _sounds_like_wake(_clean_token(token), wake_words, ratio):
+                rest = tokens[:i] + tokens[i + 1:]
+                # Слова перед именем — обращение («эй», «слушай»), а не команда.
+                if all(_clean_token(t) in _FILLERS for t in tokens[:i]):
+                    rest = tokens[i + 1:]
+                команда = " ".join(rest).strip(" ,.!?…—-")
+                # Голое «Кузя!» отдельным предложением: команда идёт СЛЕДОМ, а
+                # не внутри. Робот на это отвечал «Да?» и терял просьбу —
+                # «Кузя! Включи музыку.» превращалось в переспрос.
+                if not команда:
+                    команда = " ".join(предложения[н + 1:]).strip(" ,.!?…—-")
+                return команда
+
+    # Срез комнаты: двадцать секунд без пауз, распознавание точек не
+    # расставило, и предложений тут может не быть вовсе. Тогда ищем имя где
+    # угодно — терять обращение из-за отсутствующей точки глупо.
+    if anywhere:
+        tokens = text.split()
+        for i in range(len(tokens) - 1, -1, -1):
+            if _sounds_like_wake(_clean_token(tokens[i]), wake_words, ratio):
+                return " ".join(tokens[i + 1:]).strip(" ,.!?…—-")
     return None
 
 
@@ -214,13 +319,16 @@ class Watchdog:
               (CUTOFF_VOLT, "Батарея почти пустая, ехать я больше не буду."))
 
     def __init__(self, ros, voice: Voice, listener: Listener,
-                 period: float = 30.0) -> None:
+                 period: float = 30.0, recognizer=None, brain=None) -> None:
         self.ros = ros
         self.voice = voice
         self.listener = listener
         self.period = period
+        self.recognizer = recognizer
+        self.brain = brain
         self._said: set[float] = set()
         self._mic_was: bool | None = None
+        self._запас_был: str | None = None
         self._stop = threading.Event()
 
     def start(self) -> None:
@@ -234,6 +342,7 @@ class Watchdog:
             try:
                 self._battery()
                 self._mic()
+                self._запасной_путь()
             except Exception:
                 log.exception("наблюдатель споткнулся")
 
@@ -250,8 +359,42 @@ class Watchdog:
                 self.voice.say(phrase)
                 break
 
+    def _запасной_путь(self) -> None:
+        """Сказать, что робот работает не в полную силу.
+
+        Запасные пути есть у каждого звена, и это хорошо — но проходил их
+        робот молча. Снаружи ухудшение выглядит как «стал тупить»: отвечает
+        медленнее, хуже слышит, а почему — видно только в журнале по ssh.
+        Про синтез не говорим: там запасной путь слышно и так, голос меняется.
+        """
+        беды = []
+        if self.recognizer is not None and getattr(
+                self.recognizer, "сам_разбираю", False):
+            беды.append("разбираю речь сам")
+        мозг = self.brain
+        если_запасной = (мозг is not None and мозг.ответил
+                         and мозг.endpoints and мозг.ответил != мозг.endpoints[0].name)
+        if если_запасной:
+            беды.append(f"отвечаю через {мозг.ответил}")
+        стало = "; ".join(беды)
+        if стало == self._запас_был:
+            return
+        # Первый заход при живом роботе — молчим: сказать «всё хорошо» тому,
+        # кто ничего не спрашивал, незачем.
+        впервые = self._запас_был is None
+        self._запас_был = стало
+        if стало:
+            log.info("работаю на запасном: %s", стало)
+            self.voice.status(f"на запасном пути: {стало}")
+            if not впервые:
+                self.voice.say("Отвечаю на запасных силах, "
+                               "ПК не отзывается — будет медленнее.")
+        elif not впервые:
+            log.info("вернулся на основной путь")
+            self.voice.status("всё на своих местах")
+
     def _mic(self) -> None:
-        online = self.listener.pump.online
+        online = self.listener.pump.alive
         if online == self._mic_was:
             return
         self._mic_was = online
@@ -271,6 +414,81 @@ def _post_heard(speak_endpoint: str, kind: str, text: str) -> None:
         pass
 
 
+def _собрать_проигрыватель(cfg, state, listener) -> Player:
+    """Проигрыватель один на радио и на Яндекс — и он есть ВСЕГДА.
+
+    «Выключи музыку» и «сделай тише» человек говорит одинаково, что бы под
+    ними ни играло, поэтому проигрыватель один.
+
+    Раньше он собирался только при audio_out == "browser", и это условие
+    путало две разные вещи: куда идёт ГОЛОС робота и где играет МУЗЫКА. Музыка
+    играет в пульте, а пульт — отдельная служба robot-web, она работает
+    независимо от голоса. Стоило перевести голос на свой динамик — и вместе с
+    ним пропадали все инструменты музыки: на «включи музыку» робот отвечал «у
+    меня нет такой функции», имея под рукой работающее радио, а правило
+    громкости звало инструмент, которого нет, — робот говорил «громкость
+    уменьшена», не изменив ничего. Вслух это неотличимо от исправной работы.
+
+    Функция отдельная не для красоты: условие жило в середине main(), где его
+    нельзя проверить, и потому оно спокойно прожило до живого робота.
+    """
+    # Про Яндекс говорим честно и сразу: без библиотеки токен бесполезен, а
+    # узнавать об этом в момент «Кузя, включи Грота» — потерянный вечер.
+    музыка = None
+    if cfg.yandex_token and not Music.installed():
+        log.warning("токен Яндекса есть, а библиотеки нет — играет только "
+                    "радио. Поставь: pip3 install --user yandex-music")
+    elif cfg.yandex_token:
+        музыка = Music(cfg.yandex_token)
+    # Куда играть. Пока голос шёл во вкладку, музыка там же и играла — это
+    # было естественно. С колонкой на роботе вкладка становится лишним звеном:
+    # робот честно ставит песню, рапортует «включаю» — и человек не слышит
+    # ничего, потому что вкладка закрыта. Ровно так и вышло на живом роботе.
+    куда = Pult(cfg.web_endpoint.rsplit("/", 1)[0])
+    где = "в пульте"
+    if cfg.audio_out == "local":
+        игрок = Колонка.живой()
+        if игрок:
+            куда = Колонка(cfg.spk_device, игрок=игрок)
+            где = f"в колонку робота через {игрок}"
+        else:
+            где = ("в пульте — в колонку играть нечем. Поставить: "
+                   "sudo apt install ffmpeg (или mpg123)")
+    log.info("музыка: %s, %s",
+             "Яндекс и радио" if музыка is not None
+             else "интернет-радио (Яндекс не подключён)", где)
+    return Player(
+        куда, музыка,
+        громкость=float(state.get("громкость музыки", MUSIC_LOUD)),
+        on_volume=lambda доля: state.set("громкость музыки", доля),
+        # Под музыку детектор речи глохнет: ровный фон он принимает за речь и
+        # режет паузы на куски, а куски возвращаются пустыми. Поэтому
+        # проигрыватель сообщает микрофону, что стало шумно.
+        on_playing=listener.background)
+
+
+def _звуковые_карты(cfg) -> None:
+    """Показать выбранные карты и обругать настройку, которая ни к чему.
+
+    ROBOT_MIC_DEVICE при audio_source=browser не делает ровно ничего. Молчать
+    об этом нельзя: человек уверен, что перевёл робота на USB-микрофон, а тот
+    по-прежнему слушает вкладку пульта — и ищет поломку где угодно, кроме
+    строчки, которую сам же и написал.
+    """
+    if cfg.mic_device and cfg.audio_source != "local":
+        log.warning("ROBOT_MIC_DEVICE=%s ни на что не влияет: микрофон взят "
+                    "из %s. Нужен ROBOT_AUDIO_SOURCE=local",
+                    cfg.mic_device, cfg.audio_source)
+    if cfg.spk_device and cfg.audio_out != "local":
+        log.warning("ROBOT_SPK_DEVICE=%s ни на что не влияет: звук уходит "
+                    "в %s. Нужен ROBOT_AUDIO_OUT=local",
+                    cfg.spk_device, cfg.audio_out)
+    if cfg.audio_source == "local" or cfg.audio_out == "local":
+        log.info("звуковые карты: слушаю %s, говорю в %s",
+                 cfg.mic_device or "ту, что по умолчанию",
+                 cfg.spk_device or "ту, что по умолчанию")
+
+
 def main() -> None:
     _setup_logging()
 
@@ -279,19 +497,28 @@ def main() -> None:
     log.info("модель %s через %s, effort %s, микрофон %s, динамик %s",
              cfg.model, cfg.api_base or "api.anthropic.com",
              cfg.effort or "не задан", cfg.audio_source, cfg.audio_out)
+    _звуковые_карты(cfg)
+    if cfg.local_api_base:
+        log.info("основной собеседник — ПК: %s через %s, %s",
+                 cfg.local_model, cfg.local_api_base,
+                 "облако остаётся про запас" if cfg.api_key else "облака нет")
     # Часы робота видны сразу: от них зависят будильники, напоминания и тихие
     # часы. На свежем образе время обычно в UTC, и «разбуди в семь» окажется
     # на три часа мимо — а понять это по поведению трудно.
     log.info("часы робота: %s, тихие часы %s",
              datetime.now().strftime("%d.%m %H:%M"),
              cfg.quiet_hours or "выключены")
+    _check_clock(cfg)
 
     # Настроенное голосом переживает перезапуск: автообновление случается
     # каждые две минуты, и громкость не должна возвращаться сама.
     state = State(cfg.data_dir / "settings.json")
     speaker = Speaker(cfg.piper_model_path,
                       audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint,
-                      volume=float(state.get("volume", cfg.volume)))
+                      volume=float(state.get("volume", cfg.volume)),
+                      cache_dir=cfg.data_dir / "фразы",
+                      pc_url=cfg.tts_url, pc_voice=cfg.pc_voice,
+                      spk_device=cfg.spk_device)
     speaker.on_volume = lambda level: state.set("volume", level)
     speaker.quiet_now = cfg.is_quiet_now
     speaker.quiet_volume = cfg.quiet_volume
@@ -305,17 +532,35 @@ def main() -> None:
     busy = BusyFlag(ros)
     busy.start()
 
-    recognizer = Recognizer(cfg.whisper_model, cfg.language,
-                            beam_size=cfg.whisper_beam)
+    def local_recognizer() -> Recognizer:
+        return Recognizer(cfg.whisper_model, cfg.language,
+                          beam_size=cfg.whisper_beam)
+
+    if cfg.stt_url:
+        log.info("распознавание на ПК: %s", cfg.stt_url)
+        recognizer = Remote(cfg.stt_url, local_recognizer)
+        # Своё распознавание поднимаем заранее и в фоне. Раньше оно грузилось
+        # в тот самый миг, когда ПК замолчал, — то есть когда человек уже ждёт
+        # ответа, и робот вместо ответа надолго замолкал. Память под модель
+        # тратится теперь всегда: это размен полутора сотен мегабайт на минуту
+        # немоты в единственный важный момент. ROBOT_WARM_LOCAL_STT=0 вернёт
+        # прежнее поведение тем, кому память дороже.
+        if cfg.warm_local_stt:
+            threading.Thread(target=recognizer.прогреть, daemon=True).start()
+    else:
+        recognizer = local_recognizer()
 
     listener = Listener(
         make_source(cfg.audio_source, cfg.phone_url, cfg.sample_rate,
-                    web_url=cfg.web_endpoint.rsplit("/speak", 1)[0]),
+                    web_url=cfg.web_endpoint.rsplit("/speak", 1)[0],
+                    mic_device=cfg.mic_device),
         sample_rate=cfg.sample_rate,
         vad_level=cfg.vad_level,
         silence_ms=cfg.silence_ms,
         min_speech_ms=cfg.min_speech_ms,
         max_speech_ms=cfg.max_speech_ms,
+        spotter=make_spotter(cfg),
+        command_ms=cfg.command_ms,
     )
     voice = Voice(speaker, listener)
     voice.on_heard = lambda kind, text: _post_heard(cfg.web_endpoint, kind, text)
@@ -325,20 +570,44 @@ def main() -> None:
     timers = Timers(announce=voice.say, store=cfg.data_dir / "timers.json")
     notes = Notes(cfg.data_dir / "notes.json")
     addressed = Addressed()
+    people = People(cfg.data_dir / "люди.json")
+    # Кто говорит — узнаётся заново на каждой фразе, поэтому инструменту
+    # передаётся не имя, а способ его спросить.
+    def дом() -> tuple[float, float] | None:
+        """Где робот стоит: сначала сказанное голосом, потом настройки."""
+        куда = state.get("дом")
+        if куда:
+            return float(куда["lat"]), float(куда["lon"])
+        return (cfg.lat, cfg.lon) if any((cfg.lat, cfg.lon)) else None
+
+    def запомнить_дом(имя: str, lat: float, lon: float) -> None:
+        state.set("дом", {"город": имя, "lat": lat, "lon": lon})
+        log.info("дом теперь %s (%.3f, %.3f)", имя, lat, lon)
+
+    player = _собрать_проигрыватель(cfg, state, listener)
+    player.start()
+
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
-                        place=(cfg.lat, cfg.lon), addressed=addressed)
+                        people=people, who=lambda: getattr(recognizer, "speaker", ""),
+                        place=(cfg.lat, cfg.lon), addressed=addressed,
+                        home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
+                        player=player)
     brain = Brain(cfg, tools)
 
     # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.
-    watch = Watchdog(ros, voice, listener)
+    watch = Watchdog(ros, voice, listener, recognizer=recognizer, brain=brain)
     watch.start()
 
     def shutdown(_sig, _frm) -> None:
         # Выход именно через sys.exit: главный цикл висит в чтении звука и
         # флаг увидел бы только после следующей фразы, то есть никогда.
         log.info("останавливаюсь")
-        timers.cancel_all()
+        # Именно stop, а не cancel_all: снимать таймеры при выключении нельзя,
+        # они должны пережить перезапуск — за этим и заведён файл.
+        timers.stop()
         ros.stop_motion()
+        if player is not None:
+            player.stop()
         busy.stop()
         watch.stop()
         ros.stop()
@@ -365,7 +634,8 @@ def main() -> None:
 
     while True:
         try:
-            _listen_loop(cfg, listener, recognizer, brain, voice, tools, addressed)
+            _listen_loop(cfg, listener, recognizer, brain, voice, tools,
+                         addressed, ros, people)
         except KeyboardInterrupt:
             shutdown(None, None)
         except Exception:
@@ -394,6 +664,35 @@ def _dump_audio(wav: bytes, text: str) -> None:
         log.warning("не смог сохранить запись: %s", e)
 
 
+def _разобрать(command: str) -> tuple:
+    """Что робот умеет сделать по этой фразе сам, без модели.
+
+    Одиночное правило либо цепочка движений («метр вперёд и метр назад»).
+    Считаем один раз за реплику: разбор нужен и до решения «моё ли это», и
+    после — а regexp-ов тут на две сотни строк.
+    """
+    m = intents.parse(command)
+    return m, (None if m is not None else intents.parse_chain(command))
+
+
+def _команда_движения(rule, цепочка) -> bool:
+    """Разобрано ли правилом именно движение — а не разговор и не таймер."""
+    if цепочка:
+        return True
+    return rule is not None and rule.tool in intents.ДВИЖЕНИЕ
+
+
+def _спрашивали(voice) -> bool:
+    """Кончилась ли прошлая реплика робота вопросом.
+
+    Нужно ровно для одного: отличить «да» в ответ на вопрос робота от «да»,
+    сказанного не ему. Вопросы правил проходят через Pending, а вопрос модели
+    больше нигде не отмечен — только знаком в конце сказанного.
+    """
+    сказано = getattr(getattr(voice, "speaker", None), "last_said", "") or ""
+    return сказано.strip().endswith("?")
+
+
 def _is_sleep_word(command: str, sleep_words: tuple[str, ...]) -> bool:
     """Отпустили ли робота. Сравниваем фразу целиком, а не по вхождению:
     «спасибо» — прощание, «спасибо что напомнил про таймер» — нет."""
@@ -402,24 +701,304 @@ def _is_sleep_word(command: str, sleep_words: tuple[str, ...]) -> bool:
 
 
 class Addressed:
-    """Звали ли робота по имени в текущей реплике.
+    """Можно ли выполнять по этой реплике то, что не отменишь.
 
-    Инструменты движения спрашивают об этом сами: «поезжай на кухню» правилами
-    не разбирается и уходит модели, а такие формулировки как раз и звучат из
-    телевизора. Проверка в одном месте — в tools.py — закрывает оба пути.
+    Два условия, и оба обязательны.
+
+    Первое — звали ли робота по имени. «Поезжай на кухню» правилами не
+    разбирается и уходит модели, а такие формулировки как раз и звучат из
+    телевизора.
+
+    Второе — уверенно ли распознана фраза. На живом роботе whisper услышал
+    «Кузяка идла», модель домыслила из этого «влево», и робот поехал. Имя при
+    этом совпало, так что первое условие не спасло. Так делают все, у кого
+    команда может что-то сдвинуть: Home Assistant вообще не пускает в модель
+    то, что разобрал сам, а Алиса перед разговорной веткой прогоняет реплику
+    через отдельный классификатор уверенности.
+
+    Проверка в одном месте — в tools.py — закрывает оба пути, и правило, и
+    модель.
     """
 
     def __init__(self) -> None:
         self.by_name = True
+        self.sure = True
+        # Чем инструмент движения отказал на этой реплике. Ставится в tools.py,
+        # читается после хода: см. _respond, где по этому полю решается, что
+        # прозвучит вслух.
+        self.отказ = ""
 
     def __call__(self) -> bool:
-        return self.by_name
+        return self.by_name and self.sure
+
+
+class Meeting:
+    """Знакомство без обряда: голос заводится сам, имя приходит из разговора.
+
+    Первая версия просила «скажи три фразы». На живом роботе это не сработало
+    ни разу: Whisper ломал саму просьбу, человек сбивался, а под конец робот
+    заявил, что голоса запоминать не умеет. Да и по существу обряд лишний —
+    людям не приходит в голову представляться пылесосу.
+
+    Теперь так. Каждая обращённая к роботу фраза уходит на ПК дважды: сначала
+    узнать (это делает распознавание заодно), потом — подтвердить, что
+    говорили именно с роботом, и только тогда голос попадает в память. Раздельно
+    потому, что телевизор в комнате говорит больше всех, и учиться на всём
+    подряд — верный способ растащить слепки по дикторам.
+
+    Имя не обязательно. Гость приходит, разговаривает, робот заводит на него
+    дело под кличкой «голос 3» и копит заметки. Назвался — кличка меняется на
+    имя вместе со всем архивом. Не назвался — и ладно, дело всё равно ведётся.
+    """
+
+    # После скольких разговоров робот один раз спросит имя. Раньше — навязчиво:
+    # человек ещё не понял, с кем говорит. Позже — глупо: он уже всё рассказал.
+    ASK_AFTER = 3
+
+    def __init__(self, pc_url: str) -> None:
+        self.pc_url = pc_url.rstrip("/")
+        self.asking = False
+        # Имя, которое надо привязать к голосу при следующем подтверждении.
+        self._name_next = ""
+
+    def confirm(self, метка: str, name: str = "") -> str:
+        """«Это говорили мне» — голос попадает в память. Возвращает, за кем."""
+        name = name or self._name_next
+        self._name_next = ""
+        if not self.pc_url or not метка:
+            return ""
+        адрес = f"{self.pc_url}/voice/confirm?tag={urllib.parse.quote(метка)}"
+        if name:
+            адрес += "&name=" + urllib.parse.quote(name)
+        try:
+            return (_post(адрес, b"") or {}).get("кто", "")
+        except Exception as e:
+            log.warning("не смог запомнить голос (%s)", e)
+            return ""
+
+    def forget(self, name: str) -> None:
+        if not self.pc_url or not name:
+            return
+        try:
+            _post(f"{self.pc_url}/voice/forget?name=" + urllib.parse.quote(name), b"")
+        except Exception as e:
+            log.warning("слепок голоса на ПК стереть не вышло (%s)", e)
+
+    def time_to_ask(self, who: str, people) -> bool:
+        """Пора ли один раз спросить, как зовут этот голос."""
+        return (not self.asking and who and people.nameless(who)
+                and people.card(who).get("разговоров", 0) >= self.ASK_AFTER)
+
+    def name_is(self, text: str, who: str, voice, people) -> bool:
+        """Приняли имя в ответ на «как тебя зовут». True — приняли."""
+        if not self.asking:
+            return False
+        self.asking = False
+        # Команда — это не знакомство. «Кузя, вперёд проедь на метр» ровно
+        # четыре слова, под ограничение длины не попадало, и первое слово
+        # уходило в имя: на живом роботе человек стал зваться «Вперёд», а
+        # поездка не состоялась. Отдаём фразу дальше — пусть едет.
+        правило, цепочка = _разобрать(text)
+        первое = (text.split() or [""])[0]
+        if правило is not None or цепочка or intents.командное_слово(первое):
+            log.info("вместо имени назвали команду (%r) — выполняю её", text)
+            return False
+        name = _person_name(text)
+        if not name:
+            voice.say("Ладно, потом скажешь.")
+            return True
+        people.rename(who, name)
+        self.name_voice(name)
+        voice.say(f"Очень приятно, {name}.")
+        return True
+
+    def name_voice(self, name: str) -> None:
+        """Просит ПК переименовать слепок вслед за личным делом.
+
+        Порядок не важен, важна полнота: если переименовать дело и забыть про
+        слепок, робот при следующей фразе снова назовёт человека кличкой — и
+        заведёт ему второе дело.
+        """
+        self._name_next = name
+
+
+# Разговор про самих людей: знакомство, память, забвение. Правилами, а не
+# моделью, — это команды роботу, а не тема для беседы, и ошибаться тут нельзя:
+# «забудь про меня» должно стирать дело, а не отвечать «хорошо, забыл».
+# Все формы, которыми просят запомнить голос. На живом роботе не сработало
+# ничего: Whisper то ставит запятую («запомни, мой голос»), то слышит будущее
+# время («запомнишь мой голос»), то слепляет слова. А не сработавшее правило —
+# это не «робот не понял», это «робот соврал»: модель бодро ответила «у меня
+# нет функции запоминать голоса», хотя функция есть.
+_ЗАПОМНИ = r"(?:запомн\w*|запоминай|запиши)"
+_KNOW_ME = re.compile(
+    rf"^{_ЗАПОМНИ}\s+(?:мой\s+голос|голос\s+мой|мой\s+тембр|меня)$"
+    r"|^познакомимся$|^давай\s+знакомиться$|^знакомство$"
+    rf"|^узнавай\s+меня$|^{_ЗАПОМНИ}\s+как\s+я\s+говорю$")
+_WHO_AM_I = re.compile(
+    r"^(?:кто\s+я|ты\s+знаешь\s+кто\s+я|знаешь\s+кто\s+я|"
+    r"узнаешь\s+меня|ты\s+меня\s+узнаешь|ты\s+меня\s+узнал)$")
+_WHAT_ABOUT_ME = re.compile(
+    r"^что\s+ты\s+(?:обо?\s+мне\s+)?(?:знаешь|помнишь)(?:\s+обо?\s+мне)?$")
+_FORGET_ME = re.compile(
+    rf"^забудь\s+(?:про\s+меня|меня|мой\s+голос|обо\s+мне)$"
+    r"|^сотри\s+(?:мо[её]\s+)?(?:личное\s+)?дело$")
+_REMEMBER = re.compile(rf"^{_ЗАПОМНИ}\s+(?:что\s+)?(.{{3,}})$")
+# «Меня зовут Игорь», сказанное просто так: тоже повод дать голосу имя.
+_MY_NAME = re.compile(r"^(?:меня\s+зовут|я)\s+([А-ЯЁа-яёA-Za-z-]{2,20})$")
+
+
+def _bare(text: str) -> str:
+    """Фраза без знаков препинания — по ней и сверяем правила.
+
+    Whisper расставляет запятые и тире по своему разумению, и правило,
+    написанное под чистую строку, на живой речи не срабатывает ни разу.
+    """
+    return " ".join(re.sub(r"[^\w\s]", " ",
+                           text.lower().replace("ё", "е")).split())
+
+
+def _about_people(command: str, who: str, voice, people, meeting) -> bool:
+    """Разговор о самих людях. True — разобрались, модель звать не надо."""
+    bare = _bare(command)
+
+    if _KNOW_ME.match(bare):
+        # Голос робот запоминает сам, из разговора. Просьба «запомни меня»
+        # теперь значит другое: дай голосу имя вместо клички.
+        if not who:
+            voice.say("Голос твой я ещё не запомнил. "
+                      "Поговори со мной немного, и запомню сам.")
+        elif people.nameless(who):
+            meeting.asking = True
+            voice.say("Голос твой я уже узнаю. А как тебя зовут?")
+        else:
+            voice.say(f"Я тебя и так узнаю, {who}.")
+        return True
+
+    if _WHO_AM_I.match(bare):
+        if not who:
+            voice.say("Пока не узнаю тебя по голосу — мало тебя слышал.")
+        elif people.nameless(who):
+            meeting.asking = True
+            voice.say("Голос узнаю, а имени не знаю. Как тебя зовут?")
+        else:
+            voice.say(f"Ты {who}.")
+        return True
+
+    if _WHAT_ABOUT_ME.match(bare):
+        voice.say(people.tell(who))
+        return True
+
+    if _FORGET_ME.match(bare):
+        said = people.forget(who)
+        # Слепок голоса живёт на ПК, дело — на роботе. Стираем оба: иначе
+        # робот «забыл» человека, но продолжает его узнавать.
+        meeting.forget(who)
+        voice.say(said)
+        return True
+
+    m = _MY_NAME.match(bare)
+    if m and who:
+        имя = _person_name(m.group(0))
+        if имя and имя != who:
+            people.rename(who, имя)
+            meeting.name_voice(имя)
+            voice.say(f"Запомнил, {имя}.")
+            return True
+
+    m = _REMEMBER.match(bare)
+    if m:
+        voice.say(people.remember(who, m.group(1)))
+        return True
+    return False
+
+
+# Служебные слова, которые в позиции имени встречаются, а именами не бывают.
+_NOT_A_WORD = {"не", "мне", "тебе", "меня", "тебя", "имя", "зовут", "это",
+               "скажу", "буду", "хочу", "знаю", "помню", "думаю"}
+
+
+def _person_name(text: str) -> str:
+    """Имя из фразы «меня зовут Игорь», «я Игорь» или просто «Игорь»."""
+    bare = text.strip().strip(".!?,")
+    # Длинную фразу именем не считаем вовсе: «а я не скажу тебе имя» — это не
+    # знакомство. Границы слов обязательны: без них «меНЯ зовут» давало «Зовут».
+    # Имя может стоять посреди длинной фразы: «меня зовут Игорь, а скажи какой
+    # город». Тогда берём его из явной формулы. Без формулы длинную фразу
+    # именем не считаем — «а я не скажу тебе имя» это не знакомство.
+    прямо = re.search(r"\bменя\s+зовут\s+([А-ЯЁA-Za-zа-яё-]{2,20})", bare, re.I)
+    if прямо:
+        имя = прямо.group(1).strip("-").capitalize()
+        return "" if имя.lower() in _NOT_A_NAME or имя.lower() in _NOT_A_WORD else имя
+    if len(bare.split()) > 4:
+        return ""
+    m = re.search(r"\b(?:зовут|это|я)\s+([А-ЯЁA-Za-zа-яё-]{2,20})", bare, re.I)
+    # Без «меня зовут» берём первое слово: «Игорь Петрович» — тоже имя, а звать
+    # человека двойным именем в каждой реплике незачем.
+    word = m.group(1) if m else bare.split()[0] if bare.split() else ""
+    word = word.strip("-").capitalize()
+    if len(word) < 2 or word.lower() in _NOT_A_NAME or word.lower() in _NOT_A_WORD:
+        return ""
+    # Командой звать человека нельзя. «Вперёд проедь на метр» — ровно четыре
+    # слова, под ограничение длины не попадало, и робот завёл жильца «Вперёд».
+    if intents.командное_слово(word):
+        return ""
+    return word
+
+
+def _post(url: str, data: bytes) -> dict:
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "audio/wav"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        import json as _json
+        return _json.loads(resp.read() or b"{}")
+
+
+class Turn:
+    """Секундомер одного обмена: куда именно уходит время до ответа.
+
+    «Как будто долго» — самая дорогая жалоба: чинить по ней можно что угодно
+    и промахнуться. Здесь три отрезка, и каждый лечится по-своему.
+
+    Ожидание тишины — робот не знает, что фраза кончилась, пока человек не
+    помолчит. Это не работа, это ожидание, и сократить его можно только
+    порогом silence_ms, рискуя перебивать человека на паузе.
+
+    Распознавание — дорога до ПК и сам whisper.
+
+    Ответ — модель плюс правила. У правил он нулевой, поэтому в логе видно,
+    сколько на самом деле экономит каждая регулярка.
+
+    Пишем один раз за обмен и только когда робот заговорил: молчаливые
+    отбрасывания шума лог не засоряют.
+    """
+
+    def __init__(self, silence: float) -> None:
+        self.silence = silence
+        self.at = time.monotonic()
+        self.heard = 0.0
+        self.told = False
+
+    def recognized(self) -> None:
+        self.heard = time.monotonic() - self.at
+
+    def spoke(self, how: str) -> None:
+        if self.told:
+            return
+        self.told = True
+        total = time.monotonic() - self.at
+        log.info("заговорил через %.1f с после фразы: тишина %.1f + "
+                 "распознавание %.1f + ответ %.1f (%s)",
+                 self.silence + total, self.silence, self.heard,
+                 total - self.heard, how)
 
 
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                  brain: Brain, voice: Voice, tools: list,
-                 addressed: Addressed) -> None:
+                 addressed: Addressed, ros=None, people: People | None = None) -> None:
     by_name = {t.name: t for t in tools}
+    if people is None:
+        people = People(cfg.data_dir / "люди.json")
     name = cfg.wake_words[0].capitalize() if cfg.wake_words else "робот"
     log.info("слушаю, имя — %s, разговор держится %.0f с после ответа",
              name, cfg.session_seconds)
@@ -428,6 +1007,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
     # в разговоре и отвечает без имени, пока не замолчат.
     awake_until = 0.0
 
+    meeting = Meeting(cfg.tts_url or cfg.pc_url)
     debug_audio = os.environ.get("ROBOT_DEBUG_AUDIO") == "1"
     if debug_audio:
         log.info("записи услышанного складываю в /tmp/robot-audio")
@@ -440,15 +1020,47 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
     undo = Undo()
 
     for wav in listener.utterances():
+        # Кусок, нарезанный по длине, а не по паузе: в комнате говорят не
+        # умолкая. Разбирать его стоит — обращение к роботу может оказаться
+        # внутри, — но только пока распознаёт ПК: он успевает за десятую долю
+        # длины. Когда ПК замолчал и робот разбирает сам, двадцать секунд
+        # звука превращаются в минуту немоты, и в эту минуту не проходит
+        # ничего, включая «стоп». Тогда честнее выбросить.
+        срез_комнаты = listener.long_chunk
+        if срез_комнаты and getattr(recognizer, "сам_разбираю", False):
+            log.info("длинный кусок, а разбираю сам — пропускаю, чтобы не онеметь")
+            continue
+        turn = Turn(cfg.silence_ms / 1000.0)
         text = recognizer.transcribe(wav)
+        turn.recognized()
+        # Кто это сказал. Пусто — ПК не узнал голос, выключен или узнавание
+        # не поднято; тогда робот разговаривает, никого не различая.
+        who = getattr(recognizer, "speaker", "")
+        brain.about = people.brief(who)
+        # Насколько распознавание само себе верит. Пишем в лог всегда: без
+        # живых чисел порог подбирается гаданием, а цена ошибки здесь —
+        # уехавший робот.
+        sure = getattr(recognizer, "confidence", None)
         if debug_audio:
             _dump_audio(wav, text)
+        if sure is not None and sure < GARBAGE_BELOW:
+            log.info("расслышал слишком плохо (%.2f), отбрасываю: %r", sure, text)
+            deaf = True
+            continue
         if _is_junk(text):
             # В разговоре молчать нельзя: человек не понимает, услышали его
             # или нет, и начинает повторять всё громче. Но говорить это на
             # каждый шорох тоже нельзя — иначе шум на кухне зациклит робота
             # на одной фразе. Поэтому только на первый неразобранный подряд.
-            if time.monotonic() < awake_until and not deaf:
+            #
+            # И только если что-то действительно прозвучало. Пустой разбор —
+            # это тишина, а не неудачная фраза: отзываться на неё «не
+            # расслышал» значит спорить с человеком, который молчал. На живом
+            # роботе так и вышло — он говорил это после каждой поездки, потому
+            # что слышал собственные моторы и разбирал их в пустоту.
+            слышно = bool(text.strip())
+            занят = ros is not None and ros.busy
+            if слышно and not занят and time.monotonic() < awake_until and not deaf:
                 voice.say("Не расслышал.")
                 awake_until = time.monotonic() + cfg.session_seconds
             deaf = True
@@ -461,10 +1073,28 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             brain.reset()
 
         awake = time.monotonic() < awake_until
-        command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
-        # Инструменты движения смотрят на этот признак: ехать можно только по
-        # имени, кто бы ни попросил — правило или модель.
-        addressed.by_name = command is not None or not cfg.motion_needs_name
+        if listener.wake_heard:
+            # Имя услышано в ЗВУКЕ — в тексте его искать незачем, и это главный
+            # выигрыш нового слоя. Запись начинается около имени, и начало
+            # могло срезаться: «зя, вперёд на метр» по тексту не опознать
+            # никак, а робота при этом звали. Имя из расшифровки всё-таки
+            # снимаем, если оно туда попало целиком, — чтобы не уехало в
+            # команду.
+            снятое = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
+            command = снятое if снятое is not None else text.strip()
+            по_имени = True
+        else:
+            command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio,
+                                       anywhere=срез_комнаты)
+            по_имени = command is not None
+        if срез_комнаты:
+            # Без имени такой кусок — просто чужой разговор, и «не мне» на
+            # каждые двадцать секунд комнаты забьёт журнал.
+            if command is None:
+                log.debug("срез комнаты без имени, молчу (%r)", text[:80])
+                continue
+            log.info("имя нашлось внутри среза комнаты: %r", command[:80])
+        разбор: tuple | None = None
 
         if command is None:
             if not awake:
@@ -475,11 +1105,32 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # другим человеком. Длинную фразу без имени считаем не своей —
             # иначе робот платит модели за чужие реплики.
             command = text.strip()
-            if len(command.split()) > IN_SESSION_WORDS and intents.parse(command) is None:
+            разбор = _разобрать(command)
+            rule, цепочка = разбор
+            свои = rule is not None or цепочка is not None
+            if len(command.split()) > IN_SESSION_WORDS and not свои:
                 log.info("в окне, но длинно и не команда — не моё (%r)", command)
                 continue
+            # Обращаются по имени, и имя не моё. Команду при этом слушаемся:
+            # «Рома, стой» роботу тоже адресовано, если он едет.
+            other = _VOCATIVE.match(command)
+            if not свои and other and _clean_token(other.group(1)) not in _NOT_A_NAME:
+                log.info("зовут не меня, а %s — молчу (%r)", other.group(1), command)
+                continue
+            # Внутри начатого разговора имя можно не повторять, если движение
+            # разобрано правилом: почему именно так — в config.motion_name_once.
+            if cfg.motion_name_once and _команда_движения(rule, цепочка):
+                log.info("движение в открытом разговоре — имя не переспрашиваю")
+                по_имени = True
         elif not awake:
             log.info("проснулся по имени")
+
+        # Инструменты движения смотрят на эти два признака: ехать можно только
+        # по имени и только если фразу разобрали уверенно — кто бы ни попросил,
+        # правило или модель.
+        addressed.by_name = по_имени or not cfg.motion_needs_name
+        addressed.sure = sure is None or sure >= UNSURE_BELOW
+        addressed.отказ = ""
 
         voice.heard(command or text)
 
@@ -492,9 +1143,33 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
 
         log.info("человек: %s", command)
 
+        # Знакомство идёт своим порядком и главнее правил: пока робот ждёт
+        # имя, «Игорь» — это ответ ему, а не команда.
+        # Голос запоминаем ТОЛЬКО здесь — когда уже точно знаем, что говорили
+        # с роботом. Всё, что звучало в комнате мимо, до памяти не доходит.
+        метка = getattr(recognizer, "tag", "")
+        узнан = meeting.confirm(метка) or who
+        if узнан:
+            people.met(узнан)
+            if узнан != who:
+                # Голос завели прямо сейчас: справку для модели надо
+                # пересобрать, иначе первый разговор пройдёт мимо дела.
+                who = узнан
+                brain.about = people.brief(who)
+
+        if meeting.name_is(command, who, voice, people):
+            awake_until = time.monotonic() + cfg.session_seconds
+            continue
+        if _about_people(command, who, voice, people, meeting):
+            awake_until = time.monotonic() + cfg.session_seconds
+            last_talk = brain.last_talk = time.monotonic()
+            continue
+
         # Простые команды разбираем правилами: мгновенно, бесплатно и без
         # риска, что модель поймёт «влево» как «вправо». Всё остальное — модели.
-        match = intents.parse(command)
+        if разбор is None:
+            разбор = _разобрать(command)
+        match, цепочка = разбор
 
         # «Стоп» не должен ни за чем стоять в очереди. Раньше «отбой» на ходу
         # усыплял робота, а «стой» во время переспроса про таймеры считалось
@@ -526,14 +1201,43 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         if answered:
             pass                    # это был ответ на вопрос робота
         elif match is not None and match.tool in by_name:
-            _run_direct(by_name[match.tool], match.args, voice, pending)
+            _run_direct(by_name[match.tool], match.args, voice, pending, turn)
             undo.remember(match.tool, match.args)
+        elif цепочка:
+            # Движения выполняем по очереди и вслух отчитываемся о каждом.
+            # Второй вызов ждёт, пока доедет первый (см. Ros.drive), поэтому
+            # «Еду назад» звучит ровно тогда, когда робот и правда поехал
+            # назад, — а не в ту же секунду, что и «Еду вперёд».
+            for шаг in цепочка:
+                инструмент = by_name.get(шаг.tool)
+                if инструмент is not None:
+                    _run_direct(инструмент, шаг.args, voice, turn=turn)
+        elif intents.поддакивание(command) and not _спрашивали(voice):
+            # «Да» само по себе, когда робот ни о чём не спрашивал, сказано не
+            # ему: в окне разговора слышно и телевизор, и чужую реплику.
+            # Живой человек на такое молчит, а робот раньше платил модели за
+            # ответ и получал «Понял. Готов к следующему. Что нужно?».
+            log.info("пустое поддакивание, вопроса не было — молчу (%r)", command)
         else:
+            if match is not None:
+                # Правило разобрало, а инструмента нет — это наша ошибка
+                # сборки, и молчать о ней нельзя. Так пропала музыка: правило
+                # звало music_volume, инструмент не собрался, робот уходил к
+                # модели и отвечал «громкость уменьшена», не тронув ничего.
+                # Вслух это неотличимо от исправной работы.
+                log.warning("правило звало %s, а инструмента нет — "
+                            "спрашиваю модель вместо него", match.tool)
             # Помечаем явно: по этим строкам в логе видно, каких формулировок
             # не хватает правилам. Это лучший источник для их пополнения —
             # выборка под конкретного человека, а не общий корпус.
             log.info("правилами не разобрал, спрашиваю модель")
-            _respond(command, brain, voice)
+            _respond(command, brain, voice, recognizer, ros, turn, addressed)
+
+        # Поговорили несколько раз, а как зовут — так и не знаем. Спросим
+        # один раз: раньше навязчиво, позже глупо — человек уже всё рассказал.
+        if meeting.time_to_ask(who, people):
+            meeting.asking = True
+            voice.say("Кстати, мы так и не познакомились. Как тебя зовут?")
 
         # Окно отсчитываем от конца ответа, а не от начала: иначе длинная
         # реплика робота съедала бы всё время, отведённое на продолжение.
@@ -573,8 +1277,11 @@ class Undo:
         if not self.tool or time.monotonic() - self.at > UNDO_SECONDS:
             return False
         plain = re.sub(r"[^\w\s]", "", command.lower().replace("ё", "е")).strip()
-        if plain not in ("отмена", "отмени", "отменить", "забудь", "не надо",
-                         "неважно", "не важно"):
+        # «Забудь», «неважно», «не надо» отсюда убраны намеренно: это слова
+        # прощания — человек передумал разговаривать, и правильная реакция
+        # замолчать, а не снимать поставленный минуту назад таймер. Раньше
+        # отмена проверялась раньше прощания и перехватывала их.
+        if plain not in ("отмена", "отмени", "отменить"):
             return False
 
         name, field = self.UNDOABLE[self.tool]
@@ -652,7 +1359,8 @@ class Pending:
 _ASKS_LABEL = ("Какой снять?", "Какой поставить на паузу?", "Какой продолжить?")
 
 
-def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None) -> None:
+def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None,
+                turn=None) -> None:
     """Выполняет команду, разобранную правилом, минуя модель."""
     # Инструмент вызываем до заглушения микрофона: движение стартует сразу, и
     # эти доли секунды робот ещё слышит комнату.
@@ -662,6 +1370,11 @@ def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None) 
     elif (pending is not None and answer.endswith("?")
             and "confirmed" in tool.input_schema.get("properties", {})):
         pending.ask(tool, confirm=True, args={**args, "confirmed": True})
+    # Отметку ставим ДО say: он ждёт, пока реплика отзвучит, а секундомер
+    # меряет, когда робот ЗАГОВОРИЛ. Иначе рассказ про умения показывал
+    # «ответ 16.5 с» — это не задержка, это длина самого рассказа.
+    if turn is not None:
+        turn.spoke("правило")
     voice.say(answer)   # say сам пишет реплику в лог
 
 
@@ -672,6 +1385,14 @@ def _failure_phrase(error: Exception) -> str:
     и получал то же самое. При телефоне-микрофоне и двойном NAT отвалившийся
     интернет — обычное дело, и сказать об этом честно полезнее.
     """
+    from .brain import наша_вина
+
+    # Наша собственная ошибка в запросе. Раньше она попадала в последнюю ветку
+    # и человек слышал «повтори» — повторял, и получал то же самое, потому что
+    # повтор тут не помогает никогда.
+    if наша_вина(error):
+        return ("Я сломан внутри: модель не принимает мой запрос. "
+                "Повторять бесполезно, нужен журнал.")
     name = type(error).__name__
     if "Connection" in name or "Timeout" in name:
         return ("Сейчас я без интернета. Таймеры, время, список и езда "
@@ -683,13 +1404,71 @@ def _failure_phrase(error: Exception) -> str:
     return "Что-то пошло не так, повтори."
 
 
-def _respond(command: str, brain: Brain, voice: Voice) -> None:
-    """Отвечает вслух, проговаривая предложения по мере генерации."""
-    buffer = SentenceBuffer()
+def _caught_stop(wav: bytes, recognizer, ros) -> bool:
+    """Не сказал ли человек «стоп», пока робот думал над ответом.
 
-    # Микрофон глушим не на весь ход, а с первого произнесённого предложения:
-    # пока модель думает, робот молчит — и должен слышать «стоп», тем более
-    # что модель могла уже вызвать drive и робот в этот момент едет.
+    Пока идёт разговор с моделью, главный цикл висит в нём и фраз не читает —
+    а модель к этому моменту могла уже отправить робота ехать, и поездка
+    длится до пятнадцати секунд. Разбираем накопленный хвост задним числом:
+    это не мгновенная остановка, но лучше, чем никакой.
+
+    Настоящее решение — отдельный поток слуха; оно крупнее и отложено. Пока
+    так, и лучше честно, чем обещать в комментариях несуществующее.
+    """
+    if not wav or not ros.moving:
+        return False
+    try:
+        text = recognizer.transcribe(wav)
+    except Exception:
+        log.debug("не смог разобрать хвост", exc_info=True)
+        return False
+    if _is_junk(text):
+        return False
+    match = intents.parse(text)
+    if match is None or match.tool != "stop":
+        return False
+    log.warning("«%s» прозвучало, пока я думал — останавливаюсь", text.strip())
+    ros.stop_motion()
+    return True
+
+
+def _respond(command: str, brain: Brain, voice: Voice,
+             recognizer=None, ros=None, turn=None, addressed=None) -> None:
+    """Отвечает вслух, проговаривая предложения по мере генерации.
+
+    С одним исключением: если человек велел ехать, ответ придерживается до
+    конца хода. Причина в живом случае. На «метр вперёд и метр назад» домашняя
+    модель ответила «Приехал вперёд. Теперь назад. Готов к следующему!» — и не
+    позвала ни одного инструмента. Робот не сдвинулся, а человек услышал отчёт
+    о двух поездках и узнал правду, только обернувшись. Такое враньё хуже
+    отказа, и произносить его нельзя вовсе: сказанное вслух не вернёшь.
+
+    Поэтому на командах движения потоковость отключается — и это дёшево.
+    Ответ на «поезжай вперёд» это одна короткая фраза, а не рассказ: терять
+    тут нечего, кроме доли секунды.
+
+    Придерживаем и тогда, когда ехать сейчас вообще нельзя — робота не звали
+    по имени или расслышали неуверенно. Тут был свой живой случай, и он
+    выглядел глупее всех: модель успевала сказать «Еду вперёд на метр», потом
+    инструмент отказывал, модель пересказывала отказ — и робот произносил
+    «Еду вперёд на метр. Похоже, нужно обратиться ко мне по имени» одной
+    фразой. Обещание и отказ в нём разом; человек не понимает, поехали или
+    нет. Обещание в таком ходу не звучит вовсе, а вслух идёт только отказ,
+    одной строкой и без пересказа.
+    """
+    # not addressed() — это «ехать сейчас нельзя», а не «человек не тот».
+    нельзя_ехать = addressed is not None and not addressed()
+    придержать = intents.просят_ехать(command) or нельзя_ехать
+    buffer = SentenceBuffer()
+    # Хвост снимаем в момент, когда робот собирается заговорить: дальше в нём
+    # будет уже его собственный голос, и искать в этом «стоп» бессмысленно.
+    unheard = b""
+
+    # Микрофон глушим не на весь ход, а с первого произнесённого предложения.
+    # Пока модель думает, робот молчит, и сказанное в этот момент копится в
+    # буфере звука. Мгновенно на «стоп» он не среагирует — главный цикл висит
+    # в разговоре с моделью, — но хвост разбирается сразу после ответа, и
+    # колёса встают. Это важно: модель могла уже отправить робота ехать.
     #
     # Синтез открываем уже под замком: в режиме local это отдельный процесс
     # piper на общую звуковую карту, и открывать его раньше, чем занят голос,
@@ -699,26 +1478,69 @@ def _respond(command: str, brain: Brain, voice: Voice) -> None:
         speaking = False
 
         def start_speaking() -> None:
-            nonlocal speaking
+            nonlocal speaking, unheard
             if not speaking:
+                if recognizer is not None and ros is not None:
+                    unheard = voice.listener.unheard()
                 stack.enter_context(voice.quiet())
                 speaking = True
 
+        придержанное: list[str] = []
+
+        def произнести(sentence: str) -> None:
+            log.info("робот: %s", sentence)
+            start_speaking()
+            if turn is not None:
+                turn.spoke("модель")
+            if speech:
+                speech.feed(sentence)
+
         def on_text(chunk: str) -> None:
             for sentence in buffer.push(chunk):
-                log.info("робот: %s", sentence)
-                start_speaking()
-                if speech:
-                    speech.feed(sentence)
+                if придержать:
+                    придержанное.append(sentence)
+                else:
+                    произнести(sentence)
 
+        said = ""
         try:
-            brain.reply(command, on_text)
+            # «Подумай хорошо» — просьба позвать умного. Домашняя модель
+            # отвечает за секунду и даром, но потолок у неё свой, и человек
+            # это слышит раньше любого автомата. Решение платить принимает он,
+            # вслух и осознанно, а не классификатор, который сам ошибается.
+            smart, command = intents.wants_smart(command)
+            if smart:
+                log.info("просили умного — иду в облако")
+            said = brain.reply(command, on_text, smart)
             tail = buffer.flush()
             if tail:
-                log.info("робот: %s", tail)
-                start_speaking()
-                if speech:
-                    speech.feed(tail)
+                if придержать:
+                    придержанное.append(tail)
+                else:
+                    произнести(tail)
+
+            if придержать:
+                # Ход кончился — теперь видно, поехал робот или только сказал.
+                поехал = any(и in intents.ДВИЖЕНИЕ for и in brain.позвал)
+                отказ = getattr(addressed, "отказ", "") if addressed else ""
+                if отказ:
+                    # Инструмент движения отказал. Всё, что модель успела
+                    # сочинить вокруг, — это обещание поездки и пересказ
+                    # отказа своими словами; вслух идёт только сам отказ.
+                    log.info("движение не разрешено; модель хотела сказать "
+                             "%r — не говорю", " ".join(придержанное)[:120])
+                    придержанное = [отказ]
+                elif not поехал and intents.просят_ехать(command):
+                    log.warning("просили ехать (%r), а инструмент не позван; "
+                                "модель хотела сказать %r — не говорю",
+                                command, " ".join(придержанное)[:120])
+                    придержанное = [
+                        "Не понял, куда ехать.",
+                        "Скажи попроще: вперёд на метр или направо.",
+                    ]
+                for предложение in придержанное:
+                    произнести(предложение)
+                said = " ".join(придержанное)
         except Exception as e:
             log.exception("не смог ответить")
             start_speaking()
@@ -730,3 +1552,22 @@ def _respond(command: str, brain: Brain, voice: Voice) -> None:
                     speech.close()
                 except Exception:
                     log.exception("сбой при озвучивании")
+            # «Повтори» до сих пор не умело повторять именно то, ради чего его
+            # и просят: разговорный ответ шёл мимо Speaker.say, и last_said
+            # хранил старую реплику правила. Фразу про сбой сюда не пишем —
+            # после неудачи повторять надо прошлый нормальный ответ.
+            if said:
+                voice.speaker.last_said = said
+            # Строго до выхода из ExitStack: на выходе микрофон разглушается,
+            # и накопленное будет выброшено.
+            if recognizer is not None and ros is not None:
+                if not speaking:
+                    # Робот так и не заговорил — например, модель только
+                    # вызвала инструменты. Значит в буфере один человек, и
+                    # брать хвост можно прямо сейчас.
+                    unheard = voice.listener.unheard()
+                try:
+                    if _caught_stop(unheard, recognizer, ros):
+                        voice.status("остановился по «стоп»")
+                except Exception:
+                    log.exception("сбой при разборе хвоста")

@@ -1,0 +1,138 @@
+"""Ловля имени робота в непрерывном потоке звука.
+
+Как было. Звук резался на фразы по паузам, каждая фраза уезжала в полное
+распознавание, и уже в тексте искалось «Кузя». В тихой комнате это работает, а
+в живой — нет: паузы не случается, кусок растёт до предела длины, и робот
+отзывается через столько секунд, сколько этот предел. Со стороны выглядит как
+глухота, хотя слышно всё. Плюс любая музыка ломала нарезку.
+
+Как надо, и как устроены все настоящие ассистенты. Отдельный дешёвый детектор
+крутится на сыром потоке непрерывно: он не режет фраз, не ждёт пауз и не
+распознаёт речь — только слушает, не прозвучало ли имя. Услышал — открывается
+окно записи команды, и вот ТУТ уже нужен детектор пауз, но только чтобы
+понять, где команда кончилась. В полное распознавание уходит одна команда, а
+не двадцать секунд комнаты.
+
+Внутри — Vosk с суженным до имени словарём. Русский у него родной, обучать
+ничего не надо, модель `small-ru` весит около сорока мегабайт и тянет поток в
+реальном времени на A55. Сужение словаря — это и есть режим ключевого слова:
+распознавателю незачем знать все слова языка, когда ищется одно.
+
+Сверху лежит нечёткое сравнение — то же самое, которым раньше искали имя в
+тексте. Оно нужно и здесь: распознавание пишет имя по-разному, и «Кузь»,
+«Куся», «Хузя» должны считаться обращением.
+"""
+
+from __future__ import annotations
+
+import difflib
+import json
+import logging
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+
+def clean_token(token: str) -> str:
+    return token.lower().replace("ё", "е").strip(" ,.!?…—-\"'()")
+
+
+def sounds_like_wake(token: str, wake_words: tuple[str, ...], ratio: float) -> bool:
+    """Похоже ли слово на имя робота.
+
+    Распознавание пишет имя по-разному — «Кузя», «Кузь», «Куся», — поэтому
+    сравниваем нестрого. Порог держим высоким: имя короткое, а на четырёх
+    буквах послабление начинает ловить всё подряд.
+    """
+    if not token:
+        return False
+    for wake in wake_words:
+        if token == wake or token.startswith(wake):
+            return True
+        if difflib.SequenceMatcher(None, token, wake).ratio() >= ratio:
+            return True
+    return False
+
+
+class Spotter:
+    """Детектор имени на потоке. Кормится теми же кадрами, что и нарезка."""
+
+    def __init__(self, model_dir: Path, wake_words: tuple[str, ...],
+                 sample_rate: int = 16000, ratio: float = 0.8,
+                 full_vocab: bool = False) -> None:
+        from vosk import KaldiRecognizer, Model, SetLogLevel
+
+        SetLogLevel(-1)          # иначе Kaldi засыпает журнал своей отладкой
+        self.wake_words = wake_words
+        self.ratio = ratio
+        model = Model(str(model_dir))
+        if full_vocab:
+            # Полный словарь: дороже по процессору, но берёт имя, которого нет
+            # в лексиконе модели. «Кузя» — имя собственное, и в маленькой
+            # модели его может не оказаться вовсе; тогда суженный словарь не
+            # сработает никогда, а полный — вытащит через нечёткое сравнение.
+            self._rec = KaldiRecognizer(model, sample_rate)
+        else:
+            грамматика = json.dumps(list(wake_words) + ["[unk]"],
+                                    ensure_ascii=False)
+            self._rec = KaldiRecognizer(model, sample_rate, грамматика)
+
+    def сбросить(self) -> None:
+        """Забыть накопленное — после срабатывания и после своей же речи."""
+        self._rec.Reset()
+
+    def услышал(self, frame: bytes) -> bool:
+        """Прозвучало ли имя. Кадр — те же 20 мс, что и у нарезки.
+
+        Смотрим ЧАСТИЧНЫЙ результат, а не окончательный: окончательный Vosk
+        отдаёт по концу реплики, то есть опять по паузе — ровно то, от чего мы
+        здесь уходим. Частичный обновляется по мере слов, и имя видно сразу
+        после того, как оно договорено.
+        """
+        if self._rec.AcceptWaveform(frame):
+            текст = json.loads(self._rec.Result()).get("text", "")
+        else:
+            текст = json.loads(self._rec.PartialResult()).get("partial", "")
+        if not текст:
+            return False
+        for слово in текст.split():
+            if sounds_like_wake(clean_token(слово), self.wake_words, self.ratio):
+                self.сбросить()
+                return True
+        return False
+
+
+def make_spotter(cfg) -> "Spotter | None":
+    """Собрать детектор или честно сказать, почему не вышло.
+
+    None — это не поломка, а откат на прежний способ: резать по паузам и
+    искать имя в тексте. Он хуже, но работает, поэтому отсутствие модели не
+    повод не запускаться. А вот молчать об этом нельзя: разница в поведении
+    видна сразу, и человек должен знать, какой из двух режимов у него сейчас.
+    """
+    if cfg.wake_engine != "vosk":
+        log.info("ловля имени на потоке выключена — режу по паузам, "
+                 "имя ищу в тексте")
+        return None
+    if not cfg.wake_words:
+        log.warning("имя робота не задано — ловить нечего")
+        return None
+    model_dir = Path(cfg.wake_model).expanduser()
+    if not model_dir.is_dir():
+        log.error("нет модели для ловли имени: %s. Робот будет слышать хуже — "
+                  "резать по паузам и искать имя в тексте. Как поставить — "
+                  "см. voice/README.md", model_dir)
+        return None
+    try:
+        spotter = Spotter(model_dir, cfg.wake_words, cfg.sample_rate,
+                          cfg.wake_ratio, cfg.wake_full_vocab)
+    except ImportError:
+        log.error("библиотека vosk не установлена — режу по паузам. "
+                  "Поставить: voice/.venv/bin/pip install vosk")
+        return None
+    except Exception:
+        log.exception("не смог поднять ловлю имени — режу по паузам")
+        return None
+    log.info("ловлю имя «%s» прямо в потоке, словарь %s",
+             cfg.wake_words[0], "полный" if cfg.wake_full_vocab else "суженный")
+    return spotter

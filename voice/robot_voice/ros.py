@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 
@@ -18,6 +19,17 @@ log = logging.getLogger(__name__)
 
 CMD_VEL = "/cmd_vel"
 POWER = "/PowerVoltage"
+# Куда шасси докладывает, где оно на самом деле. Без этого поездка отмеряется
+# секундомером: «полметра» — это «две с половиной секунды на такой-то
+# скорости». Разгон при этом никто не считает, и робот проезжает меньше, а
+# разворот «на сто восемьдесят» выходит на глаз градусов на сто двадцать.
+ODOM = "/odom"
+# Дальше этого одометрию считаем протухшей: шасси молчит или узел упал.
+ODOM_TTL = 2.0
+# Сколько ждать, пока доедет прежняя команда, прежде чем начать новую. Больше
+# самой долгой поездки: три метра на скорости ноль двадцать — это пятнадцать
+# секунд, плюс запас на разгон.
+ОЧЕРЕДЬ_ЖДЁМ = 25.0
 
 # Шасси шлёт напряжение раз в секунду. Десять секунд молчания — связи нет.
 VOLTAGE_TTL = 10.0
@@ -30,6 +42,8 @@ class Ros:
         self._connected = threading.Event()
         self._voltage: float | None = None
         self._voltage_at = 0.0
+        self._odom: tuple[float, float, float] | None = None
+        self._odom_at = 0.0
         self._lock = threading.Lock()
         self._stop = False
         # Движение крутится в отдельном потоке, иначе робот не услышит «стоп»,
@@ -73,10 +87,16 @@ class Ros:
         log.info("rosbridge: подключён к %s", self.url)
         self._connected.set()
         self._send({"op": "advertise", "topic": CMD_VEL, "type": "geometry_msgs/msg/Twist"})
+        self._send({"op": "subscribe", "topic": ODOM,
+                    "type": "nav_msgs/msg/Odometry", "throttle_rate": 50})
         self._send({"op": "subscribe", "topic": POWER, "type": "std_msgs/msg/Float32",
                     "throttle_rate": 1000})
-        self._send({"op": "subscribe", "topic": CMD_VEL, "type": "geometry_msgs/msg/Twist",
-                    "throttle_rate": 100})
+        # Без throttle намеренно. Это единственный канал, по которому работает
+        # кнопка СТОП: rosbridge при throttle не ставит сообщения в очередь, а
+        # выбрасывает пришедшие раньше окна, и нули от кнопки терялись целиком
+        # — их перекрывало эхо собственной поездки, идущее каждые 66 мс.
+        # Разбор трёх десятков json в секунду ничего не стоит.
+        self._send({"op": "subscribe", "topic": CMD_VEL, "type": "geometry_msgs/msg/Twist"})
 
     def _on_close(self, ws, *_a) -> None:
         log.warning("rosbridge: соединение закрыто")
@@ -90,6 +110,9 @@ class Ros:
         if msg.get("op") != "publish":
             return
 
+        if msg.get("topic") == ODOM:
+            self._запомнить_одометрию(msg.get("msg") or {})
+            return
         if msg.get("topic") == POWER:
             with self._lock:
                 self._voltage = float(msg["msg"]["data"])
@@ -150,6 +173,36 @@ class Ros:
         with self._lock:
             return time.monotonic() - self._own_zero_at < window
 
+    def _запомнить_одометрию(self, сообщение: dict) -> None:
+        """Где шасси считает себя сейчас: координаты и поворот."""
+        try:
+            поза = сообщение["pose"]["pose"]
+            точка = поза["position"]
+            кватернион = поза["orientation"]
+            x, y = float(точка["x"]), float(точка["y"])
+            qz, qw = float(кватернион["z"]), float(кватернион["w"])
+            qx, qy = float(кватернион.get("x", 0.0)), float(кватернион.get("y", 0.0))
+        except (KeyError, TypeError, ValueError):
+            return
+        # Плоский робот: из кватерниона нужен только поворот вокруг вертикали.
+        поворот = math.atan2(2.0 * (qw * qz + qx * qy),
+                             1.0 - 2.0 * (qy * qy + qz * qz))
+        with self._lock:
+            self._odom = (x, y, поворот)
+            self._odom_at = time.monotonic()
+
+    @property
+    def odom(self) -> tuple[float, float, float] | None:
+        """Координаты и поворот. None — шасси про это молчит.
+
+        Молчит оно в двух случаях: узел не запущен или подписка не доехала.
+        Оба означают одно — ехать придётся по секундомеру, как раньше.
+        """
+        with self._lock:
+            if not self._odom_at or time.monotonic() - self._odom_at > ODOM_TTL:
+                return None
+            return self._odom
+
     def publish_twist(self, x: float = 0.0, y: float = 0.0, wz: float = 0.0) -> None:
         if abs(x) + abs(y) + abs(wz) <= 1e-3:
             with self._lock:
@@ -195,26 +248,125 @@ class Ros:
             last = self._last_move
         return last > 0 and (time.monotonic() - last) < 1.5
 
-    def drive(self, x: float, y: float, wz: float, duration: float) -> None:
-        """Запускает движение на заданное время в отдельном потоке.
+    def drive(self, x: float, y: float, wz: float, duration: float,
+              *, путь: float = 0.0, угол: float = 0.0) -> None:
+        """Запускает движение в отдельном потоке.
 
         Возврат управления сразу — чтобы робот продолжал слушать и мог
         принять «стоп» на ходу.
+
+        Путь и угол — сколько проехать и на сколько повернуться по правде,
+        в метрах и радианах. Если шасси докладывает одометрию, движение
+        кончается по ней, а duration остаётся предохранителем на случай, когда
+        одометрия врёт или молчит. Без неё всё как раньше — по секундомеру.
+
+        Если робот уже едет — ДОЖИДАЕМСЯ. Раньше новая команда отменяла
+        прежнюю, и «проедь вперёд, а потом назад» кончалось одним движением
+        назад: модель звала оба инструмента в одну секунду, второй убивал
+        первый. Человек видел, что робот дёрнулся и уехал не туда.
+
+        Отмена осталась ровно там, где нужна, — в stop_motion по слову «стоп».
         """
+        self._пустить(self._motion_loop, (x, y, wz, duration),
+                      {"путь": путь, "угол": угол})
+
+    def run_route(self, шаги: list[dict]) -> None:
+        """Несколько движений подряд — одной программой, одним потоком.
+
+        Зачем отдельно от drive. Фигуру вроде зигзага или круга нельзя собрать
+        из отдельных вызовов drive: каждый ждёт предыдущий в ОЧЕРЕДЬ_ЖДЁМ, и
+        двенадцать шагов заняли бы главный цикл на всё время поездки — робот
+        перестал бы слышать «стоп» ровно тогда, когда он нужнее всего.
+
+        Здесь наоборот: управление возвращается сразу, а шаги отсчитывает
+        отдельный поток. Поток этот — тот же самый self._motion, поэтому
+        снаружи маршрут неотличим от обычной поездки: moving и busy правдивы,
+        а stop_motion обрывает не текущий шаг, а всю программу целиком.
+
+        Каждый шаг — словарь аргументов _motion_loop: x, y, wz, duration и,
+        если есть одометрия, путь с углом.
+        """
+        self._пустить(self._route_loop, (list(шаги),), {})
+
+    def _пустить(self, цель, args: tuple, kwargs: dict) -> None:
+        """Общее начало любого движения: дождаться прежнего и завести поток."""
+        предыдущее = self._motion
+        if (предыдущее is not None and предыдущее.is_alive()
+                and предыдущее is not threading.current_thread()):
+            # Ждём не бесконечно: если прежнее движение зависло, новое всё
+            # равно должно случиться, иначе робот замрёт навсегда.
+            предыдущее.join(timeout=ОЧЕРЕДЬ_ЖДЁМ)
         self.cancel_motion()
         self._motion_cancel.clear()
-        self._motion = threading.Thread(
-            target=self._motion_loop, args=(x, y, wz, duration), daemon=True)
+        # Предыдущая поездка только что доложила о себе тремя нулями, и по
+        # времени они выглядят как «наши». Если их не забыть, окно в полсекунды
+        # накроет начало новой поездки, и кнопка СТОП в первые полсекунды
+        # молча не сработает — а проверять её будут на одиночной поездке, где
+        # всё хорошо.
+        with self._lock:
+            self._own_zero_at = 0.0
+        self._motion = threading.Thread(target=цель, args=args, kwargs=kwargs,
+                                        daemon=True)
         self._motion.start()
 
-    def _motion_loop(self, x: float, y: float, wz: float, duration: float) -> None:
+    def _route_loop(self, шаги: list[dict]) -> None:
+        """Шаги маршрута по очереди, с оглядкой на «стоп» между ними.
+
+        Отмену проверяем и здесь, а не только внутри шага: _motion_loop от
+        неё выходит молча, и без этой проверки маршрут после «стоп» просто
+        поехал бы дальше со следующего колена.
+        """
+        всего = len(шаги)
+        for номер, шаг in enumerate(шаги, 1):
+            if self._motion_cancel.is_set():
+                log.info("маршрут прерван на шаге %d из %d", номер, всего)
+                return
+            log.info("маршрут: шаг %d из %d", номер, всего)
+            self._motion_loop(**шаг)
+        log.info("маршрут пройден, шагов %d", всего)
+
+    def _motion_loop(self, x: float, y: float, wz: float, duration: float,
+                     *, путь: float = 0.0, угол: float = 0.0) -> None:
         # Шасси ждёт /cmd_vel непрерывно — при паузе оно само тормозит,
         # поэтому команду повторяем 15 раз в секунду.
-        deadline = time.monotonic() + duration
+        начало = self.odom if (путь or угол) else None
+        if начало is not None:
+            # По одометрии ждём дольше: разгон съедает время, и робот доедет
+            # позже, чем обещал секундомер. Втрое — с запасом, это всё равно
+            # только предохранитель на случай вранья одометрии.
+            deadline = time.monotonic() + max(duration * 3.0, duration + 2.0)
+        else:
+            deadline = time.monotonic() + duration
+        пройдено = повёрнуто = 0.0
+        прошлый = начало
         try:
             while time.monotonic() < deadline and not self._motion_cancel.is_set():
                 self.publish_twist(x, y, wz)
                 self._motion_cancel.wait(1 / 15)
+                if начало is None:
+                    continue
+                сейчас = self.odom
+                if сейчас is None:
+                    continue
+                if путь:
+                    пройдено = math.hypot(сейчас[0] - начало[0],
+                                          сейчас[1] - начало[1])
+                    if пройдено >= путь:
+                        log.info("проехал %.2f м из %.2f — останавливаюсь",
+                                 пройдено, путь)
+                        break
+                if угол and прошлый is not None:
+                    # Складываем приращения, а не считаем разницу с началом:
+                    # поворот идёт по кругу, и на трёхстах шестидесяти градусах
+                    # разница вернулась бы к нулю.
+                    шаг = сейчас[2] - прошлый[2]
+                    шаг = (шаг + math.pi) % (2 * math.pi) - math.pi
+                    повёрнуто += abs(шаг)
+                    if повёрнуто >= угол:
+                        log.info("повернулся на %.0f° из %.0f — останавливаюсь",
+                                 math.degrees(повёрнуто), math.degrees(угол))
+                        break
+                прошлый = сейчас
         finally:
             for _ in range(3):
                 self.publish_twist()
