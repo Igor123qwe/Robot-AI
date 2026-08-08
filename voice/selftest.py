@@ -1447,6 +1447,9 @@ def прогон_фраз(схема, шумно: bool = False, с_флагам�
     l._noisy = шумно
     l._muted = th.Event()
     l.long_chunk = False
+    l.wake_heard = False
+    l.spotter = None            # запасной режим: режем по паузам
+    l.command_frames = 1000
     куски = []
     for w in l.utterances():
         куски.append((round((len(w) - 44) / 2 / 16000, 1), l.long_chunk))
@@ -1676,6 +1679,99 @@ def test_stop_while_thinking() -> None:
         transcribe=lambda wav: (_ for _ in ()).throw(RuntimeError("нет связи")))
     ros.moving = True
     check("сбой распознавания не роняет", _caught_stop("звук".encode(), падучий, ros), False)
+
+
+def test_wake_stream() -> None:
+    """Имя ловится на потоке, и до него паузы не ждём вовсе.
+
+    Прежняя нарезка резала по паузам и искала имя в расшифровке. В комнате, где
+    разговаривают не умолкая, паузы не случается, кусок рос до предела длины —
+    и робот отзывался через столько секунд, сколько этот предел. Со стороны
+    выглядело как «пропускает восемь команд из десяти».
+    """
+    import threading as th
+    from collections import deque
+
+    import numpy as np
+
+    from robot_voice import audio
+    from robot_voice.wake import sounds_like_wake
+
+    section("ловля имени на потоке")
+
+    # Нечёткое сравнение переехало в wake.py — проверяем, что не растеряло
+    # варианты, ради которых заводилось.
+    имена = ("кузя", "кузь", "куся")
+    for слово in ("кузя", "хузя", "куся", "кузь"):
+        check(f"«{слово}» — имя", sounds_like_wake(слово, имена, 0.75), True)
+    for слово in ("кухня", "коля", "пуля", ""):
+        check(f"«{слово}» — не имя", sounds_like_wake(слово, имена, 0.75), False)
+
+    def прогон(до_имени: int, команда, command_frames: int = 100,
+               имя_прозвучит: bool = True):
+        """До имени — сколько кадров шумит комната; команда — (речь?, кадров).
+
+        Разделено намеренно: детектор имени и детектор речи вызываются в разные
+        моменты, и общий список признаков между ними разъезжается. Здесь у
+        каждого свой отсчёт, как и в жизни.
+        """
+        признаки = []
+        for речь, n in команда:
+            признаки.extend([речь] * n)
+        кадры = [np.zeros(160, dtype=np.int16)
+                 for _ in range(до_имени + len(признаки))]
+        подряд = iter(признаки)
+        счётчик = {"n": 0}
+        сбросов = {"n": 0}
+
+        class Ухо:
+            def услышал(self, frame):
+                счётчик["n"] += 1
+                return имя_прозвучит and счётчик["n"] == до_имени
+
+            def сбросить(self):
+                сбросов["n"] += 1
+
+        l = audio.Listener.__new__(audio.Listener)
+        l.pump = types.SimpleNamespace(start=lambda: None,
+                                       frames=lambda: iter(кадры))
+        l.sample_rate = 16000
+        l.vad = types.SimpleNamespace(is_speech=lambda *a: next(подряд))
+        l.silence_frames, l._min_speech = 35, 15
+        l.max_speech_frames = 1000
+        l._start, l.preroll = 2, deque(maxlen=15)
+        l._noisy = False
+        l._muted = th.Event()
+        l.long_chunk = False
+        l.wake_heard = False
+        l.spotter = Ухо()
+        l.command_frames = command_frames
+        куски = [round((len(w) - 44) / 2 / 16000, 1) for w in l.utterances()]
+        return куски, l.wake_heard, сбросов["n"]
+
+    # Двести кадров непрерывной речи до имени: прежняя нарезка застряла бы в
+    # них до самого предела длины и отозвалась бы через двадцать секунд. Здесь
+    # они просто проходят мимо, а команда за именем приезжает по своей паузе.
+    куски, услышано, _ = прогон(200, [(True, 50), (False, 40)])
+    check("команда после имени приехала", len(куски), 1)
+    check("и помечена как названная по имени", услышано, True)
+
+    # Не позвали — не слушаем, сколько бы в комнате ни говорили.
+    куски, услышано, _ = прогон(500, [(True, 50), (False, 40)],
+                                имя_прозвучит=False)
+    check("без имени ничего не отдаём", куски, [])
+    check("и признак не поднят", услышано, False)
+
+    # Команда кончается по паузе — это единственное, ради чего тут нужен
+    # детектор речи. Вторая фраза без нового имени наружу не идёт.
+    куски, _, _ = прогон(5, [(True, 50), (False, 40), (True, 50), (False, 40)])
+    check("одно имя — одна команда", len(куски), 1)
+
+    # Длинная команда упирается в свой предел. Но это предел ОДНОЙ реплики, а
+    # не времени, через которое робот отзовётся, — в этом вся разница.
+    куски, _, _ = прогон(5, [(True, 300), (False, 40)], command_frames=100)
+    check("слишком длинная команда обрезается", len(куски), 1)
+    check("обрезана по своему пределу, а не по паузе", куски[0] < 1.5, True)
 
 
 def test_sound_cards() -> None:
@@ -2400,8 +2496,10 @@ def test_dialogue() -> None:
 
     class FakeListener:
         pump = types.SimpleNamespace(online=True)
-        # Обычные фразы, нарезанные по паузе, а не по длине.
+        # Обычные фразы, нарезанные по паузе, а не по длине, и имя в них
+        # ищется по тексту — как в запасном режиме без ловли на потоке.
         long_chunk = False
+        wake_heard = False
 
         def __init__(self, phrases): self.phrases = phrases
         def utterances(self): return iter([p.encode() for p in self.phrases])
@@ -3774,7 +3872,7 @@ def main() -> int:
                  test_no_broken_promise, test_chain, test_no_narration,
                  test_one_voice,
                  test_slicing, test_stop_while_thinking,
-                 test_sound_cards, test_speech_streams,
+                 test_wake_stream, test_sound_cards, test_speech_streams,
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,
                  test_counting, test_rules_reach_tools, test_ws_proxy,

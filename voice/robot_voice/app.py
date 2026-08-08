@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import difflib
 import logging
 import os
 import re
@@ -33,6 +32,7 @@ from .state import State
 from .stt import Recognizer, Remote
 from .tools import CUTOFF_VOLT, Timers, build_tools
 from .tts import SentenceBuffer, Speaker
+from .wake import clean_token, make_spotter, sounds_like_wake
 from .yandex import Music
 
 log = logging.getLogger("robot_voice")
@@ -215,25 +215,10 @@ def _setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def _clean_token(token: str) -> str:
-    return token.lower().replace("ё", "е").strip(" ,.!?…—-\"'()")
-
-
-def _sounds_like_wake(token: str, wake_words: tuple[str, ...], ratio: float) -> bool:
-    """Похоже ли слово на имя робота.
-
-    Whisper пишет имя по-разному — «Кузя», «Кузь», «Куся», — поэтому сравниваем
-    нестрого. Порог держим высоким: имя короткое, а на четырёх буквах послабление
-    начинает ловить всё подряд.
-    """
-    if not token:
-        return False
-    for wake in wake_words:
-        if token == wake or token.startswith(wake):
-            return True
-        if difflib.SequenceMatcher(None, token, wake).ratio() >= ratio:
-            return True
-    return False
+# Нечёткое сравнение с именем живёт в wake.py: оно нужно и там, где имя ищут
+# в звуке, и там, где его ищут в тексте. Пусть будет в одном месте.
+_clean_token = clean_token
+_sounds_like_wake = sounds_like_wake
 
 
 def _strip_wake_word(text: str, wake_words: tuple[str, ...],
@@ -562,6 +547,8 @@ def main() -> None:
         silence_ms=cfg.silence_ms,
         min_speech_ms=cfg.min_speech_ms,
         max_speech_ms=cfg.max_speech_ms,
+        spotter=make_spotter(cfg),
+        command_ms=cfg.command_ms,
     )
     voice = Voice(speaker, listener)
     voice.on_heard = lambda kind, text: _post_heard(cfg.web_endpoint, kind, text)
@@ -1074,9 +1061,20 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             brain.reset()
 
         awake = time.monotonic() < awake_until
-        command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio,
-                                   anywhere=срез_комнаты)
-        по_имени = command is not None
+        if listener.wake_heard:
+            # Имя услышано в ЗВУКЕ — в тексте его искать незачем, и это главный
+            # выигрыш нового слоя. Запись начинается около имени, и начало
+            # могло срезаться: «зя, вперёд на метр» по тексту не опознать
+            # никак, а робота при этом звали. Имя из расшифровки всё-таки
+            # снимаем, если оно туда попало целиком, — чтобы не уехало в
+            # команду.
+            снятое = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
+            command = снятое if снятое is not None else text.strip()
+            по_имени = True
+        else:
+            command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio,
+                                       anywhere=срез_комнаты)
+            по_имени = command is not None
         if срез_комнаты:
             # Без имени такой кусок — просто чужой разговор, и «не мне» на
             # каждые двадцать секунд комнаты забьёт журнал.

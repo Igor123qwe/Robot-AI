@@ -132,6 +132,23 @@ class Config:
     # аккуратнее, поэтому вынесено наружу — подбирается только на живом доме.
     vad_level: int = field(default_factory=lambda: int(_num("ROBOT_VAD_LEVEL", 2)))
 
+    # --- ловля имени на потоке ---
+    # vosk — слушать имя непрерывно и писать только команду за ним. Пусто или
+    # «нет» — прежний способ: резать по паузам, имя искать в расшифровке.
+    # Выключатель нужен на случай, если ложные срабатывания окажутся хуже
+    # задержки: вернуться одной строкой.
+    wake_engine: str = field(default_factory=lambda: _env("ROBOT_WAKE_ENGINE", "vosk"))
+    wake_model: str = field(
+        default_factory=lambda: _env("ROBOT_WAKE_MODEL", "~/vosk-model-small-ru"))
+    # Полный словарь дороже по процессору, но берёт имя, которого нет в
+    # лексиконе модели. «Кузя» — имя собственное, и в маленькой модели его
+    # может не оказаться: тогда суженный словарь не сработает никогда.
+    wake_full_vocab: bool = field(
+        default_factory=lambda: _env("ROBOT_WAKE_FULL_VOCAB", "0") not in ("0", "нет", "no"))
+    # Сколько писать команду после имени, пока человек не замолчал. Это длина
+    # ОДНОЙ реплики, а не потолок задержки ответа: ответ приходит по паузе.
+    command_ms: int = field(default_factory=lambda: int(_num("ROBOT_COMMAND_MS", 10000)))
+
     # --- распознавание ---
     whisper_model: str = field(default_factory=lambda: _env("ROBOT_WHISPER_MODEL", "base"))
     # 1 — жадный поиск, быстро. 5 — точнее, но втрое дольше на A55.

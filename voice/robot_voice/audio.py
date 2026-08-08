@@ -368,8 +368,17 @@ class Listener:
 
     def __init__(self, source, *, sample_rate: int, vad_level: int,
                  silence_ms: int, min_speech_ms: int, max_speech_ms: int = 20000,
-                 start_frames: int = 2) -> None:
+                 start_frames: int = 2, spotter=None,
+                 command_ms: int = 10000) -> None:
         self.pump = Pump(source)
+        # Детектор имени на потоке. Есть — слушаем по имени и режем только
+        # команду; нет — откатываемся на нарезку по паузам, см. utterances().
+        self.spotter = spotter
+        self.command_frames = max(1, command_ms // FRAME_MS)
+        # Имя прозвучало в ЗВУКЕ, а не в тексте. Читается сразу после фразы —
+        # как confidence у распознавания. Верх по этому признаку понимает, что
+        # искать имя в расшифровке уже не надо: оно точно было.
+        self.wake_heard = False
         self.sample_rate = sample_rate
         self.vad = webrtcvad.Vad(vad_level)
         self.silence_frames = max(1, silence_ms // FRAME_MS)
@@ -442,6 +451,68 @@ class Listener:
         self.pump.drop_pending()
 
     def utterances(self) -> Iterator[bytes]:
+        """Фразы для разбора. Как именно — решает наличие детектора имени."""
+        if self.spotter is not None:
+            yield from self._по_имени()
+        else:
+            yield from self._по_паузам()
+
+    def _по_имени(self) -> Iterator[bytes]:
+        """Слушаем имя на потоке, пишем только команду за ним.
+
+        Пауз до имени не ждём вовсе — поэтому шумная комната и играющая музыка
+        перестают мешать: детектор слушает поток как есть. Пауза нужна ровно
+        для одного — понять, где команда кончилась.
+
+        Имя в запись попадает не всегда: предбуфер короче слова, и начало
+        может срезаться. Это не беда, а замысел — верх и не ищет имя в тексте,
+        ему сказано звуком, что робота позвали.
+        """
+        self.pump.start()
+        speech: list[np.ndarray] = []
+        silence = 0
+        пишем = False
+
+        for frame in self.pump.frames():
+            if self._muted.is_set():
+                # Робот говорит сам. Копить его собственную речь в детекторе
+                # нельзя: своё имя он произносит и сам, и позвал бы себя.
+                speech, silence, пишем = [], 0, False
+                self.preroll.clear()
+                self.spotter.сбросить()
+                continue
+
+            if not пишем:
+                self.preroll.append(frame)
+                if self.spotter.услышал(frame.tobytes()):
+                    log.info("аудио: имя услышано — слушаю команду")
+                    speech = list(self.preroll)
+                    silence, пишем = 0, True
+                continue
+
+            speech.append(frame)
+            if self.vad.is_speech(frame.tobytes(), self.sample_rate):
+                silence = 0
+            else:
+                silence += 1
+
+            # Либо человек договорил, либо говорит слишком долго. Предел здесь
+            # щедрый: это длина ОДНОЙ команды, а не потолок задержки ответа,
+            # как было у нарезки по паузам.
+            if silence >= self.silence_frames or len(speech) >= self.command_frames:
+                payload, speech = speech, []
+                silence, пишем = 0, False
+                self.preroll.clear()
+                self.wake_heard = True
+                yield to_wav(np.concatenate(payload), self.sample_rate)
+
+    def _по_паузам(self) -> Iterator[bytes]:
+        """Запасной способ: резать по паузам, имя искать в тексте.
+
+        Работает без модели для ловли имени — хуже, но работает. Всё, что
+        связано с «срезом комнаты», живёт только здесь: при живом детекторе
+        куски приезжают размером с команду, и резать по длине незачем.
+        """
         self.pump.start()
         speech: list[np.ndarray] = []
         silence = 0
