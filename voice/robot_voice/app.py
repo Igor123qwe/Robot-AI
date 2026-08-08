@@ -266,15 +266,22 @@ def _strip_wake_word(text: str, wake_words: tuple[str, ...],
     # С конца — потому что человек часто зовёт несколько раз подряд, не
     # дождавшись ответа: «Кузя, сделай звук на пять. Кузя, включи музыку.»
     # Свежее обращение и есть настоящее, а первое робот уже проспал.
-    for предложение in reversed(_SENTENCE.split(text)):
-        tokens = предложение.split()
+    предложения = _SENTENCE.split(text)
+    for н in range(len(предложения) - 1, -1, -1):
+        tokens = предложения[н].split()
         for i, token in enumerate(tokens[:3]):
             if _sounds_like_wake(_clean_token(token), wake_words, ratio):
                 rest = tokens[:i] + tokens[i + 1:]
                 # Слова перед именем — обращение («эй», «слушай»), а не команда.
                 if all(_clean_token(t) in _FILLERS for t in tokens[:i]):
                     rest = tokens[i + 1:]
-                return " ".join(rest).strip(" ,.!?…—-")
+                команда = " ".join(rest).strip(" ,.!?…—-")
+                # Голое «Кузя!» отдельным предложением: команда идёт СЛЕДОМ, а
+                # не внутри. Робот на это отвечал «Да?» и терял просьбу —
+                # «Кузя! Включи музыку.» превращалось в переспрос.
+                if not команда:
+                    команда = " ".join(предложения[н + 1:]).strip(" ,.!?…—-")
+                return команда
 
     # Срез комнаты: двадцать секунд без пауз, распознавание точек не
     # расставило, и предложений тут может не быть вовсе. Тогда ищем имя где
@@ -788,6 +795,15 @@ class Meeting:
         if not self.asking:
             return False
         self.asking = False
+        # Команда — это не знакомство. «Кузя, вперёд проедь на метр» ровно
+        # четыре слова, под ограничение длины не попадало, и первое слово
+        # уходило в имя: на живом роботе человек стал зваться «Вперёд», а
+        # поездка не состоялась. Отдаём фразу дальше — пусть едет.
+        правило, цепочка = _разобрать(text)
+        первое = (text.split() or [""])[0]
+        if правило is not None or цепочка or intents.командное_слово(первое):
+            log.info("вместо имени назвали команду (%r) — выполняю её", text)
+            return False
         name = _person_name(text)
         if not name:
             voice.say("Ладно, потом скажешь.")
@@ -923,6 +939,10 @@ def _person_name(text: str) -> str:
     word = m.group(1) if m else bare.split()[0] if bare.split() else ""
     word = word.strip("-").capitalize()
     if len(word) < 2 or word.lower() in _NOT_A_NAME or word.lower() in _NOT_A_WORD:
+        return ""
+    # Командой звать человека нельзя. «Вперёд проедь на метр» — ровно четыре
+    # слова, под ограничение длины не попадало, и робот завёл жильца «Вперёд».
+    if intents.командное_слово(word):
         return ""
     return word
 
