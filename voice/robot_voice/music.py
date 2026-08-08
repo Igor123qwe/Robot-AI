@@ -134,6 +134,9 @@ class Колонка:
     # через управляющий сокет; остальные — нет, им придётся перезапускать.
     ИГРОКИ = ("mpv", "ffplay", "mpg123")
 
+    # Быстрее этого песня кончиться не может — значит это падение.
+    СЛИШКОМ_БЫСТРО = 1.5
+
     @classmethod
     def живой(cls) -> str | None:
         """Первый проигрыватель, который не просто есть, а работает.
@@ -204,23 +207,42 @@ class Колонка:
                 return False
             команда = self._команда(адрес)
             try:
+                # Ругань проигрывателя ловим, а не выбрасываем: без неё «музыка
+                # не играет» не отличить от «нет такой карты» и «формат не
+                # принят». На живом роботе это уже стоило вечера с arecord.
                 self._proc = subprocess.Popen(команда, stdout=subprocess.DEVNULL,
-                                              stderr=subprocess.DEVNULL)
+                                              stderr=subprocess.PIPE)
             except OSError as e:
                 log.warning("не смог запустить %s (%s)", self.игрок, e)
                 return False
-            if следить:
-                # Кто-то должен заметить, что песня кончилась: у пульта об этом
-                # сообщает браузер, а здесь сообщать некому.
-                threading.Thread(target=self._дождаться, args=(self._proc,),
-                                 daemon=True).start()
+            # Следим всегда: за концом песни — чтобы поставить следующую, за
+            # мгновенной смертью — чтобы сказать о ней вслух журналу.
+            threading.Thread(target=self._дождаться,
+                             args=(self._proc, следить, time.monotonic()),
+                             daemon=True).start()
             return True
 
-    def _дождаться(self, proc: subprocess.Popen) -> None:
+    def _дождаться(self, proc: subprocess.Popen, следить: bool,
+                   начали: float) -> None:
         proc.wait()
+        прожил = time.monotonic() - начали
+        if прожил < self.СЛИШКОМ_БЫСТРО:
+            # Песня не может кончиться за секунду. Значит проигрыватель упал —
+            # чаще всего потому, что карты нет, она занята или не принимает
+            # формат. Молча это выглядит как «робот сказал „включаю“ и тишина».
+            беда = ""
+            try:
+                беда = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
+            except Exception:                       # noqa: BLE001
+                pass
+            log.warning("%s умер через %.1f с — музыки не будет%s",
+                        self.игрок, прожил,
+                        f": {беда.splitlines()[-1]}" if беда else
+                        " (устройство %s)" % (self.device or "по умолчанию"))
         with self._lock:
             if proc is self._proc:
-                self._доиграно += 1
+                if следить:
+                    self._доиграно += 1
                 self._proc = None
 
     def поток(self, адрес: str) -> bool:
