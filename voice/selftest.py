@@ -3863,6 +3863,46 @@ def test_chain() -> None:
     check("а цепочкой правил route не собирается", "route" in ЦЕПОЧКОЙ, False)
 
 
+def test_stop_stops_everything() -> None:
+    """«Стоп» и «хватит» — это «прекрати всё», а не только тормоз колёс.
+
+    С живого робота: под играющую песню человек сказал «Кузя, стоп», услышал
+    «Я и так стою» — и музыка продолжила играть. Пришлось отдельной фразой
+    просить выключить её. Слово «стоп» человек говорит, когда хочет тишины
+    целиком, и разбирать его на составляющие должен робот, а не человек.
+    """
+    section("«стоп» прекращает всё")
+    store = Path(tempfile.mkdtemp())
+    timers = Timers(announce=lambda text, **kw: None, store=store / "t.json")
+
+    def собрать(едет: bool, играет: bool):
+        выключено = []
+        ros = types.SimpleNamespace(
+            voltage=12.4, moving=едет, busy=едет, connected=True,
+            drive=lambda *a, **k: None, stop_motion=lambda: None)
+        player = types.SimpleNamespace(
+            играет=играет,
+            выключить=lambda: выключено.append(True) or "Выключил.")
+        tools = {t.name: t for t in build_tools(ros, timers, player=player)}
+        return tools["stop"].run(), выключено
+
+    ответ, выключено = собрать(едет=True, играет=True)
+    check("ехал и играло — встали и замолчали", bool(выключено), True)
+    check("и сказано про оба", ответ, "Остановился, музыку выключил.")
+
+    ответ, выключено = собрать(едет=False, играет=True)
+    check("стоял, но играло — музыку выключили", bool(выключено), True)
+    check("коротко", ответ, "Выключил.")
+
+    ответ, выключено = собрать(едет=True, играет=False)
+    check("ехал без музыки — про музыку молчим", bool(выключено), False)
+    check("обычный ответ", ответ, "Остановился.")
+
+    ответ, выключено = собрать(едет=False, играет=False)
+    check("нечего прекращать", ответ, "Я и так стою.")
+    check("и музыку не трогали", bool(выключено), False)
+
+
 def test_sentence_cap() -> None:
     """Робот не должен говорить дольше, чем нужно.
 
@@ -4044,7 +4084,7 @@ def main() -> int:
                  test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_odometry, test_motion_queue, test_route,
-                 test_no_broken_promise, test_chain, test_sentence_cap, test_no_narration,
+                 test_no_broken_promise, test_chain, test_stop_stops_everything, test_sentence_cap, test_no_narration,
                  test_one_voice,
                  test_slicing, test_stop_while_thinking,
                  test_wake_stream, test_sound_cards, test_speech_streams,
