@@ -3849,6 +3849,55 @@ def test_chain() -> None:
     check("а цепочкой правил route не собирается", "route" in ЦЕПОЧКОЙ, False)
 
 
+def test_sentence_cap() -> None:
+    """Робот не должен говорить дольше, чем нужно.
+
+    Промпт просит одну-две фразы, но четырёхмиллиардная модель запреты держит
+    плохо: на живом роботе «Кузя, ты тут?» получило три реплики подряд, а из
+    тринадцати ответов за вечер девять кончались вопросом «а что дальше?».
+    Цена не только в занудстве — пока робот договаривает, микрофон заглушён, и
+    сказанное человеком в этот момент выбрасывается.
+    """
+    section("робот не заговаривается")
+    import contextlib as _c
+
+    from robot_voice.app import _respond
+
+    contextlib_nullcontext = _c.nullcontext
+
+    сказано: list[str] = []
+
+    class Речь:
+        def feed(self, s): сказано.append(s)
+        def close(self): return 1
+
+    class Голос:
+        speaker = types.SimpleNamespace(stream=lambda **kw: Речь(), last_said="")
+        def say(self, t, **kw): сказано.append(t); return 1
+        def hold(self): return contextlib_nullcontext()
+        def quiet(self): return contextlib_nullcontext()
+        def status(self, t): pass
+
+    class Мозг:
+        позвал: list = []
+        last_talk = 0.0
+
+        def reply(self, команда, on_text, smart=False):
+            for кусок in ("Привет! ", "Готов помочь! ", "Что хочешь сейчас? "):
+                on_text(кусок)
+            return "Привет! Готов помочь! Что хочешь сейчас?"
+
+    _respond("привет", Мозг(), Голос(), предел_фраз=2)
+    check("сказано ровно две фразы", len(сказано), 2)
+    check("и это первые две", сказано[0].strip(), "Привет!")
+    check("третья не прозвучала",
+          any("хочешь сейчас" in ф for ф in сказано), False)
+
+    сказано.clear()
+    _respond("привет", Мозг(), Голос(), предел_фраз=1)
+    check("предел в одну фразу тоже держится", len(сказано), 1)
+
+
 def test_no_narration() -> None:
     """Робот не отчитывается о том, чего не сделал.
 
@@ -3981,7 +4030,7 @@ def main() -> int:
                  test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_odometry, test_motion_queue, test_route,
-                 test_no_broken_promise, test_chain, test_no_narration,
+                 test_no_broken_promise, test_chain, test_sentence_cap, test_no_narration,
                  test_one_voice,
                  test_slicing, test_stop_while_thinking,
                  test_wake_stream, test_sound_cards, test_speech_streams,
