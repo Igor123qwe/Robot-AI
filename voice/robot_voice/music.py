@@ -119,17 +119,48 @@ class Колонка:
     а это слышно.
     """
 
-    def __init__(self, device: str = "", сокет: str = "/tmp/robot-mpv.sock") -> None:
+    def __init__(self, device: str = "", сокет: str = "/tmp/robot-mpv.sock",
+                 игрок: str = "") -> None:
         self.device = device.strip()
         self.сокет = сокет
+        self.игрок = игрок or (self.живой() or "")
         self._proc: subprocess.Popen | None = None
         self._доиграно = 0
         self._громкость = 1.0
+        self._поток = ""          # что играет сейчас, если это радио
         self._lock = threading.Lock()
 
-    @staticmethod
-    def есть() -> bool:
-        return shutil.which("mpv") is not None
+    # Чем играть, по убыванию удобства. mpv умеет менять громкость на лету
+    # через управляющий сокет; остальные — нет, им придётся перезапускать.
+    ИГРОКИ = ("mpv", "ffplay", "mpg123")
+
+    @classmethod
+    def живой(cls) -> str | None:
+        """Первый проигрыватель, который не просто есть, а работает.
+
+        Проверять наличие файла мало. На живом роботе mpv поставился и падал с
+        «undefined symbol: vkCreateWaylandSurfaceKHR» — фирменные драйверы
+        Rockchip против стандартной сборки. По which() он выглядел полностью
+        исправным, и музыка молча уходила в никуда.
+        """
+        for имя in cls.ИГРОКИ:
+            if shutil.which(имя) is None:
+                continue
+            try:
+                готов = subprocess.run(
+                    [имя, "--version"], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=10).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                готов = False
+            if готов:
+                return имя
+            log.warning("%s установлен, но не запускается — пробую следующий",
+                        имя)
+        return None
+
+    @classmethod
+    def есть(cls) -> bool:
+        return cls.живой() is not None
 
     def _стоп(self) -> None:
         proc, self._proc = self._proc, None
@@ -141,22 +172,42 @@ class Колонка:
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    def _играть(self, адрес: str, следить: bool) -> bool:
-        with self._lock:
-            self._стоп()
-            if not адрес:
-                return True
+    def _команда(self, адрес: str) -> list[str]:
+        """Как позвать выбранный проигрыватель. Громкость — в процентах."""
+        громко = int(max(0.0, min(1.0, self._громкость)) * 100)
+        if self.игрок == "mpv":
             команда = ["mpv", "--no-video", "--really-quiet", "--no-terminal",
-                       f"--volume={int(max(0.0, min(1.0, self._громкость)) * 100)}",
+                       f"--volume={громко}",
                        f"--input-ipc-server={self.сокет}"]
             if self.device:
                 команда.append(f"--audio-device=alsa/{self.device}")
-            команда.append(адрес)
+            return команда + [адрес]
+        if self.игрок == "ffplay":
+            команда = ["ffplay", "-nodisp", "-autoexit", "-vn",
+                       "-loglevel", "quiet", "-volume", str(громко)]
+            return команда + [адрес]
+        # mpg123: громкость долей от единицы, устройство — ключом -a.
+        команда = ["mpg123", "-q", "--no-control", "-f",
+                   str(int(32768 * max(0.0, min(1.0, self._громкость))))]
+        if self.device:
+            команда += ["-a", self.device]
+        return команда + [адрес]
+
+    def _играть(self, адрес: str, следить: bool) -> bool:
+        with self._lock:
+            self._стоп()
+            self._поток = "" if следить else адрес
+            if not адрес:
+                return True
+            if not self.игрок:
+                log.warning("играть нечем: ни mpv, ни ffplay, ни mpg123")
+                return False
+            команда = self._команда(адрес)
             try:
                 self._proc = subprocess.Popen(команда, stdout=subprocess.DEVNULL,
                                               stderr=subprocess.DEVNULL)
             except OSError as e:
-                log.warning("не смог запустить mpv (%s)", e)
+                log.warning("не смог запустить %s (%s)", self.игрок, e)
                 return False
             if следить:
                 # Кто-то должен заметить, что песня кончилась: у пульта об этом
@@ -181,19 +232,29 @@ class Колонка:
         return self._играть(адрес, следить=True)
 
     def громкость(self, доля: float) -> bool:
+        """Сделать тише или громче то, что играет прямо сейчас.
+
+        У mpv для этого есть управляющий сокет, и это лучший случай: песня не
+        прерывается. У остальных живой громкости нет вовсе, и остаётся выбор
+        между «перезапустить» и «применить к следующему». Радио перезапускаем —
+        у потока нет места, которое можно потерять. Песню не трогаем: начать её
+        заново в ответ на «сделай тише» хуже, чем подождать до следующей.
+        """
         self._громкость = max(0.0, min(1.0, доля))
-        # Живому mpv громкость меняем по сокету: перезапуск песни с начала
-        # слышен, а «сделай тише» не должно начинать её заново.
-        приказ = json.dumps({"command": ["set_property", "volume",
-                                         int(self._громкость * 100)]}) + "\n"
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(2)
-                s.connect(self.сокет)
-                s.sendall(приказ.encode())
+        if self.игрок == "mpv":
+            приказ = json.dumps({"command": ["set_property", "volume",
+                                             int(self._громкость * 100)]}) + "\n"
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(2)
+                    s.connect(self.сокет)
+                    s.sendall(приказ.encode())
+            except OSError:
+                pass            # никто не играет — громкость запомнена на потом
             return True
-        except OSError:
-            return True         # никто не играет — громкость запомнена на потом
+        if self._поток:
+            self._играть(self._поток, следить=False)
+        return True
 
     def сыграно(self) -> int | None:
         return self._доиграно
