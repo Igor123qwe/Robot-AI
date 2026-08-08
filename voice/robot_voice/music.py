@@ -1,9 +1,14 @@
 """Проигрыватель: очередь треков и поток радио — в одних руках.
 
-Играет по-прежнему пульт: своего динамика у робота нет, а вкладка умеет
-тянуть звук сама. Разница между радио и Яндексом только в том, кончается ли
-то, что играет. Радио — бесконечный поток: отдал адрес и забыл. Яндекс —
-трек за треком, и после каждого кто-то должен включить следующий.
+Играть есть куда двумя способами, и оба выглядят для очереди одинаково.
+Пульт — вкладка браузера, она тянет звук сама; так было, пока своего динамика
+у робота не было. Колонка — mpv на самом роботе; нужна с тех пор, как голос
+переехал на свой динамик, иначе робот честно ставит песню и рапортует
+«включаю», а человек не слышит ничего, потому что вкладка закрыта.
+
+Разница между радио и Яндексом только в том, кончается ли то, что играет.
+Радио — бесконечный поток: отдал адрес и забыл. Яндекс — трек за треком, и
+после каждого кто-то должен включить следующий.
 
 Очередь поэтому живёт здесь, а не в пульте: ссылки Яндекса подписанные и
 живут минуты, так что нарезать плейлист вперёд нельзя — адрес надо добывать
@@ -20,6 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -94,6 +102,101 @@ class Pult:
                 return int(json.loads(ответ.read()).get("кончилось") or 0)
         except Exception:                           # noqa: BLE001
             return None
+
+
+class Колонка:
+    """Музыка в динамик самого робота — тот же интерфейс, что у пульта.
+
+    Пульт играет музыку во вкладке браузера, и пока голос робота шёл туда же,
+    это было естественно. С отдельной колонкой на роботе вкладка становится
+    лишним звеном: робот честно ставит песню, рапортует «включаю» — и человек
+    не слышит ничего, потому что вкладка закрыта. Ровно так и вышло на живом
+    роботе.
+
+    Играет mpv: он умеет и бесконечный поток радио, и одиночный файл по
+    ссылке, и не разваливается, когда поток моргнул. Громкость меняем через
+    его же управляющий сокет — иначе пришлось бы перезапускать песню с начала,
+    а это слышно.
+    """
+
+    def __init__(self, device: str = "", сокет: str = "/tmp/robot-mpv.sock") -> None:
+        self.device = device.strip()
+        self.сокет = сокет
+        self._proc: subprocess.Popen | None = None
+        self._доиграно = 0
+        self._громкость = 1.0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def есть() -> bool:
+        return shutil.which("mpv") is not None
+
+    def _стоп(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    def _играть(self, адрес: str, следить: bool) -> bool:
+        with self._lock:
+            self._стоп()
+            if not адрес:
+                return True
+            команда = ["mpv", "--no-video", "--really-quiet", "--no-terminal",
+                       f"--volume={int(max(0.0, min(1.0, self._громкость)) * 100)}",
+                       f"--input-ipc-server={self.сокет}"]
+            if self.device:
+                команда.append(f"--audio-device=alsa/{self.device}")
+            команда.append(адрес)
+            try:
+                self._proc = subprocess.Popen(команда, stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL)
+            except OSError as e:
+                log.warning("не смог запустить mpv (%s)", e)
+                return False
+            if следить:
+                # Кто-то должен заметить, что песня кончилась: у пульта об этом
+                # сообщает браузер, а здесь сообщать некому.
+                threading.Thread(target=self._дождаться, args=(self._proc,),
+                                 daemon=True).start()
+            return True
+
+    def _дождаться(self, proc: subprocess.Popen) -> None:
+        proc.wait()
+        with self._lock:
+            if proc is self._proc:
+                self._доиграно += 1
+                self._proc = None
+
+    def поток(self, адрес: str) -> bool:
+        """Радио: бесконечный поток. Пустой адрес — выключить всё."""
+        return self._играть(адрес, следить=False)
+
+    def трек(self, адрес: str, название: str = "") -> bool:
+        """Одна песня. Когда доиграет, счётчик сдвинется сам."""
+        return self._играть(адрес, следить=True)
+
+    def громкость(self, доля: float) -> bool:
+        self._громкость = max(0.0, min(1.0, доля))
+        # Живому mpv громкость меняем по сокету: перезапуск песни с начала
+        # слышен, а «сделай тише» не должно начинать её заново.
+        приказ = json.dumps({"command": ["set_property", "volume",
+                                         int(self._громкость * 100)]}) + "\n"
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                s.connect(self.сокет)
+                s.sendall(приказ.encode())
+            return True
+        except OSError:
+            return True         # никто не играет — громкость запомнена на потом
+
+    def сыграно(self) -> int | None:
+        return self._доиграно
 
 
 class Player:

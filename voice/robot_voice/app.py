@@ -24,7 +24,7 @@ from .brain import Brain
 from .busyflag import BusyFlag
 from .config import Config
 from .music import LOUD as MUSIC_LOUD
-from .music import Player, Pult
+from .music import Колонка, Player, Pult
 from .notes import Notes
 from .people import People
 from .ros import Ros
@@ -440,13 +440,24 @@ def _собрать_проигрыватель(cfg, state, listener) -> Player:
                     "радио. Поставь: pip3 install --user yandex-music")
     elif cfg.yandex_token:
         музыка = Music(cfg.yandex_token)
-    log.info("музыка: %s%s",
+    # Куда играть. Пока голос шёл во вкладку, музыка там же и играла — это
+    # было естественно. С колонкой на роботе вкладка становится лишним звеном:
+    # робот честно ставит песню, рапортует «включаю» — и человек не слышит
+    # ничего, потому что вкладка закрыта. Ровно так и вышло на живом роботе.
+    куда = Pult(cfg.web_endpoint.rsplit("/", 1)[0])
+    где = "в пульте"
+    if cfg.audio_out == "local":
+        if Колонка.есть():
+            куда = Колонка(cfg.spk_device)
+            где = "в колонку робота"
+        else:
+            где = ("в пульте — mpv не установлен, в колонку играть нечем. "
+                   "Поставить: sudo apt install mpv")
+    log.info("музыка: %s, %s",
              "Яндекс и радио" if музыка is not None
-             else "интернет-радио (Яндекс не подключён)",
-             "" if cfg.audio_out == "browser"
-             else " — играет в пульте, нужна открытая вкладка со звуком")
+             else "интернет-радио (Яндекс не подключён)", где)
     return Player(
-        Pult(cfg.web_endpoint.rsplit("/", 1)[0]), музыка,
+        куда, музыка,
         громкость=float(state.get("громкость музыки", MUSIC_LOUD)),
         on_volume=lambda доля: state.set("громкость музыки", доля),
         # Под музыку детектор речи глохнет: ровный фон он принимает за речь и
