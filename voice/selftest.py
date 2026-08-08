@@ -1448,6 +1448,7 @@ def прогон_фраз(схема, шумно: bool = False, с_флагам�
     l._muted = th.Event()
     l.long_chunk = False
     l.wake_heard = False
+    l.on_wake = None
     l.spotter = None            # запасной режим: режем по паузам
     l.command_frames = 1000
     куски = []
@@ -1744,6 +1745,7 @@ def test_wake_stream() -> None:
         l._muted = th.Event()
         l.long_chunk = False
         l.wake_heard = False
+        l.on_wake = None
         l.spotter = Ухо()
         l.command_frames = command_frames
         куски = [round((len(w) - 44) / 2 / 16000, 1) for w in l.utterances()]
@@ -1755,6 +1757,28 @@ def test_wake_stream() -> None:
     куски, услышано, _ = прогон(200, [(True, 50), (False, 40)])
     check("команда после имени приехала", len(куски), 1)
     check("и помечена как названная по имени", услышано, True)
+
+    # Услышали имя — музыку надо приглушить НЕМЕДЛЕННО, ещё до распознавания:
+    # человек уже говорит, и перекрикивать песню он не должен.
+    from robot_voice.music import Player
+
+    class ТихийПульт:
+        def __init__(self): self.громкости = []
+        def громкость(self, доля): self.громкости.append(доля); return True
+        def поток(self, адрес): return True
+        def трек(self, адрес, название=""): return True
+        def сыграно(self): return 0
+
+    пульт = ТихийПульт()
+    плеер = Player(пульт, громкость=0.8)
+    плеер.приглушить(True)
+    check("позвали — музыка убавилась", пульт.громкости[-1] < 0.8, True)
+    сколько = len(пульт.громкости)
+    плеер.приглушить(True)
+    check("повторный зов не дёргает громкость заново",
+          len(пульт.громкости), сколько)
+    плеер.приглушить(False)
+    check("ход кончился — вернулась ровно та же", пульт.громкости[-1], 0.8)
 
     # Не позвали — не слушаем, сколько бы в комнате ни говорили.
     куски, услышано, _ = прогон(500, [(True, 50), (False, 40)],

@@ -586,6 +586,11 @@ def main() -> None:
 
     player = _собрать_проигрыватель(cfg, state, listener)
     player.start()
+    # Позвали робота — музыка приглушается в тот же миг, ещё до распознавания.
+    # Человек уже начал говорить, и перекрикивать песню он не должен; заодно и
+    # ответ робота будет слышно. Возвращается громкость в конце хода, см.
+    # _listen_loop.
+    listener.on_wake = lambda: player.приглушить(True)
 
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
@@ -635,7 +640,7 @@ def main() -> None:
     while True:
         try:
             _listen_loop(cfg, listener, recognizer, brain, voice, tools,
-                         addressed, ros, people)
+                         addressed, ros, people, player)
         except KeyboardInterrupt:
             shutdown(None, None)
         except Exception:
@@ -995,7 +1000,8 @@ class Turn:
 
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                  brain: Brain, voice: Voice, tools: list,
-                 addressed: Addressed, ros=None, people: People | None = None) -> None:
+                 addressed: Addressed, ros=None, people: People | None = None,
+                 player=None) -> None:
     by_name = {t.name: t for t in tools}
     if people is None:
         people = People(cfg.data_dir / "люди.json")
@@ -1232,6 +1238,11 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # выборка под конкретного человека, а не общий корпус.
             log.info("правилами не разобрал, спрашиваю модель")
             _respond(command, brain, voice, recognizer, ros, turn, addressed)
+
+        # Ход кончился — музыке пора обратно. Приглушили её, как только
+        # услышали имя; держать тихой дольше незачем, робот уже ответил.
+        if player is not None:
+            player.приглушить(False)
 
         # Поговорили несколько раз, а как зовут — так и не знаем. Спросим
         # один раз: раньше навязчиво, позже глупо — человек уже всё рассказал.

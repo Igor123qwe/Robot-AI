@@ -22,7 +22,7 @@ import threading
 import time
 import wave
 from collections import deque
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 import webrtcvad
@@ -379,6 +379,10 @@ class Listener:
         # как confidence у распознавания. Верх по этому признаку понимает, что
         # искать имя в расшифровке уже не надо: оно точно было.
         self.wake_heard = False
+        # Кого дёрнуть, как только имя услышано. Нужно, чтобы приглушить
+        # музыку ПРЯМО СЕЙЧАС, а не после распознавания: человек уже начал
+        # говорить, и перекрикивать песню он не должен.
+        self.on_wake: Callable[[], None] | None = None
         self.sample_rate = sample_rate
         self.vad = webrtcvad.Vad(vad_level)
         self.silence_frames = max(1, silence_ms // FRAME_MS)
@@ -486,6 +490,11 @@ class Listener:
                 self.preroll.append(frame)
                 if self.spotter.услышал(frame.tobytes()):
                     log.info("аудио: имя услышано — слушаю команду")
+                    if self.on_wake is not None:
+                        try:
+                            self.on_wake()
+                        except Exception:       # noqa: BLE001 — музыка не повод глохнуть
+                            log.exception("не смог приглушить музыку")
                     speech = list(self.preroll)
                     silence, пишем = 0, True
                 continue
