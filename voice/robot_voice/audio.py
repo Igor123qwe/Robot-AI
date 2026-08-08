@@ -383,6 +383,10 @@ class Listener:
         # музыку ПРЯМО СЕЙЧАС, а не после распознавания: человек уже начал
         # говорить, и перекрикивать песню он не должен.
         self.on_wake: Callable[[], None] | None = None
+        # Короткая команда, услышанная прямо здесь: «стоп», «дальше», «тише».
+        # Пусто — обычная фраза, её надо распознавать. Не пусто — распознавать
+        # нечего, слово уже известно, и это экономит две секунды на «стоп».
+        self.instant = ""
         self.sample_rate = sample_rate
         self.vad = webrtcvad.Vad(vad_level)
         self.silence_frames = max(1, silence_ms // FRAME_MS)
@@ -404,6 +408,11 @@ class Listener:
         # Такой кусок — это срез комнаты, а не реплика: имя в нём может стоять
         # где угодно, и разбирать его надо иначе.
         self.long_chunk = False
+
+    # Сколько кадров после имени слушаем короткий приказ. Полторы секунды:
+    # «стоп» и «дальше» звучат меньше секунды, а дальше начинается обычная
+    # фраза, и ловить в ней отдельные слова опасно.
+    МГНОВЕННЫХ_КАДРОВ = 1500 // FRAME_MS
 
     # Во сколько раз дольше должен звучать звук, чтобы под музыку считаться
     # началом фразы. Двух хватает: 40 мс подряд речевых кадров превращаются в
@@ -476,6 +485,7 @@ class Listener:
         speech: list[np.ndarray] = []
         silence = 0
         пишем = False
+        слушаем_приказ = 0
 
         for frame in self.pump.frames():
             if self._muted.is_set():
@@ -497,9 +507,25 @@ class Listener:
                             log.exception("не смог приглушить музыку")
                     speech = list(self.preroll)
                     silence, пишем = 0, True
+                    слушаем_приказ = self.МГНОВЕННЫХ_КАДРОВ
                 continue
 
             speech.append(frame)
+            if слушаем_приказ:
+                # Первые полторы секунды после имени слушаем короткий приказ.
+                # Дальше не слушаем намеренно: «стоп» в середине длинной фразы
+                # («да не надо, стоп-кран это не про нас») сработать не должен.
+                слушаем_приказ -= 1
+                приказ = self.spotter.команда(frame.tobytes())
+                if приказ:
+                    log.info("аудио: сразу услышал «%s» — не распознаю", приказ)
+                    payload, speech = speech, []
+                    silence, пишем, слушаем_приказ = 0, False, 0
+                    self.preroll.clear()
+                    self.wake_heard = True
+                    self.instant = приказ
+                    yield to_wav(np.concatenate(payload), self.sample_rate)
+                    continue
             if self.vad.is_speech(frame.tobytes(), self.sample_rate):
                 silence = 0
             else:
@@ -510,9 +536,10 @@ class Listener:
             # как было у нарезки по паузам.
             if silence >= self.silence_frames or len(speech) >= self.command_frames:
                 payload, speech = speech, []
-                silence, пишем = 0, False
+                silence, пишем, слушаем_приказ = 0, False, 0
                 self.preroll.clear()
                 self.wake_heard = True
+                self.instant = ""
                 yield to_wav(np.concatenate(payload), self.sample_rate)
 
     def _по_паузам(self) -> Iterator[bytes]:

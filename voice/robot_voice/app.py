@@ -1037,7 +1037,10 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             log.info("длинный кусок, а разбираю сам — пропускаю, чтобы не онеметь")
             continue
         turn = Turn(cfg.silence_ms / 1000.0)
-        text = recognizer.transcribe(wav)
+        # Короткий приказ услышан прямо на роботе — распознавать нечего. Это и
+        # есть весь выигрыш: «стоп» срабатывает за доли секунды вместо двух с
+        # лишним, а для едущего робота эта разница — лишний метр.
+        text = getattr(listener, "instant", "") or recognizer.transcribe(wav)
         turn.recognized()
         # Кто это сказал. Пусто — ПК не узнал голос, выключен или узнавание
         # не поднято; тогда робот разговаривает, никого не различая.
