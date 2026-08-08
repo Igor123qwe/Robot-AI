@@ -3355,7 +3355,7 @@ def test_rules_reach_tools() -> None:
     for куда, ожидаем in (("browser", Pult), ("local", Колонка)):
         cfg = types.SimpleNamespace(
             yandex_token="", audio_out=куда, spk_device="plughw:0,0",
-            web_endpoint="http://127.0.0.1:8000/speak")
+            music_device="", web_endpoint="http://127.0.0.1:8000/speak")
         плеер = _собрать_проигрыватель(
             cfg, types.SimpleNamespace(get=lambda k, d=None: d, set=lambda *a: None),
             types.SimpleNamespace(background=lambda шумно: None))
@@ -3363,6 +3363,18 @@ def test_rules_reach_tools() -> None:
         ждём = ожидаем if (куда == "browser" or Колонка.есть()) else Pult
         check(f"audio_out={куда} — играем через {ждём.__name__}",
               isinstance(плеер.пульт, ждём), True)
+
+    # Музыке можно свою карту: голосовая может не тянуть её физически.
+    # ReSpeaker Lite умеет ровно 16 кГц — речи хватает, музыке это потолок в
+    # восемь килогерц по полосе, и лечится он только другой картой.
+    if Колонка.есть():
+        cfg = types.SimpleNamespace(
+            yandex_token="", audio_out="local", spk_device="plughw:0,0",
+            music_device="plughw:1,0", web_endpoint="http://127.0.0.1:8000/speak")
+        плеер = _собрать_проигрыватель(
+            cfg, types.SimpleNamespace(get=lambda k, d=None: d, set=lambda *a: None),
+            types.SimpleNamespace(background=lambda шумно: None))
+        check("музыка идёт на свою карту", плеер.пульт.device, "plughw:1,0")
 
     # Обе стороны обязаны отвечать на одни и те же вызовы: Player не должен
     # знать, во вкладку он играет или в колонку.
