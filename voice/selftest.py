@@ -28,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _STUBS = {
     "webrtcvad": lambda: types.SimpleNamespace(
         Vad=lambda level: types.SimpleNamespace(is_speech=lambda *a: False)),
-    "sounddevice": lambda: types.SimpleNamespace(),
     "anthropic": lambda: types.SimpleNamespace(
         Anthropic=lambda **kw: types.SimpleNamespace(**kw),
         BadRequestError=type("BadRequestError", (Exception,), {}),
@@ -1607,19 +1606,12 @@ def test_sound_cards() -> None:
 
     Пока карта была одна, «по умолчанию» работало само. С USB-микрофоном их
     две, и умолчание превращается в лотерею: ALSA отдаёт ту, что первой
-    попалась. Проверяется, что заданное устройство доезжает до sounddevice и
-    до aplay, а не теряется по дороге.
+    попалась. Проверяется, что заданное устройство доезжает до arecord и до
+    aplay, а не теряется по дороге.
     """
     section("выбор звуковой карты")
-    from robot_voice.audio import LocalSource, device_id, make_source
+    from robot_voice.audio import LocalSource, make_source
     from robot_voice.tts import Speaker, aplay_cmd
-
-    # Номер должен приехать числом: строка «2» для sounddevice — это имя,
-    # которого нет ни у одной карты.
-    check("пусто — умолчание системы", device_id(""), None)
-    check("пробелы — тоже умолчание", device_id("   "), None)
-    check("номер стал числом", device_id("2"), 2)
-    check("имя осталось строкой", device_id("ReSpeaker"), "ReSpeaker")
 
     check("без устройства -D нет", "-D" in aplay_cmd(16000), False)
     check("с устройством -D есть",
@@ -1628,12 +1620,19 @@ def test_sound_cards() -> None:
           "-D" in aplay_cmd(16000, "  "), False)
     check("частота на месте", "16000" in aplay_cmd(16000, "plughw:1,0"), True)
 
-    источник = make_source("local", "", 16000, mic_device="ReSpeaker")
+    источник = make_source("local", "", 16000, mic_device="plughw:0,0")
     check("микрофон дошёл до источника",
           (isinstance(источник, LocalSource), источник.device),
-          (True, "ReSpeaker"))
+          (True, "plughw:0,0"))
+    # Пусто — не «никакая карта», а системная: иначе arecord получил бы -D ""
+    # и не запустился вовсе.
+    check("без имени слушаем умолчание",
+          make_source("local", "", 16000).device, "default")
+    check("пробелы — тоже умолчание",
+          make_source("local", "", 16000, mic_device="  ").device, "default")
     check("браузеру устройство ни к чему",
-          hasattr(make_source("browser", "", 16000, mic_device="2"), "device"),
+          hasattr(make_source("browser", "", 16000, mic_device="plughw:0,0"),
+                  "device"),
           False)
 
     # Speaker без piper выключается, но устройство запомнить обязан: иначе

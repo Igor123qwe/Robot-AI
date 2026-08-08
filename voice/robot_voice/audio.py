@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import logging
 import struct
+import subprocess
 import threading
 import time
 import wave
@@ -39,40 +40,52 @@ REAL_AUDIO_TTL = 5.0
 # --------------------------------------------------------------------------
 # Источники
 # --------------------------------------------------------------------------
-def device_id(spec: str):
-    """Как назвали устройство в настройках — номером или куском имени.
-
-    sounddevice принимает и то, и другое, но номер должен приехать числом:
-    строка «2» для него — это имя, которого нет ни у одной карты, и он падает
-    с «ValueError: no input device matching '2'». Пусто — системное умолчание.
-    """
-    spec = spec.strip()
-    if not spec:
-        return None
-    return int(spec) if spec.isdigit() else spec
-
-
 class LocalSource:
-    """Микрофон через sounddevice."""
+    """Микрофон, воткнутый в самого робота, — через arecord.
+
+    Сначала здесь был sounddevice, и на ReSpeaker Lite он оказался бесполезен:
+    PortAudio показывает эту карту как «0 in, 2 out», то есть микрофона на ней
+    как будто нет вовсе. Он опрашивает устройство на своей частоте, карта
+    отказывает — и вход просто исчезает из списка. При этом
+    `arecord -D plughw:0,0` с той же картой пишет прекрасно.
+
+    Поэтому запись идёт тем же способом, что и воспроизведение: отдельным
+    процессом ALSA. Заодно это снимает вопрос частоты и формата — они заданы
+    явно, а `plughw` приведёт их сам, если карта хочет иначе. И симметрия:
+    микрофон и динамик настраиваются одинаковыми именами, обе стороны можно
+    проверить руками через arecord/aplay, не поднимая робота.
+    """
 
     def __init__(self, sample_rate: int, device: str = "") -> None:
         self.sample_rate = sample_rate
         self.frame_len = sample_rate * FRAME_MS // 1000
-        self.device = device
+        self.device = device.strip() or "default"
 
     def frames(self) -> Iterator[np.ndarray]:
-        import sounddevice as sd
-
-        log.info("аудио: слушаю %s",
-                 self.device or "звуковую карту по умолчанию")
-        with sd.InputStream(samplerate=self.sample_rate, channels=1,
-                            dtype="int16", blocksize=self.frame_len,
-                            device=device_id(self.device)) as stream:
+        cmd = ["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1",
+               "-r", str(self.sample_rate), "-D", self.device]
+        log.info("аудио: слушаю %s", self.device)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        try:
             while True:
-                data, overflowed = stream.read(self.frame_len)
-                if overflowed:
-                    log.debug("аудио: переполнение буфера")
-                yield data.reshape(-1).copy()
+                buf = proc.stdout.read(self.frame_len * 2)
+                if len(buf) < self.frame_len * 2:
+                    # Ругань arecord тащим в текст ошибки: без неё «источник
+                    # пропал» не отличить от «нет такой карты», и человек
+                    # ищет обрыв связи там, где опечатка в имени устройства.
+                    беда = (proc.stderr.read() or b"").decode(
+                        "utf-8", "replace").strip()
+                    raise ConnectionError(
+                        f"arecord замолчал ({self.device})"
+                        + (f": {беда.splitlines()[-1]}" if беда else ""))
+                yield np.frombuffer(buf, dtype="<i2")
+        finally:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning("arecord не закрылся")
 
 
 class PhoneSource:
