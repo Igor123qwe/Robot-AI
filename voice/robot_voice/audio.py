@@ -39,18 +39,35 @@ REAL_AUDIO_TTL = 5.0
 # --------------------------------------------------------------------------
 # Источники
 # --------------------------------------------------------------------------
+def device_id(spec: str):
+    """Как назвали устройство в настройках — номером или куском имени.
+
+    sounddevice принимает и то, и другое, но номер должен приехать числом:
+    строка «2» для него — это имя, которого нет ни у одной карты, и он падает
+    с «ValueError: no input device matching '2'». Пусто — системное умолчание.
+    """
+    spec = spec.strip()
+    if not spec:
+        return None
+    return int(spec) if spec.isdigit() else spec
+
+
 class LocalSource:
     """Микрофон через sounddevice."""
 
-    def __init__(self, sample_rate: int) -> None:
+    def __init__(self, sample_rate: int, device: str = "") -> None:
         self.sample_rate = sample_rate
         self.frame_len = sample_rate * FRAME_MS // 1000
+        self.device = device
 
     def frames(self) -> Iterator[np.ndarray]:
         import sounddevice as sd
 
+        log.info("аудио: слушаю %s",
+                 self.device or "звуковую карту по умолчанию")
         with sd.InputStream(samplerate=self.sample_rate, channels=1,
-                            dtype="int16", blocksize=self.frame_len) as stream:
+                            dtype="int16", blocksize=self.frame_len,
+                            device=device_id(self.device)) as stream:
             while True:
                 data, overflowed = stream.read(self.frame_len)
                 if overflowed:
@@ -196,9 +213,9 @@ class BrowserSource:
 
 
 def make_source(audio_source: str, phone_url: str, sample_rate: int,
-                web_url: str = "http://127.0.0.1:8000"):
+                web_url: str = "http://127.0.0.1:8000", mic_device: str = ""):
     if audio_source == "local":
-        return LocalSource(sample_rate)
+        return LocalSource(sample_rate, mic_device)
     if audio_source == "browser":
         return BrowserSource(web_url, sample_rate)
     return PhoneSource(phone_url, sample_rate)

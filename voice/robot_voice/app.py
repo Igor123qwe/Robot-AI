@@ -388,6 +388,28 @@ def _post_heard(speak_endpoint: str, kind: str, text: str) -> None:
         pass
 
 
+def _звуковые_карты(cfg) -> None:
+    """Показать выбранные карты и обругать настройку, которая ни к чему.
+
+    ROBOT_MIC_DEVICE при audio_source=browser не делает ровно ничего. Молчать
+    об этом нельзя: человек уверен, что перевёл робота на USB-микрофон, а тот
+    по-прежнему слушает вкладку пульта — и ищет поломку где угодно, кроме
+    строчки, которую сам же и написал.
+    """
+    if cfg.mic_device and cfg.audio_source != "local":
+        log.warning("ROBOT_MIC_DEVICE=%s ни на что не влияет: микрофон взят "
+                    "из %s. Нужен ROBOT_AUDIO_SOURCE=local",
+                    cfg.mic_device, cfg.audio_source)
+    if cfg.spk_device and cfg.audio_out != "local":
+        log.warning("ROBOT_SPK_DEVICE=%s ни на что не влияет: звук уходит "
+                    "в %s. Нужен ROBOT_AUDIO_OUT=local",
+                    cfg.spk_device, cfg.audio_out)
+    if cfg.audio_source == "local" or cfg.audio_out == "local":
+        log.info("звуковые карты: слушаю %s, говорю в %s",
+                 cfg.mic_device or "ту, что по умолчанию",
+                 cfg.spk_device or "ту, что по умолчанию")
+
+
 def main() -> None:
     _setup_logging()
 
@@ -396,6 +418,7 @@ def main() -> None:
     log.info("модель %s через %s, effort %s, микрофон %s, динамик %s",
              cfg.model, cfg.api_base or "api.anthropic.com",
              cfg.effort or "не задан", cfg.audio_source, cfg.audio_out)
+    _звуковые_карты(cfg)
     if cfg.local_api_base:
         log.info("основной собеседник — ПК: %s через %s, %s",
                  cfg.local_model, cfg.local_api_base,
@@ -415,7 +438,8 @@ def main() -> None:
                       audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint,
                       volume=float(state.get("volume", cfg.volume)),
                       cache_dir=cfg.data_dir / "фразы",
-                      pc_url=cfg.tts_url, pc_voice=cfg.pc_voice)
+                      pc_url=cfg.tts_url, pc_voice=cfg.pc_voice,
+                      spk_device=cfg.spk_device)
     speaker.on_volume = lambda level: state.set("volume", level)
     speaker.quiet_now = cfg.is_quiet_now
     speaker.quiet_volume = cfg.quiet_volume
@@ -449,7 +473,8 @@ def main() -> None:
 
     listener = Listener(
         make_source(cfg.audio_source, cfg.phone_url, cfg.sample_rate,
-                    web_url=cfg.web_endpoint.rsplit("/speak", 1)[0]),
+                    web_url=cfg.web_endpoint.rsplit("/speak", 1)[0],
+                    mic_device=cfg.mic_device),
         sample_rate=cfg.sample_rate,
         vad_level=cfg.vad_level,
         silence_ms=cfg.silence_ms,

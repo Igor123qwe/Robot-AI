@@ -1602,6 +1602,47 @@ def test_stop_while_thinking() -> None:
     check("сбой распознавания не роняет", _caught_stop("звук".encode(), падучий, ros), False)
 
 
+def test_sound_cards() -> None:
+    """Робот должен слушать и говорить именно в ту карту, которую назвали.
+
+    Пока карта была одна, «по умолчанию» работало само. С USB-микрофоном их
+    две, и умолчание превращается в лотерею: ALSA отдаёт ту, что первой
+    попалась. Проверяется, что заданное устройство доезжает до sounddevice и
+    до aplay, а не теряется по дороге.
+    """
+    section("выбор звуковой карты")
+    from robot_voice.audio import LocalSource, device_id, make_source
+    from robot_voice.tts import Speaker, aplay_cmd
+
+    # Номер должен приехать числом: строка «2» для sounddevice — это имя,
+    # которого нет ни у одной карты.
+    check("пусто — умолчание системы", device_id(""), None)
+    check("пробелы — тоже умолчание", device_id("   "), None)
+    check("номер стал числом", device_id("2"), 2)
+    check("имя осталось строкой", device_id("ReSpeaker"), "ReSpeaker")
+
+    check("без устройства -D нет", "-D" in aplay_cmd(16000), False)
+    check("с устройством -D есть",
+          aplay_cmd(16000, "plughw:1,0")[-3:], ["-D", "plughw:1,0", "-"])
+    check("пробелы вокруг имени не ломают команду",
+          "-D" in aplay_cmd(16000, "  "), False)
+    check("частота на месте", "16000" in aplay_cmd(16000, "plughw:1,0"), True)
+
+    источник = make_source("local", "", 16000, mic_device="ReSpeaker")
+    check("микрофон дошёл до источника",
+          (isinstance(источник, LocalSource), источник.device),
+          (True, "ReSpeaker"))
+    check("браузеру устройство ни к чему",
+          hasattr(make_source("browser", "", 16000, mic_device="2"), "device"),
+          False)
+
+    # Speaker без piper выключается, но устройство запомнить обязан: иначе
+    # правка «поставил ReSpeaker» тихо не доедет до aplay.
+    динамик = Speaker(Path("нет-такого-голоса.onnx"), audio_out="local",
+                      spk_device="plughw:1,0")
+    check("динамик запомнил карту", динамик.spk_device, "plughw:1,0")
+
+
 def test_speech_streams() -> None:
     """Первое предложение уходит в пульт, пока модель ещё договаривает.
 
@@ -3638,7 +3679,7 @@ def main() -> int:
                  test_no_broken_promise, test_chain, test_no_narration,
                  test_one_voice,
                  test_slicing, test_stop_while_thinking,
-                 test_speech_streams,
+                 test_sound_cards, test_speech_streams,
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,
                  test_counting, test_rules_reach_tools, test_ws_proxy,

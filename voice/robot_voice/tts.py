@@ -274,17 +274,30 @@ class RemoteVoice:
         return pcm
 
 
+def aplay_cmd(sample_rate: int, device: str = "") -> list[str]:
+    """Команда проигрывания сырого моно-PCM.
+
+    Устройство собирается здесь, а не в двух местах по отдельности: свой синтез
+    и синтез с ПК играют через один и тот же динамик, и разъехаться они не
+    должны. Пусто — карта по умолчанию, как было до появления USB-звука.
+    """
+    cmd = ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1",
+           "-r", str(sample_rate)]
+    if device.strip():
+        cmd += ["-D", device.strip()]
+    return cmd + ["-"]
+
+
 class Speech:
     """Одна реплика робота в динамик. Предложения докидываются по мере генерации."""
 
     def __init__(self, piper_cmd: list[str], sample_rate: int,
-                 volume: float = 1.0) -> None:
+                 volume: float = 1.0, device: str = "") -> None:
         self._piper = subprocess.Popen(
             piper_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        aplay = ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1",
-                 "-r", str(sample_rate), "-"]
+        aplay = aplay_cmd(sample_rate, device)
         self._pump: threading.Thread | None = None
         if volume >= 0.999:
             # Обычный случай: piper пишет прямо в aplay, Python не при делах.
@@ -369,13 +382,12 @@ class RemoteSpeech:
     """
 
     def __init__(self, remote: RemoteVoice, fallback_cmd: list[str],
-                 volume: float = 1.0) -> None:
+                 volume: float = 1.0, device: str = "") -> None:
         self.remote = remote
         self.fallback_cmd = fallback_cmd
         self.volume = volume
         self._aplay = subprocess.Popen(
-            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1",
-             "-r", str(remote.rate), "-"],
+            aplay_cmd(remote.rate, device),
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self._queue: queue.Queue = queue.Queue()
         self._cancelled = False
@@ -574,10 +586,12 @@ class Speaker:
     def __init__(self, model_path: Path, *, audio_out: str = "local",
                  web_endpoint: str = "http://127.0.0.1:8000/speak",
                  volume: float = 1.0, cache_dir: Path | None = None,
-                 pc_url: str = "", pc_voice: str = "") -> None:
+                 pc_url: str = "", pc_voice: str = "",
+                 spk_device: str = "") -> None:
         self.model_path = model_path
         self.audio_out = audio_out
         self.web_endpoint = web_endpoint
+        self.spk_device = spk_device
         self.cache = (PhraseCache(cache_dir, model_path.name)
                       if cache_dir is not None else None)
         # Голос с ПК. Кэш у него свой: частота и тембр другие, и путать их
@@ -675,8 +689,10 @@ class Speaker:
             return speech
         try:
             if self.remote is not None and self.remote.alive():
-                return RemoteSpeech(self.remote, self._cmd(), volume)
-            return Speech(self._cmd(), self.sample_rate, volume)
+                return RemoteSpeech(self.remote, self._cmd(), volume,
+                                    self.spk_device)
+            return Speech(self._cmd(), self.sample_rate, volume,
+                          self.spk_device)
         except OSError:
             log.exception("не смог запустить piper/aplay")
             return None
