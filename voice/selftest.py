@@ -3928,6 +3928,38 @@ def test_stop_stops_everything() -> None:
     check("и музыку не трогали", bool(выключено), False)
 
 
+def test_instant_ignores_stale() -> None:
+    """Мгновенный приказ не должен зависеть от прошлой фразы.
+
+    Уверенность, говорящий и метка слепка пишутся только внутри transcribe, а
+    мгновенный приказ его не зовёт. Без явного обнуления там оставалась
+    предыдущая фраза: шум с уверенностью −1.4 отбрасывался, поле оставалось
+    −1.4, и следующий за ним «Кузя, стоп» выбрасывался как мусор — при едущем
+    роботе. Проверяем по исходнику: сценарий целиком не воспроизвести, а
+    молчаливый откат этой правки стоит слишком дорого.
+    """
+    section("мгновенный приказ не берёт чужое")
+    исходник = (Path(__file__).resolve().parent
+                / "robot_voice" / "app.py").read_text(encoding="utf-8")
+
+    check("мгновенный путь помечен отдельно",
+          "мгновенный = bool(getattr(listener" in исходник, True)
+    check("уверенность на нём не берётся",
+          "sure = None if мгновенный else" in исходник, True)
+    check("говорящий тоже",
+          'who = "" if мгновенный else' in исходник, True)
+    check("и метка слепка",
+          'метка = "" if мгновенный else' in исходник, True)
+
+    # Отмена и прощание звучат по имени, когда разговор уже остыл. awake
+    # считается ДО разбора обращения и в этот момент всегда ложен, поэтому
+    # девяностосекундное окно отмены на деле равнялось десяти секундам.
+    check("отмена работает и по имени",
+          "(awake or по_имени) and undo.take" in исходник, True)
+    check("прощание тоже",
+          "(awake or по_имени) and _is_sleep_word" in исходник, True)
+
+
 def test_sentence_cap() -> None:
     """Робот не должен говорить дольше, чем нужно.
 
@@ -4117,7 +4149,7 @@ def main() -> int:
                  test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_odometry, test_motion_queue, test_route,
-                 test_no_broken_promise, test_chain, test_stop_stops_everything, test_sentence_cap, test_no_narration,
+                 test_no_broken_promise, test_chain, test_stop_stops_everything, test_instant_ignores_stale, test_sentence_cap, test_no_narration,
                  test_one_voice,
                  test_slicing, test_stop_while_thinking,
                  test_wake_stream, test_sound_cards, test_speech_streams,
