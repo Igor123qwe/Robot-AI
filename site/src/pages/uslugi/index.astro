@@ -1,0 +1,102 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import LeadForm from '../../components/LeadForm.astro';
+import { allServices } from '../../lib/content';
+import { money } from '../../lib/text.mjs';
+import { ORG_ID } from '../../lib/schema.mjs';
+import { SITE, abs } from '../../../site.config.mjs';
+
+const services = await allServices();
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/uslugi/', label: 'Услуги' },
+];
+
+const answer =
+  'Мы закрываем три группы задач продавца: операционное ведение кабинетов на Ozon, Wildberries ' +
+  'и Яндекс Маркете, регуляторное сопровождение — маркировка «Честный Знак» и классификация ТН ВЭД, ' +
+  'и разовые работы: запуск продаж с нуля и аудит действующего кабинета. Каждую услугу можно взять ' +
+  'отдельно или собрать в пакет.';
+
+const itemList = {
+  '@type': 'ItemList',
+  '@id': `${abs('/uslugi/')}#list`,
+  name: 'Услуги по сопровождению маркетплейсов',
+  itemListElement: services.map((s, i) => ({
+    '@type': 'ListItem',
+    position: i + 1,
+    name: s.data.h1 ?? s.data.title,
+    url: abs(`/uslugi/${s.data.slug}/`),
+  })),
+};
+
+const catalog = {
+  '@type': 'OfferCatalog',
+  '@id': `${abs('/uslugi/')}#catalog`,
+  name: 'Услуги',
+  provider: { '@id': ORG_ID },
+  itemListElement: services.map((s) => ({
+    '@type': 'Offer',
+    name: s.data.h1 ?? s.data.title,
+    price: s.data.price_from,
+    priceCurrency: 'RUB',
+    url: abs(`/uslugi/${s.data.slug}/`),
+    availability: 'https://schema.org/InStock',
+  })),
+};
+---
+
+<BaseLayout
+  title="Услуги: ведение кабинетов, маркировка, ТН ВЭД"
+  description="Ведение кабинетов Ozon, Wildberries и Яндекс Маркета, сопровождение «Честного Знака», классификация ТН ВЭД, запуск с нуля и аудит — состав работ и цены."
+  path="/uslugi/"
+  crumbs={crumbs}
+  schema={[itemList, catalog]}
+>
+  <div class="wrap">
+    <Breadcrumbs items={crumbs} />
+    <h1>Услуги</h1>
+    <DirectAnswer text={answer} />
+
+    <div class="grid grid--2">
+      {
+        services.map((service) => (
+          <a class="card" href={`/uslugi/${service.data.slug}/`}>
+            <p class="card__title">{service.data.h1 ?? service.data.title}</p>
+            <p class="card__desc">{service.data.offer}</p>
+            <span class="card__meta">
+              <span class="badge">от {money(service.data.price_from)} / {service.data.price_unit}</span>
+            </span>
+          </a>
+        ))
+      }
+    </div>
+
+    <section class="section">
+      <div class="section__head">
+        <h2>Не знаете, с чего начать?</h2>
+      </div>
+      <p class="lead">
+        Опишите ситуацию в двух предложениях — предложим минимальный набор работ, который
+        закроет вашу задачу. Если задача решается без нас, скажем об этом прямо.
+      </p>
+      <div class="grid grid--2">
+        <LeadForm source="uslugi-hub" title="Заявка на разбор кабинета" />
+        <div class="card">
+          <p class="card__title">Что будет дальше</p>
+          <ol>
+            <li>Задаём 5–7 уточняющих вопросов в Telegram или по телефону.</li>
+            <li>Смотрим кабинет и товарную матрицу, если дадите доступ на чтение.</li>
+            <li>Присылаем список проблем с приоритетами и оценку работ.</li>
+          </ol>
+          <p class="muted">
+            Разбор бесплатный. Доступ к кабинету не обязателен — можно начать с описания задачи.
+            Прямой контакт: <a href={SITE.tgPersonal} rel="noopener">Telegram</a>.
+          </p>
+        </div>
+      </div>
+    </section>
+  </div>
+</BaseLayout>

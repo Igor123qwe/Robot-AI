@@ -1,0 +1,157 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import LeadForm from '../../components/LeadForm.astro';
+import Faq from '../../components/Faq.astro';
+import tarify from '../../data/tarify.json';
+import { offerCatalog, faqPage } from '../../lib/schema.mjs';
+import { money } from '../../lib/text.mjs';
+
+const { packages, matrix, excluded } = tarify;
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/tarify/', label: 'Тарифы' },
+];
+
+const answer =
+  'Ведение кабинета маркетплейса стоит от 45 000 ₽ в месяц за одну площадку и до 50 SKU, ' +
+  'от 85 000 ₽ за две площадки с маркировкой «Честный Знак» и от 150 000 ₽ за три площадки ' +
+  'без лимита SKU с сопровождением ТН ВЭД. Разовый аудит кабинета — 25 000 ₽. Цены фиксируются ' +
+  'в договоре на срок сотрудничества.';
+
+const faq = [
+  {
+    q: 'Что входит в стоимость помимо перечисленного?',
+    a: 'В стоимость входит работа команды: менеджер кабинета, специалист по маркировке и аналитик. Прямые расходы — коды маркировки, логистика, хранение, рекламный бюджет — оплачиваются продавцом отдельно и не наценяются.',
+  },
+  {
+    q: 'Можно ли начать с одного месяца?',
+    a: 'Да, первый месяц работаем без длинного договора. Дальше переходим на квартальный, потому что результат по карточкам и позициям виден на горизонте 2–3 месяцев.',
+  },
+  {
+    q: 'Что если SKU больше, чем в тарифе?',
+    a: 'Считаем шагами по 100 SKU: каждый следующий шаг сверх лимита тарифа — плюс 12 000 ₽ в месяц. На тарифе «Полный цикл» лимита нет.',
+  },
+  {
+    q: 'Работаете ли вы за процент от оборота?',
+    a: 'Нет. Процент от оборота выгоден подрядчику при росте продаж и не отражает объём операционной работы. Фиксированная ставка понятнее для планирования себестоимости.',
+  },
+  {
+    q: 'Нужен ли доступ к кабинету с правами администратора?',
+    a: 'Нет. Достаточно роли менеджера с правами на карточки, поставки и обращения. Финансовые разделы и вывод средств остаются только у владельца.',
+  },
+  {
+    q: 'Как быстро можно начать?',
+    a: 'Через 2–3 рабочих дня после подписания: столько занимает передача доступов, сверка товарной матрицы и разбор текущих проблем кабинета.',
+  },
+];
+
+const cell = (value: unknown) => {
+  if (value === true) return { text: '✓', className: 'check-yes' };
+  if (value === false) return { text: '—', className: 'check-no' };
+  return { text: String(value), className: '' };
+};
+---
+
+<BaseLayout
+  title="Тарифы на ведение маркетплейсов: цены 2026"
+  description="Стоимость ведения кабинетов Ozon, Wildberries и Яндекс Маркета: три пакета от 45 000 ₽ в месяц и аудит за 25 000 ₽. Состав работ и что в тарифы не входит."
+  path="/tarify/"
+  crumbs={crumbs}
+  schema={[offerCatalog(packages, '/tarify/'), faqPage(faq, '/tarify/')]}
+>
+  <div class="wrap">
+    <Breadcrumbs items={crumbs} />
+    <h1>Тарифы</h1>
+    <DirectAnswer text={answer} />
+
+    <div class="plans">
+      {
+        packages.map((pkg) => (
+          <div class={`plan${pkg.featured ? ' plan--featured' : ''}`} id={pkg.id}>
+            {pkg.featured && <span class="plan__flag">Чаще всего берут</span>}
+            <h2 class="plan__name">{pkg.name}</h2>
+            <p class="card__desc">{pkg.summary}</p>
+            <p class="plan__price">{money(pkg.price)}</p>
+            <p class="plan__unit">
+              {pkg.unit === 'разово' ? 'разовая работа' : `в ${pkg.unit}, НДС не облагается`}
+            </p>
+            <ul>
+              {pkg.features.map((feature) => (
+                <li>{feature}</li>
+              ))}
+            </ul>
+            <a
+              class={pkg.featured ? 'btn btn--primary' : 'btn btn--ghost'}
+              href={`/kontakty/?plan=${pkg.id}`}
+              data-goal="cta_click"
+              data-goal-place={`plan-${pkg.id}`}
+            >
+              Обсудить тариф
+            </a>
+          </div>
+        ))
+      }
+    </div>
+
+    <section class="section" aria-labelledby="matrix">
+      <h2 id="matrix">Сравнение пакетов</h2>
+      <div class="table-scroll" role="region" tabindex="0" aria-label="Сравнение тарифов">
+        <table>
+          <thead>
+            <tr>
+              <th>Что входит</th>
+              {packages.map((pkg) => <th scope="col">{pkg.name}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {
+              matrix.map((row) => (
+                <tr>
+                  <th scope="row">{row.label}</th>
+                  {row.values.map((value) => {
+                    const view = cell(value);
+                    return <td class={view.className}>{view.text}</td>;
+                  })}
+                </tr>
+              ))
+            }
+            <tr>
+              <th scope="row">Стоимость</th>
+              {packages.map((pkg) => <td><strong>{money(pkg.price)}</strong></td>)}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="excluded">
+      <h2 id="excluded">Что не входит ни в один тариф</h2>
+      <p class="lead">
+        Честнее сказать заранее: эти работы мы либо не делаем, либо они оплачиваются отдельно.
+      </p>
+      <ul>
+        {excluded.map((item) => <li>{item}</li>)}
+      </ul>
+    </section>
+
+    <Faq items={faq} />
+
+    <section class="section" aria-labelledby="lead-form">
+      <h2 id="lead-form">Подобрать тариф под вашу матрицу</h2>
+      <div class="grid grid--2">
+        <LeadForm source="tarify" title="" submitLabel="Отправить заявку" />
+        <div class="card">
+          <p class="card__title">Как считаем итоговую цену</p>
+          <ol>
+            <li>Берём базовую стоимость пакета.</li>
+            <li>Добавляем шаги по SKU сверх лимита — по 12 000 ₽ за каждые 100.</li>
+            <li>Добавляем маркировку, если категория подлежит обязательной маркировке.</li>
+            <li>Фиксируем сумму в договоре: в течение срока она не меняется.</li>
+          </ol>
+        </div>
+      </div>
+    </section>
+  </div>
+</BaseLayout>

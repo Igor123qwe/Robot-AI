@@ -1,0 +1,459 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import LeadForm from '../../components/LeadForm.astro';
+import Faq from '../../components/Faq.astro';
+import RelatedService from '../../components/RelatedService.astro';
+import rates from '../../data/commissions.json';
+import { softwareApplication, faqPage } from '../../lib/schema.mjs';
+import { formatDate } from '../../lib/text.mjs';
+
+const url = '/instrumenty/kalkulyator-ozon/';
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/instrumenty/', label: 'Калькуляторы' },
+  { href: url, label: 'Калькулятор юнит-экономики Ozon' },
+];
+
+const answer =
+  'Калькулятор считает прибыль с одной проданной единицы на Ozon: из цены вычитаются комиссия ' +
+  'категории, последняя миля, логистика с поправкой на долю возвратов, эквайринг, хранение, ' +
+  'реклама, себестоимость и налог. Расчёт идёт в браузере, данные никуда не отправляются. ' +
+  'Ссылку с параметрами можно скопировать и переслать — все значения сохраняются в адресе страницы.';
+
+const faq = [
+  {
+    q: 'Почему логистика в расчёте больше, чем в тарифах Ozon?',
+    a: 'Потому что логистика оплачивается за каждую отправку, а не за каждую продажу. При доле возвратов 20% на одну выкупленную единицу приходится 1,25 отправки, и стоимость доставки в расчёте на проданную единицу растёт на четверть.',
+  },
+  {
+    q: 'Что считать объёмом товара?',
+    a: 'Объём считается по габаритам упаковки, а не самого товара: длина × ширина × высота в сантиметрах, делённые на 1000. Полученное значение округляется вверх до целого литра — так же, как это делает площадка.',
+  },
+  {
+    q: 'Какой налог выбирать?',
+    a: 'На УСН «Доходы» налог считается от всей суммы, которую заплатил покупатель, включая комиссию площадки, — это частая ошибка новичков. На УСН «Доходы минус расходы» база уменьшается на подтверждённые расходы.',
+  },
+  {
+    q: 'Учитывает ли калькулятор акции и скидки площадки?',
+    a: 'Нет. Введите цену, по которой товар реально уходит покупателю после всех скидок: именно от неё считаются комиссия и последняя миля.',
+  },
+  {
+    q: 'Насколько точны ставки комиссий в калькуляторе?',
+    a: 'Ставки берутся из конфигурационного файла и обновляются вручную. Дата обновления указана под калькулятором. Перед принятием решения сверьтесь с личным кабинетом: комиссия зависит от конкретной категории и может отличаться от средней по группе.',
+  },
+  {
+    q: 'Что показывает точка безубыточности?',
+    a: 'Минимальную цену продажи, при которой прибыль с единицы равна нулю при текущих себестоимости, комиссии и логистике. Ниже этой цены каждая продажа увеличивает убыток.',
+  },
+];
+---
+
+<BaseLayout
+  title="Калькулятор юнит-экономики Ozon: расчёт прибыли"
+  description="Считает прибыль с единицы товара на Ozon: комиссия категории, последняя миля, логистика с учётом возвратов, хранение, реклама и налог. Расчёт идёт в браузере."
+  path={url}
+  crumbs={crumbs}
+  schema={[
+    softwareApplication({
+      name: 'Калькулятор юнит-экономики Ozon',
+      description: 'Расчёт прибыли с единицы товара на Ozon с учётом комиссии, логистики, возвратов и налога',
+      url,
+    }),
+    faqPage(faq, url),
+  ]}
+>
+  <div class="read">
+    <Breadcrumbs items={crumbs} />
+    <h1>Калькулятор юнит-экономики Ozon</h1>
+    <DirectAnswer text={answer} />
+
+    {
+      !rates.verified && (
+        <p class="demo-notice">
+          Ставки в калькуляторе — стартовые значения из конфигурации и требуют сверки с текущими
+          тарифами площадки. Файл: <code>src/data/commissions.json</code>.
+        </p>
+      )
+    }
+
+    <div class="calc">
+      <form class="calc__inputs" id="calc" novalidate>
+        <div class="calc__row">
+          <div class="field">
+            <label for="price">Цена продажи, ₽</label>
+            <input id="price" name="price" type="number" min="1" step="1" value="2490" inputmode="decimal" />
+          </div>
+          <div class="field">
+            <label for="cost">Себестоимость, ₽</label>
+            <input id="cost" name="cost" type="number" min="0" step="1" value="900" inputmode="decimal" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="cat">Категория</label>
+          <select id="cat" name="cat">
+            {rates.categories.map((c) => <option value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="scheme">Схема работы</label>
+          <select id="scheme" name="scheme">
+            <option value="fbo">FBO — товар на складе площадки</option>
+            <option value="fbs">FBS — товар на своём складе, доставка площадки</option>
+            <option value="rfbs">realFBS — своя доставка</option>
+          </select>
+        </div>
+
+        <div class="calc__row">
+          <div class="field">
+            <label for="vol">Объём упаковки, л</label>
+            <input id="vol" name="vol" type="number" min="0.1" step="0.1" value="2" inputmode="decimal" />
+            <span class="field__hint">Д × Ш × В в см ÷ 1000</span>
+          </div>
+          <div class="field">
+            <label for="ret">Доля возвратов, %</label>
+            <input id="ret" name="ret" type="number" min="0" max="90" step="1" value="15" inputmode="decimal" />
+          </div>
+        </div>
+
+        <div class="calc__row">
+          <div class="field">
+            <label for="ads">Реклама, ₽/шт</label>
+            <input id="ads" name="ads" type="number" min="0" step="1" value="120" inputmode="decimal" />
+          </div>
+          <div class="field">
+            <label for="days">Хранение, дней</label>
+            <input id="days" name="days" type="number" min="0" step="1" value="30" inputmode="decimal" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="tax">Налоговый режим</label>
+          <select id="tax" name="tax">
+            {rates.taxRates.map((t) => <option value={t.id}>{t.name}</option>)}
+          </select>
+        </div>
+
+        <button class="btn btn--ghost btn--sm" type="button" id="copy-link">Скопировать ссылку на расчёт</button>
+      </form>
+
+      <output class="calc__result" for="calc" id="result">
+        <span class="stat__label">Прибыль с единицы</span>
+        <p class="calc__headline" id="profit">—</p>
+        <ul class="calc__lines" id="lines"></ul>
+        <p class="calc__note" id="breakeven"></p>
+        <button
+          class="btn btn--primary btn--wide"
+          type="button"
+          id="send-calc"
+          data-goal="calc_use"
+          data-goal-place="ozon"
+        >
+          Отправить расчёт в Telegram
+        </button>
+      </output>
+    </div>
+
+    <p class="calc__note">
+      Ставки обновлены {formatDate(rates.updated)}. Источник: {rates.source}.
+      Комиссия зависит от конкретной категории — сверяйтесь с личным кабинетом.
+    </p>
+
+    <section class="section" id="lead">
+      <h2>Проверим расчёт вместе</h2>
+      <p class="muted">
+        Пришлём разбор: где в вашей экономике зашита ошибка и какие расходы можно снять
+        без потери оборота. Расчёт из калькулятора подставится в комментарий автоматически.
+      </p>
+      <LeadForm source="calc:ozon" title="" submitLabel="Отправить расчёт" />
+    </section>
+
+    <div class="article-body">
+      <h2>Как считается юнит-экономика в этом калькуляторе</h2>
+      <p>
+        Юнит-экономика — это прибыль с одной проданной единицы после всех расходов, которые
+        возникают именно из-за этой продажи. Постоянные расходы бизнеса — зарплата, аренда офиса,
+        подписки на сервисы — в такой расчёт не входят: они не зависят от того, продали вы
+        сегодня одну единицу или сто.
+      </p>
+
+      <h3>Что вычитается из цены</h3>
+      <p>
+        Комиссия площадки считается процентом от цены продажи и зависит от категории и схемы
+        работы. На FBO комиссия обычно выше, чем на FBS, а на realFBS — самая низкая, потому что
+        доставку организует продавец. Последняя миля — отдельный платёж за доставку до пункта
+        выдачи: процент от цены с нижней и верхней границей, поэтому у дешёвых товаров она
+        съедает заметную долю, а у дорогих упирается в потолок.
+      </p>
+      <p>
+        Логистика зависит от объёма упаковки, а не от веса. Объём считается по габаритам коробки
+        в сантиметрах: длина, умноженная на ширину и высоту, делённая на 1000, — и округляется
+        вверх до целого литра. Стоимость складывается из базовой ставки за первый литр и доплаты
+        за каждый следующий, с ограничением сверху.
+      </p>
+
+      <h3>Почему возвраты дороже, чем кажутся</h3>
+      <p>
+        Главная ошибка в самодельных таблицах — считать логистику один раз на продажу. На самом
+        деле площадка берёт деньги за каждую отправку, включая ту, которая вернулась. Если доля
+        возвратов составляет 20%, то на одну выкупленную единицу приходится 1,25 отправки: цифра
+        получается делением единицы на разность единицы и доли возвратов. Плюс обратная логистика
+        за каждый возврат.
+      </p>
+      <p>
+        Именно поэтому в категориях с высоким процентом отказов — одежда, обувь, крупные
+        аксессуары — товар с виду прибыльный по таблице может уходить в минус на практике.
+        Калькулятор пересчитывает логистику и обработку с этой поправкой автоматически: вы вводите
+        долю возвратов, а расходы масштабируются.
+      </p>
+
+      <h3>Хранение, реклама и эквайринг</h3>
+      <p>
+        Хранение считается за литр объёма в сутки и умножается на срок, который единица лежит
+        на складе. При медленной оборачиваемости хранение способно превысить комиссию. Реклама
+        вводится в рублях на единицу: если вы знаете только месячный бюджет, разделите его на
+        число продаж за тот же месяц. Эквайринг — процент за приём платежа, он берётся от полной
+        суммы, которую заплатил покупатель.
+      </p>
+
+      <h3>Налог и точка безубыточности</h3>
+      <p>
+        Налог считается по выбранному режиму. На УСН «Доходы» база — вся сумма, полученная
+        от покупателя, включая ту часть, которую площадка удержала как комиссию: продавец
+        не получал этих денег на счёт, но налог с них платит. На УСН «Доходы минус расходы» база
+        уменьшается на подтверждённые расходы, поэтому при высокой доле комиссии и логистики этот
+        режим чаще выгоднее.
+      </p>
+      <p>
+        Точка безубыточности — минимальная цена, при которой прибыль с единицы равна нулю.
+        Она считается подбором: калькулятор ищет цену, при которой все расходы, включая
+        зависящие от цены проценты, сходятся с себестоимостью. Разница между вашей ценой
+        и точкой безубыточности показывает запас прочности на случай скидок и акций.
+      </p>
+
+      <h3>Чего калькулятор не учитывает</h3>
+      <p>
+        За кадром остаются акции площадки со скидкой за счёт продавца, платное продвижение
+        в поиске сверх введённого бюджета, штрафы за нарушение регламентов, стоимость упаковки
+        и маркировки, если товар подлежит обязательной маркировке. Стоимость кодов и работ
+        по маркировке добавляйте в себестоимость — так расчёт останется корректным.
+      </p>
+    </div>
+
+    <Faq items={faq} />
+    <RelatedService slug="audit-kabineta" />
+  </div>
+</BaseLayout>
+
+<script is:inline define:vars={{ rates }}>
+  // Расчёт целиком на клиенте (§6.5): ни один параметр не уходит на сервер,
+  // состояние формы живёт в адресе страницы, чтобы ссылкой можно было делиться.
+  (function () {
+    const form = document.getElementById('calc');
+    if (!form) return;
+
+    const fields = ['price', 'cost', 'cat', 'scheme', 'vol', 'ret', 'ads', 'days', 'tax'];
+    const el = {};
+    fields.forEach(function (id) {
+      el[id] = document.getElementById(id);
+    });
+
+    const rub = function (value) {
+      return Math.round(value).toLocaleString('ru-RU') + ' ₽';
+    };
+
+    function readState() {
+      const params = new URLSearchParams(location.search);
+      fields.forEach(function (id) {
+        const value = params.get(id);
+        if (value !== null && el[id]) el[id].value = value;
+      });
+    }
+
+    function writeState() {
+      const params = new URLSearchParams();
+      fields.forEach(function (id) {
+        if (el[id]) params.set(id, el[id].value);
+      });
+      history.replaceState(null, '', location.pathname + '?' + params.toString());
+    }
+
+    function categoryRate(scheme) {
+      const category = rates.categories.find(function (c) {
+        return c.id === el.cat.value;
+      }) || rates.categories[0];
+      return category[scheme] || category.fbo;
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(Math.max(value, min), max);
+    }
+
+    /** Все расходы на одну выкупленную единицу при заданной цене */
+    function calculate(price) {
+      const scheme = el.scheme.value;
+      const cost = Number(el.cost.value) || 0;
+      const volume = Math.max(1, Math.ceil(Number(el.vol.value) || 1));
+      const returnShare = clamp((Number(el.ret.value) || 0) / 100, 0, 0.9);
+      const ads = Number(el.ads.value) || 0;
+      const days = Number(el.days.value) || 0;
+
+      // На одну выкупленную единицу приходится больше одной отправки
+      const shipments = 1 / (1 - returnShare);
+      const returnsPerSale = shipments - 1;
+
+      const commission = (price * categoryRate(scheme)) / 100;
+      const lastMile =
+        scheme === 'rfbs'
+          ? 0
+          : clamp((price * rates.lastMile.percent) / 100, rates.lastMile.min, rates.lastMile.max);
+
+      const tariff = rates.logistics[scheme];
+      const perShipment = tariff.max
+        ? Math.min(tariff.base + tariff.perLiter * (volume - 1), tariff.max)
+        : 0;
+      const logistics = perShipment * shipments;
+      const returnsCost = rates.returns[scheme] * returnsPerSale;
+
+      const acquiring = (price * rates.acquiring) / 100;
+      const storage = scheme === 'fbo' ? rates.storagePerLiterPerDay * volume * days : 0;
+      const processing = scheme === 'fbs' ? rates.processingPerUnit * shipments : 0;
+
+      const taxRule =
+        rates.taxRates.find(function (t) {
+          return t.id === el.tax.value;
+        }) || rates.taxRates[0];
+
+      const expenses =
+        commission + lastMile + logistics + returnsCost + acquiring + storage + processing + ads + cost;
+      const taxBase = taxRule.base === 'revenue' ? price : Math.max(0, price - expenses);
+      const tax = (taxBase * taxRule.rate) / 100;
+
+      return {
+        price: price,
+        commission: commission,
+        lastMile: lastMile,
+        logistics: logistics,
+        returnsCost: returnsCost,
+        acquiring: acquiring,
+        storage: storage,
+        processing: processing,
+        ads: ads,
+        cost: cost,
+        tax: tax,
+        shipments: shipments,
+        profit: price - expenses - tax,
+      };
+    }
+
+    /** Минимальная цена, при которой прибыль равна нулю — ищем делением отрезка */
+    function breakevenPrice() {
+      let low = 1;
+      let high = Math.max(1000, (Number(el.price.value) || 1000) * 10);
+      if (calculate(high).profit < 0) return null;
+      for (let i = 0; i < 40; i += 1) {
+        const mid = (low + high) / 2;
+        if (calculate(mid).profit < 0) low = mid;
+        else high = mid;
+      }
+      return high;
+    }
+
+    function render() {
+      const price = Number(el.price.value) || 0;
+      const r = calculate(price);
+      const margin = price > 0 ? (r.profit / price) * 100 : 0;
+      const roi = r.cost > 0 ? (r.profit / r.cost) * 100 : 0;
+
+      const profitEl = document.getElementById('profit');
+      profitEl.textContent = rub(r.profit);
+      profitEl.dataset.sign = r.profit >= 0 ? 'pos' : 'neg';
+
+      const rows = [
+        ['Цена продажи', r.price],
+        ['Комиссия площадки', -r.commission],
+        ['Последняя миля', -r.lastMile],
+        ['Логистика с учётом возвратов', -r.logistics],
+        ['Обратная логистика', -r.returnsCost],
+        ['Эквайринг', -r.acquiring],
+        ['Хранение', -r.storage],
+        ['Обработка отправлений', -r.processing],
+        ['Реклама', -r.ads],
+        ['Себестоимость', -r.cost],
+        ['Налог', -r.tax],
+      ].filter(function (row) {
+        return Math.abs(row[1]) >= 0.5 || row[0] === 'Цена продажи';
+      });
+
+      document.getElementById('lines').innerHTML =
+        rows
+          .map(function (row) {
+            return '<li><span>' + row[0] + '</span><b>' + rub(row[1]) + '</b></li>';
+          })
+          .join('') +
+        '<li class="calc__total"><span>Маржинальность</span><b>' +
+        margin.toFixed(1) +
+        '%</b></li>' +
+        '<li><span>Рентабельность вложений</span><b>' +
+        roi.toFixed(0) +
+        '%</b></li>';
+
+      const be = breakevenPrice();
+      document.getElementById('breakeven').textContent = be
+        ? 'Точка безубыточности: ' +
+          rub(be) +
+          '. На одну продажу приходится ' +
+          r.shipments.toFixed(2) +
+          ' отправки с учётом возвратов.'
+        : 'При текущих расходах товар убыточен при любой разумной цене — снижайте себестоимость или объём упаковки.';
+
+      writeState();
+    }
+
+    form.addEventListener('input', render);
+    form.addEventListener('change', render);
+
+    document.getElementById('copy-link').addEventListener('click', function () {
+      navigator.clipboard?.writeText(location.href);
+      this.textContent = 'Ссылка скопирована';
+      const button = this;
+      setTimeout(function () {
+        button.textContent = 'Скопировать ссылку на расчёт';
+      }, 2000);
+    });
+
+    document.getElementById('send-calc').addEventListener('click', function () {
+      const price = Number(el.price.value) || 0;
+      const r = calculate(price);
+      const summary =
+        'Расчёт с калькулятора Ozon: цена ' +
+        rub(r.price) +
+        ', себестоимость ' +
+        rub(r.cost) +
+        ', категория «' +
+        el.cat.options[el.cat.selectedIndex].text +
+        '», схема ' +
+        el.scheme.value.toUpperCase() +
+        ', возвраты ' +
+        el.ret.value +
+        '%. Прибыль с единицы: ' +
+        rub(r.profit) +
+        '. Ссылка: ' +
+        location.href;
+
+      const field = document.querySelector('form[data-lead-form] [name="comment"]');
+      if (field) {
+        field.value = summary;
+      }
+      document.getElementById('lead').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      document.querySelector('form[data-lead-form] [name="name"]')?.focus({ preventScroll: true });
+      window.siteGoal?.('calc_use', { place: 'ozon-send' });
+    });
+
+    readState();
+    render();
+  })();
+</script>

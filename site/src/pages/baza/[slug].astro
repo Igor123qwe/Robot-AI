@@ -1,0 +1,47 @@
+---
+import { render } from 'astro:content';
+import ArticleLayout from '../../layouts/ArticleLayout.astro';
+import PillarLayout from '../../layouts/PillarLayout.astro';
+import { allArticles, allPillars, articlesByPillar, relatedArticles } from '../../lib/content';
+import { gitModified, collectionPath } from '../../lib/git-dates.mjs';
+
+/**
+ * Один маршрут на pillar-страницы и статьи кластера: по ТЗ (§3.1) статьи
+ * лежат плоско внутри /baza/, на одном уровне с хабами разделов.
+ */
+export async function getStaticPaths() {
+  const [pillars, articles] = await Promise.all([allPillars(), allArticles()]);
+
+  return [
+    ...pillars.map((entry) => ({
+      params: { slug: entry.data.slug },
+      props: { kind: 'pillar' as const, entry },
+    })),
+    ...articles.map((entry) => ({
+      params: { slug: entry.data.slug },
+      props: { kind: 'article' as const, entry },
+    })),
+  ];
+}
+
+const { kind, entry } = Astro.props;
+const { Content, headings } = await render(entry as any);
+
+const collection = kind === 'pillar' ? 'pillars' : 'baza';
+const dateModified = gitModified(collectionPath(collection, entry.id), entry.data.updated);
+
+const clusterArticles = kind === 'pillar' ? await articlesByPillar(entry.data.slug) : [];
+const related = kind === 'article' ? await relatedArticles(entry as any) : [];
+---
+
+{
+  kind === 'pillar' ? (
+    <PillarLayout entry={entry as any} headings={headings} dateModified={dateModified} articles={clusterArticles}>
+      <Content />
+    </PillarLayout>
+  ) : (
+    <ArticleLayout entry={entry as any} headings={headings} dateModified={dateModified} related={related}>
+      <Content />
+    </ArticleLayout>
+  )
+}

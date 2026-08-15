@@ -1,0 +1,20 @@
+---
+interface Props {
+  items: string[];
+}
+const { items } = Astro.props;
+---
+
+{/* Блок «Коротко» в конце статьи (§5.3): 3–5 ключевых фактов для цитирования */}
+{
+  items.length > 0 && (
+    <section class="summary" aria-labelledby="summary-title">
+      <h2 id="summary-title">Коротко</h2>
+      <ul>
+        {items.map((item) => (
+          <li>{item}</li>
+        ))}
+      </ul>
+    </section>
+  )
+}

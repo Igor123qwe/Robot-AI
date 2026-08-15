@@ -1,0 +1,119 @@
+---
+import BaseLayout from './BaseLayout.astro';
+import Breadcrumbs from '../components/Breadcrumbs.astro';
+import DirectAnswer from '../components/DirectAnswer.astro';
+import Toc from '../components/Toc.astro';
+import Faq from '../components/Faq.astro';
+import RelatedService from '../components/RelatedService.astro';
+import CtaInline from '../components/CtaInline.astro';
+import { AUTHOR } from '../../site.config.mjs';
+import { article as articleSchema, faqPage, person, breadcrumbs } from '../lib/schema.mjs';
+import { formatDate } from '../lib/text.mjs';
+import { TYPE_LABELS } from '../lib/content';
+import type { Article, Pillar } from '../lib/content';
+
+interface Props {
+  entry: Pillar;
+  headings: { depth: number; slug: string; text: string }[];
+  dateModified: Date;
+  articles: Article[];
+}
+
+const { entry, headings, dateModified, articles } = Astro.props;
+const { data } = entry;
+const url = `/baza/${data.slug}/`;
+
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/baza/', label: 'База знаний' },
+  { href: url, label: data.h1 ?? data.title },
+];
+
+// Кластер группируется по типу статьи — так хаб читается и человеком,
+// и краулером как оглавление темы (§4.1)
+const groups = ['howto', 'reference', 'troubleshoot', 'comparison', 'article']
+  .map((type) => ({ type, items: articles.filter((a) => a.data.type === type) }))
+  .filter((group) => group.items.length > 0);
+
+const schema: unknown[] = [
+  articleSchema({ data, url, dateModified, type: 'article' }),
+  person(),
+];
+if (data.faq.length > 0) schema.push(faqPage(data.faq, url));
+---
+
+<BaseLayout
+  title={data.title}
+  description={data.description}
+  path={url}
+  crumbs={crumbs}
+  schema={schema}
+  noindex={data.noindex || data.demo}
+  ogType="article"
+  publishedTime={data.published}
+  modifiedTime={dateModified}
+>
+  <div class="article-layout">
+    <article class="article-main">
+      <Breadcrumbs items={crumbs} />
+
+      <header class="article-head">
+        <span class="badge">Раздел базы знаний</span>
+        <h1>{data.h1 ?? data.title}</h1>
+        <p class="meta-line">
+          <span>{AUTHOR.name}</span>
+          <span class="meta-line__dot">
+            Актуально на <time datetime={dateModified.toISOString().slice(0, 10)}>{formatDate(dateModified)}</time>
+          </span>
+          <span class="meta-line__dot">{articles.length} материалов в разделе</span>
+        </p>
+      </header>
+
+      {
+        data.demo && (
+          <p class="demo-notice">
+            Демонстрационный текст: замените содержимое и проверьте факты перед публикацией.
+          </p>
+        )
+      }
+
+      <DirectAnswer text={data.direct_answer} />
+      <Toc headings={headings} variant="inline" />
+
+      <div class="article-body">
+        <slot />
+      </div>
+
+      <CtaInline variant="soft" place="pillar-mid" />
+
+      <section class="section" aria-labelledby="cluster">
+        <h2 id="cluster">Все материалы раздела</h2>
+        {
+          groups.map((group) => (
+            <>
+              <h3>{TYPE_LABELS[group.type]}</h3>
+              <ul class="article-list">
+                {group.items.map((item) => (
+                  <li>
+                    <a href={`/baza/${item.data.slug}/`}>
+                      <span class="article-list__title">{item.data.h1 ?? item.data.title}</span>
+                      {item.data.has_own_data && <span class="badge badge--own">данные</span>}
+                      <span class="article-list__type">{formatDate(item.data.updated)}</span>
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ))
+        }
+        {articles.length === 0 && <p class="muted">Материалы раздела скоро появятся.</p>}
+      </section>
+
+      {data.faq.length > 0 && <Faq items={data.faq} />}
+
+      <RelatedService slug={data.related_service} pillar={data.slug} />
+    </article>
+
+    <Toc headings={headings} variant="aside" />
+  </div>
+</BaseLayout>

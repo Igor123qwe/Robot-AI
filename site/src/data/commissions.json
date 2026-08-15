@@ -1,0 +1,46 @@
+{
+  "_readme": "Ставки для калькуляторов. Правятся здесь, без правки кода (§6.5). После обновления поставьте новую дату в updated и verified: true — до этого на страницах калькуляторов висит предупреждение о непроверенных ставках.",
+  "updated": "2026-08-15",
+  "verified": false,
+  "source": "Тарифы Ozon для продавцов, раздел «Комиссии и услуги»",
+  "currency": "RUB",
+  "categories": [
+    { "id": "odezhda", "name": "Одежда и обувь", "fbo": 24.5, "fbs": 22.5, "rfbs": 15 },
+    { "id": "elektronika", "name": "Электроника", "fbo": 13, "fbs": 11, "rfbs": 7 },
+    { "id": "bytovaya-tehnika", "name": "Бытовая техника", "fbo": 12, "fbs": 10.5, "rfbs": 7 },
+    { "id": "krasota", "name": "Красота и здоровье", "fbo": 18, "fbs": 16, "rfbs": 11 },
+    { "id": "dom", "name": "Дом и сад", "fbo": 17, "fbs": 15, "rfbs": 10 },
+    { "id": "detskie", "name": "Детские товары", "fbo": 16, "fbs": 14, "rfbs": 9 },
+    { "id": "avtotovary", "name": "Автотовары и запчасти", "fbo": 15, "fbs": 13, "rfbs": 9 },
+    { "id": "sport", "name": "Спорт и отдых", "fbo": 17, "fbs": 15, "rfbs": 10 },
+    { "id": "produkty", "name": "Продукты питания", "fbo": 15, "fbs": 13, "rfbs": 9 },
+    { "id": "zoo", "name": "Зоотовары", "fbo": 16, "fbs": 14, "rfbs": 9 }
+  ],
+  "logistics": {
+    "_comment": "Модель: базовая ставка за первый литр объёма плюс доплата за каждый следующий литр, с потолком.",
+    "fbo": { "base": 76, "perLiter": 12, "max": 1800 },
+    "fbs": { "base": 84, "perLiter": 13, "max": 1900 },
+    "rfbs": { "base": 0, "perLiter": 0, "max": 0 }
+  },
+  "returns": {
+    "_comment": "Стоимость обратной логистики за одну возвращённую единицу.",
+    "fbo": 60,
+    "fbs": 60,
+    "rfbs": 0
+  },
+  "lastMile": {
+    "_comment": "Последняя миля: процент от цены с ограничениями по сумме.",
+    "percent": 5.5,
+    "min": 20,
+    "max": 250
+  },
+  "acquiring": 1.5,
+  "storagePerLiterPerDay": 0.2,
+  "processingPerUnit": 25,
+  "taxRates": [
+    { "id": "usn6", "name": "УСН «Доходы», 6%", "rate": 6, "base": "revenue" },
+    { "id": "usn15", "name": "УСН «Доходы минус расходы», 15%", "rate": 15, "base": "profit" },
+    { "id": "osno", "name": "ОСНО, налог на прибыль 25%", "rate": 25, "base": "profit" },
+    { "id": "none", "name": "Не учитывать", "rate": 0, "base": "revenue" }
+  ]
+}

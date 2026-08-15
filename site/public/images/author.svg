@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Фотография автора">
+  <rect width="128" height="128" rx="64" fill="#eef3ff" />
+  <circle cx="64" cy="50" r="22" fill="#1a4fd6" opacity="0.75" />
+  <path d="M20 118c6-24 23-36 44-36s38 12 44 36z" fill="#1a4fd6" opacity="0.75" />
+</svg>

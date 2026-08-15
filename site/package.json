@@ -1,0 +1,39 @@
+{
+  "name": "marketplace-service-site",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "npm run validate && astro build",
+    "preview": "astro preview",
+    "validate": "node scripts/validate-content.mjs",
+    "check": "astro check",
+    "og": "node scripts/generate-og.mjs",
+    "indexnow": "node scripts/indexnow.mjs",
+    "forms": "node server/forms.mjs",
+    "postbuild:ping": "node scripts/indexnow.mjs"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "^4.3.0",
+    "@astrojs/sitemap": "^3.7.0",
+    "astro": "^5.18.0"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.10",
+    "@resvg/resvg-js": "^2.6.2",
+    "gray-matter": "^4.0.3",
+    "mdast-util-to-string": "^4.0.0",
+    "remark-directive": "^4.0.0",
+    "satori": "^0.29.0",
+    "typescript": "^5.9.3",
+    "unist-util-visit": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "nodemailer": "^7.0.0"
+  }
+}

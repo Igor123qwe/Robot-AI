@@ -1,0 +1,45 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Breadcrumbs from '../components/Breadcrumbs.astro';
+import { SITE } from '../../site.config.mjs';
+
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/politika-konfidencialnosti/', label: 'Политика обработки персональных данных' },
+];
+---
+
+{/*
+  Юридические тексты по ТЗ (§11) предоставляет заказчик. Страница-заглушка
+  существует, чтобы ссылка из футера и форм не была битой, и закрыта от
+  индексации до появления настоящего текста.
+*/}
+<BaseLayout
+  title="Политика обработки персональных данных"
+  description="Политика обработки персональных данных: какие данные собираются через формы заявки, с какой целью, как долго хранятся и как отозвать согласие на обработку."
+  path="/politika-konfidencialnosti/"
+  crumbs={crumbs}
+  noindex={true}
+>
+  <div class="read">
+    <Breadcrumbs items={crumbs} />
+    <h1>Политика обработки персональных данных</h1>
+
+    <p class="demo-notice">
+      Текст политики предоставляет заказчик (§11 ТЗ). Замените содержимое этой страницы
+      и снимите <code>noindex</code> в <code>src/pages/politika-konfidencialnosti.astro</code>.
+    </p>
+
+    <div class="legal-body">
+      <h2>Что должно быть в тексте</h2>
+      <ul>
+        <li>Оператор персональных данных: {SITE.legalName}, ИНН {SITE.inn}.</li>
+        <li>Состав данных: имя, контакт (Telegram или телефон), текст обращения, адрес страницы и UTM-метки.</li>
+        <li>Цель обработки: ответ на заявку и заключение договора.</li>
+        <li>Правовое основание и срок хранения.</li>
+        <li>Передача третьим лицам: сервис доставки заявок, почтовый провайдер, системы аналитики.</li>
+        <li>Порядок отзыва согласия и контакт для обращений: {SITE.email}.</li>
+      </ul>
+    </div>
+  </div>
+</BaseLayout>

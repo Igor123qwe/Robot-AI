@@ -1,0 +1,327 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import LeadForm from '../../components/LeadForm.astro';
+import Faq from '../../components/Faq.astro';
+import RelatedService from '../../components/RelatedService.astro';
+import catalog from '../../data/markirovka.json';
+import { softwareApplication, faqPage, dataset } from '../../lib/schema.mjs';
+import { formatDate } from '../../lib/text.mjs';
+
+const url = '/instrumenty/nuzhna-li-markirovka/';
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/instrumenty/', label: 'Калькуляторы' },
+  { href: url, label: 'Проверка: нужна ли маркировка' },
+];
+
+const answer =
+  'Инструмент проверяет, попадает ли товар под обязательную маркировку «Честный Знак»: ' +
+  'введите код ТН ВЭД или название товара и получите ответ по товарной группе. Проверка идёт ' +
+  'по справочнику товарных групп в браузере, без отправки данных. Ответ по первым четырём ' +
+  'цифрам кода — предварительный: внутри одной позиции сроки и требования различаются.';
+
+const faq = [
+  {
+    q: 'Достаточно ли первых четырёх цифр кода ТН ВЭД?',
+    a: 'Нет. Первые четыре цифры задают товарную позицию, а требование маркировки почти всегда описано десятизначным кодом. Совпадение по четырём цифрам — повод проверить полный код в постановлении, а не готовый ответ.',
+  },
+  {
+    q: 'Что делать, если товара нет в справочнике?',
+    a: 'Отсутствие в справочнике не означает, что маркировка не нужна: перечни расширяются. Проверьте свой десятизначный код в действующей редакции постановления по вашей группе или напишите нам.',
+  },
+  {
+    q: 'Кто наносит коды при импорте?',
+    a: 'При ввозе коды наносятся до пересечения границы либо на таможенном складе — до выпуска товара в свободное обращение. Схема выбирается заранее: переклеивать коды на складе площадки уже нельзя.',
+  },
+  {
+    q: 'Нужна ли маркировка для остатков, купленных раньше?',
+    a: 'Для большинства групп предусмотрен переходный период с маркировкой остатков по упрощённой схеме. Сроки такого периода различаются по группам, и именно на них чаще всего опаздывают продавцы.',
+  },
+  {
+    q: 'Что будет, если продавать немаркированный товар?',
+    a: 'Площадка блокирует карточки и отказывает в приёмке, а по закону предусмотрены штрафы и конфискация партии. Для продавца практический риск — остановка продаж категории в пик сезона.',
+  },
+  {
+    q: 'Отличается ли маркировка от системы «Меркурий»?',
+    a: 'Да, это разные системы. «Честный Знак» — коды Data Matrix на упаковке, «Меркурий» — ветеринарные сопроводительные документы для продукции животного происхождения. Для молочной продукции нужны обе.',
+  },
+];
+---
+
+<BaseLayout
+  title="Нужна ли маркировка: проверка по коду ТН ВЭД"
+  description="Проверьте, попадает ли товар под обязательную маркировку «Честный Знак»: поиск по коду ТН ВЭД и по названию, с пояснением по товарной группе и порядку действий."
+  path={url}
+  crumbs={crumbs}
+  schema={[
+    softwareApplication({
+      name: 'Проверка обязательной маркировки по коду ТН ВЭД',
+      description: 'Определяет товарную группу «Честного Знака» по коду ТН ВЭД или названию товара',
+      url,
+    }),
+    dataset({
+      name: 'Справочник товарных групп обязательной маркировки',
+      description: 'Соответствие товарных групп «Честного Знака» кодам ТН ВЭД с пояснениями',
+      url,
+      keywords: ['Честный Знак', 'маркировка', 'ТН ВЭД', 'товарные группы'],
+      dateModified: catalog.updated,
+      measured: `Справочник ведётся вручную, источник: ${catalog.source}`,
+    }),
+    faqPage(faq, url),
+  ]}
+>
+  <div class="read">
+    <Breadcrumbs items={crumbs} />
+    <h1>Нужна ли маркировка вашему товару</h1>
+    <DirectAnswer text={answer} />
+
+    {
+      !catalog.verified && (
+        <p class="demo-notice">
+          Справочник товарных групп не сверен с первоисточником. Проверьте
+          <code>src/data/markirovka.json</code> и выставьте <code>verified: true</code> перед публикацией.
+        </p>
+      )
+    }
+
+    <div class="calc">
+      <form class="calc__inputs" id="calc" novalidate>
+        <div class="field">
+          <label for="q">Код ТН ВЭД или название товара</label>
+          <input
+            id="q"
+            name="q"
+            type="search"
+            placeholder="8708 30 или «тормозные колодки»"
+            autocomplete="off"
+          />
+          <span class="field__hint">
+            Достаточно первых четырёх цифр кода — ответ будет предварительным
+          </span>
+        </div>
+        <button class="btn btn--ghost btn--sm" type="button" id="copy-link">Скопировать ссылку на проверку</button>
+      </form>
+
+      <output class="calc__result" for="calc" id="result">
+        <span class="stat__label">Результат проверки</span>
+        <p class="calc__headline" id="verdict">Введите код</p>
+        <div id="details"></div>
+        <button
+          class="btn btn--primary btn--wide"
+          type="button"
+          id="send-calc"
+          data-goal="calc_use"
+          data-goal-place="markirovka"
+        >
+          Уточнить у эксперта
+        </button>
+      </output>
+    </div>
+
+    <section class="section">
+      <h2>Товарные группы в справочнике</h2>
+      <div class="table-scroll" role="region" tabindex="0" aria-label="Товарные группы маркировки">
+        <table>
+          <thead>
+            <tr>
+              <th>Группа</th>
+              <th>Коды ТН ВЭД</th>
+              <th>Статус</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              catalog.groups.map((group) => (
+                <tr>
+                  <td>{group.name}</td>
+                  <td><code>{group.codes.join(', ')}</code></td>
+                  <td>{group.status === 'required' ? 'маркируется' : 'нужна сверка'}</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+      <p class="calc__note">
+        Справочник обновлён {formatDate(catalog.updated)}. Источник: {catalog.source}.
+      </p>
+    </section>
+
+    <section class="section" id="lead">
+      <h2>Проверим ваш код и оформим маркировку</h2>
+      <p class="muted">
+        Пришлите код ТН ВЭД и описание товара — ответим, нужна ли маркировка, и что делать
+        с остатками и ближайшей поставкой.
+      </p>
+      <LeadForm source="calc:markirovka" title="" submitLabel="Отправить на проверку" />
+    </section>
+
+    <div class="article-body">
+      <h2>Как проверить обязательность маркировки правильно</h2>
+      <p>
+        Обязательная маркировка вводится не по категориям магазина, а по кодам ТН ВЭД и ОКПД 2,
+        перечисленным в постановлении Правительства по конкретной товарной группе. Это ключевой
+        момент: карточка на площадке может лежать в категории «Автотовары», а требование
+        маркировки определяется десятизначным кодом, который вы указали в декларации.
+      </p>
+
+      <h3>Почему четырёх цифр недостаточно</h3>
+      <p>
+        Код ТН ВЭД устроен иерархически: первые четыре цифры — товарная позиция, шесть —
+        субпозиция, десять — подсубпозиция, по которой и считаются пошлина и требования.
+        Внутри одной позиции соседние подсубпозиции могут иметь разный статус: одна попадает
+        под маркировку, другая нет. Поэтому наш инструмент по четырём цифрам показывает товарную
+        группу и предупреждение, а не окончательный ответ.
+      </p>
+
+      <h3>Порядок действий, если группа подтвердилась</h3>
+      <p>
+        Сначала регистрация в системе «Честный Знак» и получение доступа к личному кабинету,
+        затем описание товара в каталоге и получение GTIN, после этого заказ кодов Data Matrix
+        и их нанесение на упаковку. Завершается всё подачей сведений о вводе товара в оборот —
+        до отгрузки на склад площадки, а не после. Нарушение этого порядка — самая частая причина
+        отказа в приёмке: коды нанесены, но сведения не поданы, и партия физически приехала,
+        а продавать её нельзя.
+      </p>
+      <p>
+        При импорте порядок другой: коды наносятся до выпуска товара в свободное обращение,
+        то есть за границей у поставщика или на таможенном складе. Переклеить коды на складе
+        маркетплейса не получится, поэтому схему нанесения нужно согласовать с поставщиком
+        на этапе контракта.
+      </p>
+
+      <h3>Остатки и переходные периоды</h3>
+      <p>
+        Для товара, закупленного до введения требования, обычно предусмотрен переходный период:
+        остатки маркируются по упрощённой схеме, без полного описания в каталоге. Срок такого
+        периода фиксируется в постановлении и различается по группам. Пропущенный срок означает,
+        что легально продать остаток уже нельзя — его придётся списывать или возвращать
+        поставщику, поэтому дату окончания переходного периода стоит поставить в календарь
+        сразу, как только группа появилась в перечне.
+      </p>
+
+      <h3>Где смотреть первоисточник</h3>
+      <p>
+        Актуальный перечень групп ведёт оператор системы, а требования по каждой группе
+        описаны в отдельном постановлении Правительства с приложением, где перечислены коды.
+        Проверять нужно действующую редакцию: перечни расширяются, а сроки для остатков и для
+        отдельных подгрупп переносятся. Наш справочник — навигация по группам, а не замена
+        нормативному документу.
+      </p>
+    </div>
+
+    <Faq items={faq} />
+    <RelatedService slug="markirovka-chestnyj-znak" />
+  </div>
+</BaseLayout>
+
+<script is:inline define:vars={{ catalog }}>
+  (function () {
+    const input = document.getElementById('q');
+    if (!input) return;
+
+    const verdict = document.getElementById('verdict');
+    const details = document.getElementById('details');
+
+    function normalize(value) {
+      return value.toLowerCase().replace(/\s+/g, ' ').trim();
+    }
+
+    function search(query) {
+      const digits = query.replace(/\D/g, '');
+      const text = normalize(query);
+      if (!digits && text.length < 3) return null;
+
+      if (digits.length >= 4) {
+        const group = catalog.groups.find(function (g) {
+          return g.codes.some(function (code) {
+            return digits.indexOf(code) === 0 || code.indexOf(digits.slice(0, 4)) === 0;
+          });
+        });
+        if (group) return { group: group, byCode: true, digits: digits };
+      }
+
+      const group = catalog.groups.find(function (g) {
+        return (
+          normalize(g.name).indexOf(text) > -1 ||
+          g.keywords.some(function (word) {
+            return text.indexOf(word) > -1 || word.indexOf(text) === 0;
+          })
+        );
+      });
+      return group ? { group: group, byCode: false, digits: digits } : null;
+    }
+
+    function render() {
+      const query = input.value.trim();
+      const params = new URLSearchParams();
+      if (query) params.set('q', query);
+      history.replaceState(null, '', location.pathname + (query ? '?' + params.toString() : ''));
+
+      if (!query) {
+        verdict.textContent = 'Введите код';
+        verdict.dataset.sign = '';
+        details.innerHTML = '<p class="calc__note">Например: 6403, 4011 или «шины».</p>';
+        return;
+      }
+
+      const found = search(query);
+      if (!found) {
+        verdict.textContent = 'Группа не найдена';
+        verdict.dataset.sign = '';
+        details.innerHTML =
+          '<p>В нашем справочнике такой группы нет. Это <strong>не значит</strong>, что маркировка не нужна: ' +
+          'перечни расширяются. Проверьте полный десятизначный код в действующей редакции постановления ' +
+          'или отправьте его нам.</p>';
+        return;
+      }
+
+      const group = found.group;
+      const required = group.status === 'required';
+      verdict.textContent = required ? 'Скорее всего, нужна' : 'Требуется сверка';
+      verdict.dataset.sign = required ? 'neg' : '';
+
+      details.innerHTML =
+        '<p><strong>' +
+        group.name +
+        '</strong></p>' +
+        '<p>' +
+        group.note +
+        '</p>' +
+        '<p class="calc__note">Коды группы: ' +
+        group.codes.join(', ') +
+        '. ' +
+        (found.digits.length >= 10
+          ? 'Вы ввели полный код — сверьте его с приложением к постановлению.'
+          : 'Ответ предварительный: нужен полный десятизначный код.') +
+        '</p>';
+    }
+
+    document.getElementById('copy-link').addEventListener('click', function () {
+      navigator.clipboard?.writeText(location.href);
+      this.textContent = 'Ссылка скопирована';
+      const button = this;
+      setTimeout(function () {
+        button.textContent = 'Скопировать ссылку на проверку';
+      }, 2000);
+    });
+
+    document.getElementById('send-calc').addEventListener('click', function () {
+      const query = input.value.trim();
+      const field = document.querySelector('form[data-lead-form] [name="comment"]');
+      if (field) {
+        field.value = 'Проверка маркировки по запросу: ' + (query || '—') + '. Ссылка: ' + location.href;
+      }
+      document.getElementById('lead').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      window.siteGoal?.('calc_use', { place: 'markirovka-send' });
+    });
+
+    input.addEventListener('input', render);
+
+    const initial = new URLSearchParams(location.search).get('q');
+    if (initial) input.value = initial;
+    render();
+  })();
+</script>

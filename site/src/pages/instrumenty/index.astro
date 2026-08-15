@@ -1,0 +1,84 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import CtaInline from '../../components/CtaInline.astro';
+import { abs } from '../../../site.config.mjs';
+
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/instrumenty/', label: 'Калькуляторы' },
+];
+
+const tools = [
+  {
+    href: '/instrumenty/kalkulyator-ozon/',
+    title: 'Калькулятор юнит-экономики Ozon',
+    desc: 'Прибыль с единицы с учётом комиссии, последней мили, логистики, возвратов, хранения и налога. Показывает точку безубыточности.',
+  },
+  {
+    href: '/instrumenty/komissii-fbo-fbs/',
+    title: 'Сравнение комиссий FBO и FBS',
+    desc: 'Считает три схемы работы на ваших объёмах и находит точку, с которой собственный склад начинает окупаться.',
+  },
+  {
+    href: '/instrumenty/nuzhna-li-markirovka/',
+    title: 'Проверка: нужна ли маркировка',
+    desc: 'Поиск товарной группы «Честного Знака» по коду ТН ВЭД или названию товара с пояснением, что делать дальше.',
+  },
+];
+
+const answer =
+  'Три бесплатных инструмента для расчётов продавца: калькулятор юнит-экономики Ozon, ' +
+  'сравнение схем FBO и FBS и проверка обязательной маркировки по коду ТН ВЭД. ' +
+  'Все расчёты выполняются в браузере, данные никуда не передаются, а ссылку с параметрами ' +
+  'можно скопировать и переслать коллеге — значения сохраняются в адресе страницы.';
+
+const list = {
+  '@type': 'ItemList',
+  '@id': `${abs('/instrumenty/')}#list`,
+  name: 'Калькуляторы для продавцов маркетплейсов',
+  itemListElement: tools.map((tool, i) => ({
+    '@type': 'ListItem',
+    position: i + 1,
+    name: tool.title,
+    url: abs(tool.href),
+  })),
+};
+---
+
+<BaseLayout
+  title="Калькуляторы для продавцов маркетплейсов"
+  description="Бесплатные инструменты: расчёт юнит-экономики Ozon, сравнение схем FBO и FBS по вашим объёмам и проверка обязательной маркировки «Честный Знак» по коду ТН ВЭД."
+  path="/instrumenty/"
+  crumbs={crumbs}
+  schema={[list]}
+>
+  <div class="wrap">
+    <Breadcrumbs items={crumbs} />
+    <h1>Калькуляторы</h1>
+    <DirectAnswer text={answer} />
+
+    <div class="grid">
+      {
+        tools.map((tool) => (
+          <a class="card" href={tool.href}>
+            <p class="card__title">{tool.title}</p>
+            <p class="card__desc">{tool.desc}</p>
+          </a>
+        ))
+      }
+    </div>
+
+    <CtaInline variant="soft" place="instrumenty-hub" />
+
+    <section class="section">
+      <h2>Почему расчёт идёт в браузере</h2>
+      <p class="lead">
+        Цены, себестоимость и объёмы — коммерческая информация. Наши калькуляторы не отправляют
+        введённые значения на сервер: весь расчёт выполняется на вашем устройстве. Данные уходят
+        к нам, только если вы сами нажмёте «Отправить расчёт» и заполните форму.
+      </p>
+    </section>
+  </div>
+</BaseLayout>

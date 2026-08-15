@@ -1,0 +1,96 @@
+---
+import '../styles/global.css';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+import JsonLd from '../components/JsonLd.astro';
+import Analytics from '../components/Analytics.astro';
+import { SITE, abs } from '../../site.config.mjs';
+import { organization, website, breadcrumbs as breadcrumbSchema, graph, ogPath } from '../lib/schema.mjs';
+
+interface Props {
+  title: string;
+  description: string;
+  /** Путь страницы со слешами на концах: canonical строится от него (§6.1) */
+  path?: string;
+  crumbs?: { href: string; label: string }[];
+  /** Дополнительные узлы JSON-LD конкретной страницы */
+  schema?: unknown[];
+  noindex?: boolean;
+  ogImage?: string;
+  ogType?: string;
+  publishedTime?: Date;
+  modifiedTime?: Date;
+  bodyClass?: string;
+}
+
+const {
+  title,
+  description,
+  path = Astro.url.pathname,
+  crumbs = [],
+  schema = [],
+  noindex = false,
+  ogImage,
+  ogType = 'website',
+  publishedTime,
+  modifiedTime,
+  bodyClass,
+} = Astro.props;
+
+const canonical = abs(path);
+const image = abs(ogImage ?? ogPath(path));
+
+const nodes = [
+  organization(),
+  website(),
+  crumbs.length > 1 ? breadcrumbSchema(crumbs) : null,
+  ...schema,
+];
+---
+
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    {noindex && <meta name="robots" content="noindex, follow" />}
+
+    <meta property="og:type" content={ogType} />
+    <meta property="og:site_name" content={SITE.brand} />
+    <meta property="og:locale" content="ru_RU" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={image} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    {publishedTime && <meta property="article:published_time" content={publishedTime.toISOString()} />}
+    {modifiedTime && <meta property="article:modified_time" content={modifiedTime.toISOString()} />}
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={image} />
+
+    <meta name="theme-color" content="#1a4fd6" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/images/logo.svg" />
+    <link rel="sitemap" href="/sitemap-index.xml" />
+    <link rel="alternate" type="text/plain" href="/llms.txt" title="Карта сайта для языковых моделей" />
+
+    <JsonLd data={graph(nodes)} />
+  </head>
+
+  <body class={bodyClass}>
+    <a class="skip-link" href="#main">К основному содержанию</a>
+    <Header />
+    <main id="main">
+      <slot />
+    </main>
+    <Footer />
+    <Analytics />
+  </body>
+</html>

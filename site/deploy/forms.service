@@ -1,0 +1,33 @@
+[Unit]
+Description=Приём заявок с форм сайта
+Documentation=file:///var/www/marketplace-site/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/marketplace-site
+EnvironmentFile=/etc/marketplace-site.env
+ExecStart=/usr/bin/node server/forms.mjs
+Restart=always
+RestartSec=5
+
+# Обработчик только читает переменные окружения и ходит в сеть —
+# всё остальное ему не нужно
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=192M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=site-forms
+
+[Install]
+WantedBy=multi-user.target

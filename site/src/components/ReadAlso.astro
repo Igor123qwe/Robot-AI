@@ -1,0 +1,27 @@
+---
+import { TYPE_LABELS } from '../lib/content';
+import type { Article } from '../lib/content';
+
+interface Props {
+  items: Article[];
+  title?: string;
+}
+const { items, title = 'Читайте также' } = Astro.props;
+---
+
+{
+  items.length > 0 && (
+    <section class="section" aria-labelledby="read-also">
+      <h2 id="read-also">{title}</h2>
+      <div class="grid">
+        {items.map((item) => (
+          <a class="card" href={`/baza/${item.data.slug}/`}>
+            <span class="badge badge--muted">{TYPE_LABELS[item.data.type] ?? 'Статья'}</span>
+            <p class="card__title">{item.data.h1 ?? item.data.title}</p>
+            <p class="card__desc">{item.data.description}</p>
+          </a>
+        ))}
+      </div>
+    </section>
+  )
+}

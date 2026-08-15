@@ -1,0 +1,179 @@
+---
+import { render } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import Faq from '../../components/Faq.astro';
+import LeadForm from '../../components/LeadForm.astro';
+import AuthorCard from '../../components/AuthorCard.astro';
+import { allServices, articlesByPillar, pillarTitle } from '../../lib/content';
+import { gitModified, collectionPath } from '../../lib/git-dates.mjs';
+import { service as serviceSchema, howTo, faqPage, person } from '../../lib/schema.mjs';
+import { money, formatDate } from '../../lib/text.mjs';
+import { SITE } from '../../../site.config.mjs';
+
+export async function getStaticPaths() {
+  const services = await allServices();
+  return services.map((entry) => ({ params: { slug: entry.data.slug }, props: { entry } }));
+}
+
+const { entry } = Astro.props;
+const { data } = entry;
+const { Content } = await render(entry as any);
+const url = `/uslugi/${data.slug}/`;
+const dateModified = gitModified(collectionPath('uslugi', entry.id), data.updated);
+
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/uslugi/', label: 'Услуги' },
+  { href: url, label: data.h1 ?? data.title },
+];
+
+const articles = data.pillar ? (await articlesByPillar(data.pillar)).slice(0, 6) : [];
+
+const schema = [
+  serviceSchema({ data, url }),
+  howTo({
+    name: `Как проходит работа: ${data.h1 ?? data.title}`,
+    description: data.offer,
+    steps: data.steps,
+    url,
+  }),
+  faqPage(data.faq, url),
+  person(),
+];
+---
+
+<BaseLayout
+  title={data.title}
+  description={data.description}
+  path={url}
+  crumbs={crumbs}
+  schema={schema}
+  noindex={data.noindex || data.demo}
+  modifiedTime={dateModified}
+>
+  <div class="read">
+    <Breadcrumbs items={crumbs} />
+
+    <header class="article-head">
+      <h1>{data.h1 ?? data.title}</h1>
+      <p class="lead">{data.offer}</p>
+      <p class="meta-line">
+        <span>от {money(data.price_from)} / {data.price_unit}</span>
+        <span class="meta-line__dot">
+          Актуально на <time datetime={dateModified.toISOString().slice(0, 10)}>{formatDate(dateModified)}</time>
+        </span>
+      </p>
+    </header>
+
+    {data.demo && <p class="demo-notice">Демонстрационный текст: замените описание услуги перед публикацией.</p>}
+
+    <DirectAnswer text={data.direct_answer} />
+
+    <section class="section" aria-labelledby="segments">
+      <h2 id="segments">Кому подходит</h2>
+      <div class="grid">
+        {
+          data.segments.map((segment) => (
+            <div class="card">
+              <p class="card__title">{segment.title}</p>
+              <p class="card__desc">{segment.text}</p>
+            </div>
+          ))
+        }
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="works">
+      <h2 id="works">Что входит в работу</h2>
+      <div class="table-scroll" role="region" tabindex="0" aria-label="Состав работ">
+        <table>
+          <thead>
+            <tr>
+              <th>Работа</th>
+              <th>Периодичность</th>
+              <th>Результат</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              data.works.map((work) => (
+                <tr>
+                  <td>{work.work}</td>
+                  <td>{work.period}</td>
+                  <td>{work.result ?? '—'}</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="article-body">
+      <Content />
+    </div>
+
+    <section class="section" aria-labelledby="how">
+      <h2 id="how">Как проходит работа</h2>
+      <ol class="steps">
+        {
+          data.steps.map((step, i) => (
+            <li id={`step-${i + 1}`}>
+              <b>{step.name}</b>
+              {step.text}
+            </li>
+          ))
+        }
+      </ol>
+    </section>
+
+    <section class="section" aria-labelledby="price">
+      <h2 id="price">Сколько стоит</h2>
+      <p>
+        Стоимость этой услуги начинается от <strong>{money(data.price_from)} / {data.price_unit}</strong>.
+        Итоговая цена зависит от числа SKU, количества площадок и того, нужна ли работа
+        с маркировкой и таможенными документами.
+      </p>
+      <p>
+        <a class="btn btn--primary" href="/tarify/" data-goal="cta_click" data-goal-place="service-price">
+          Смотреть тарифы и что в них входит
+        </a>
+      </p>
+    </section>
+
+    <Faq items={data.faq} />
+
+    <section class="section" aria-labelledby="lead">
+      <h2 id="lead">Обсудить задачу</h2>
+      <p class="muted">
+        Ответим в рабочее время. Если удобнее в мессенджере —
+        <a href={SITE.tgPersonal} rel="noopener" data-goal="cta_click" data-goal-place="service-tg">Telegram</a>.
+      </p>
+      <LeadForm source={`service:${data.slug}`} title="" submitLabel="Отправить заявку" />
+    </section>
+
+    <AuthorCard />
+
+    {
+      articles.length > 0 && (
+        <section class="section" aria-labelledby="articles">
+          <h2 id="articles">Разбираемся в теме: {pillarTitle(data.pillar)}</h2>
+          <ul class="article-list">
+            {articles.map((item) => (
+              <li>
+                <a href={`/baza/${item.data.slug}/`}>
+                  <span class="article-list__title">{item.data.h1 ?? item.data.title}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+          <p>
+            <a href={`/baza/${data.pillar}/`}>Весь раздел «{pillarTitle(data.pillar)}» →</a>
+          </p>
+        </section>
+      )
+    }
+  </div>
+</BaseLayout>

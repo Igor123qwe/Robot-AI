@@ -1,0 +1,69 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import CtaInline from '../../components/CtaInline.astro';
+import { allCases } from '../../lib/content';
+import { abs } from '../../../site.config.mjs';
+
+const cases = await allCases();
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/kejsy/', label: 'Кейсы' },
+];
+
+const answer =
+  'В кейсах разбираем конкретные задачи клиентов: что было на входе, что мы изменили и какой ' +
+  'получился результат в цифрах. Каждый кейс содержит исходные условия, перечень работ, сроки ' +
+  'и измеримые показатели — выручку, долю выкупа, стоимость логистики или сроки приёмки.';
+
+const list = {
+  '@type': 'ItemList',
+  '@id': `${abs('/kejsy/')}#list`,
+  name: 'Кейсы',
+  itemListElement: cases.map((c, i) => ({
+    '@type': 'ListItem',
+    position: i + 1,
+    name: c.data.h1 ?? c.data.title,
+    url: abs(`/kejsy/${c.data.slug}/`),
+  })),
+};
+---
+
+<BaseLayout
+  title="Кейсы: результаты работы с кабинетами селлеров"
+  description="Разборы проектов: что было на входе, какие работы провели и какой результат в цифрах — по ведению кабинетов, маркировке «Честный Знак» и классификации ТН ВЭД."
+  path="/kejsy/"
+  crumbs={crumbs}
+  schema={[list]}
+>
+  <div class="wrap">
+    <Breadcrumbs items={crumbs} />
+    <h1>Кейсы</h1>
+    <DirectAnswer text={answer} />
+
+    {
+      cases.length > 0 ? (
+        <div class="grid grid--2">
+          {cases.map((item) => (
+            <a class="card" href={`/kejsy/${item.data.slug}/`}>
+              <p class="card__title">{item.data.h1 ?? item.data.title}</p>
+              <p class="card__desc">{item.data.description}</p>
+              <span class="card__meta">
+                <span class="badge badge--muted">{item.data.niche}</span>
+                <span class="badge badge--muted">{item.data.period}</span>
+                {item.data.marketplace.map((m) => (
+                  <span class="badge badge--muted">{m}</span>
+                ))}
+              </span>
+            </a>
+          ))}
+        </div>
+      ) : (
+        <p class="muted">Кейсы готовятся к публикации.</p>
+      )
+    }
+
+    <CtaInline variant="direct" place="kejsy-hub" />
+  </div>
+</BaseLayout>

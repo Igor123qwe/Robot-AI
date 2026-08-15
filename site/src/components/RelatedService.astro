@@ -1,0 +1,35 @@
+---
+import { serviceBySlug, pillarService } from '../lib/content';
+import { money } from '../lib/text.mjs';
+
+interface Props {
+  /** Явно заданная услуга из frontmatter, иначе — услуга pillar-раздела */
+  slug?: string;
+  pillar?: string;
+}
+
+const { slug, pillar } = Astro.props;
+const service = (await serviceBySlug(slug)) ?? (await serviceBySlug(pillarService(pillar)));
+---
+
+{/*
+  Главный конверсионный элемент статьи (§6.3): информационный трафик
+  переводится в заявку карточкой релевантной услуги.
+*/}
+{
+  service && (
+    <a
+      class="service-card"
+      href={`/uslugi/${service.data.slug}/`}
+      data-goal="cta_click"
+      data-goal-place="related-service"
+    >
+      <span class="service-card__label">Мы делаем это за вас</span>
+      <span class="service-card__title">{service.data.h1 ?? service.data.title}</span>
+      <span>{service.data.offer}</span>
+      <span class="service-card__price">
+        от {money(service.data.price_from)} / {service.data.price_unit} · смотреть состав работ →
+      </span>
+    </a>
+  )
+}

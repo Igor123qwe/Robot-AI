@@ -1,0 +1,112 @@
+---
+import { SITE } from '../../site.config.mjs';
+const { metrikaId, ga4Id } = SITE;
+---
+
+{/* Счётчики грузятся только после load — вне критического пути рендеринга (§2) */}
+<script is:inline define:vars={{ metrikaId, ga4Id }}>
+  (function () {
+    var fired = {};
+
+    function goal(name, params) {
+      if (fired[name] && name !== 'cta_click' && name !== 'calc_use') return;
+      fired[name] = true;
+      if (window.ym && metrikaId) window.ym(metrikaId, 'reachGoal', name, params || {});
+      if (window.gtag) window.gtag('event', name, params || {});
+      window.dispatchEvent(new CustomEvent('site:goal', { detail: { name: name } }));
+    }
+    window.siteGoal = goal;
+
+    // UTM-метки живут в sessionStorage и уезжают вместе с заявкой (§8.4)
+    try {
+      var params = new URLSearchParams(location.search);
+      var utm = {};
+      params.forEach(function (value, key) {
+        if (key.indexOf('utm_') === 0 || key === 'yclid' || key === 'gclid') utm[key] = value;
+      });
+      if (Object.keys(utm).length) sessionStorage.setItem('utm', JSON.stringify(utm));
+      if (!sessionStorage.getItem('landing')) sessionStorage.setItem('landing', location.href);
+    } catch (e) {
+      /* приватный режим — просто без меток */
+    }
+
+    // Цель «прочитал 75% статьи»
+    var article = document.querySelector('.article-body');
+    if (article) {
+      var onScroll = function () {
+        var box = article.getBoundingClientRect();
+        var seen = window.innerHeight - box.top;
+        if (box.height > 0 && seen / box.height >= 0.75) {
+          goal('scroll_75');
+          window.removeEventListener('scroll', onScroll);
+        }
+      };
+      window.addEventListener('scroll', onScroll, { passive: true });
+    }
+
+    document.addEventListener('click', function (event) {
+      var link = event.target.closest('a, button');
+      if (!link) return;
+      if (link.dataset.goal) goal(link.dataset.goal, { place: link.dataset.goalPlace || '' });
+      var href = link.getAttribute('href') || '';
+      if (href.indexOf('t.me/') > -1) goal('tg_click', { href: href });
+    });
+
+    function load() {
+      if (metrikaId) {
+        (function (m, e, t, r, i, k, a) {
+          m[i] =
+            m[i] ||
+            function () {
+              (m[i].a = m[i].a || []).push(arguments);
+            };
+          m[i].l = 1 * new Date();
+          k = e.createElement(t);
+          a = e.getElementsByTagName(t)[0];
+          k.async = 1;
+          k.src = r;
+          a.parentNode.insertBefore(k, a);
+        })(window, document, 'script', 'https://mc.yandex.ru/metrika/tag.js', 'ym');
+        window.ym(metrikaId, 'init', {
+          clickmap: true,
+          trackLinks: true,
+          accurateTrackBounce: true,
+          webvisor: true,
+        });
+      }
+      if (ga4Id) {
+        var s = document.createElement('script');
+        s.async = true;
+        s.src = 'https://www.googletagmanager.com/gtag/js?id=' + ga4Id;
+        document.head.appendChild(s);
+        window.dataLayer = window.dataLayer || [];
+        window.gtag = function () {
+          window.dataLayer.push(arguments);
+        };
+        window.gtag('js', new Date());
+        window.gtag('config', ga4Id);
+      }
+    }
+
+    if (metrikaId || ga4Id) {
+      if (document.readyState === 'complete') setTimeout(load, 1200);
+      else window.addEventListener('load', function () { setTimeout(load, 1200); });
+    }
+  })();
+</script>
+
+{
+  metrikaId && (
+    <noscript>
+      <div>
+        <img
+          src={`https://mc.yandex.ru/watch/${metrikaId}`}
+          style="position:absolute; left:-9999px"
+          alt=""
+          width="1"
+          height="1"
+        />
+      </div>
+    </noscript>
+  )
+}

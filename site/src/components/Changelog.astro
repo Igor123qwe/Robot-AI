@@ -1,0 +1,27 @@
+---
+import { formatDate } from '../lib/text.mjs';
+
+interface Props {
+  items: { date: Date; text: string }[];
+}
+const { items } = Astro.props;
+const sorted = [...items].sort((a, b) => +b.date - +a.date);
+---
+
+{/* Датированный список правок для регуляторных тем (§5.5) */}
+{
+  sorted.length > 0 && (
+    <section class="callout callout--actual" aria-labelledby="changelog-title">
+      <p class="callout__title" id="changelog-title">Что изменилось</p>
+      <ul>
+        {sorted.map((item) => (
+          <li>
+            <time datetime={item.date.toISOString().slice(0, 10)}>{formatDate(item.date)}</time>
+            {' — '}
+            {item.text}
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}

@@ -1,0 +1,377 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import LeadForm from '../../components/LeadForm.astro';
+import Faq from '../../components/Faq.astro';
+import RelatedService from '../../components/RelatedService.astro';
+import rates from '../../data/commissions.json';
+import { softwareApplication, faqPage } from '../../lib/schema.mjs';
+import { formatDate } from '../../lib/text.mjs';
+
+const url = '/instrumenty/komissii-fbo-fbs/';
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/instrumenty/', label: 'Калькуляторы' },
+  { href: url, label: 'Сравнение комиссий FBO и FBS' },
+];
+
+const answer =
+  'Инструмент сравнивает три схемы работы — FBO, FBS и realFBS — по вашим цифрам: комиссия ' +
+  'категории, логистика, хранение и собственные расходы склада сводятся к стоимости одной ' +
+  'проданной единицы и к месячной сумме. Отдельно считается точка перехода: с какого объёма ' +
+  'продаж своя обработка перестаёт быть дороже склада площадки.';
+
+const faq = [
+  {
+    q: 'Чем FBO отличается от FBS по расходам?',
+    a: 'На FBO продавец платит за хранение на складе площадки и получает более высокую комиссию, но не несёт расходов на собственный склад и обработку. На FBS комиссия ниже, хранение своё, зато добавляются упаковка, сборка заказов и отвоз в сортировочный центр.',
+  },
+  {
+    q: 'Когда realFBS выгоднее остальных схем?',
+    a: 'При крупногабаритном товаре и локальных продажах, когда своя доставка дешевле тарифов площадки, а также при высокой цене товара, где комиссия важнее логистики. Минус — вы отвечаете за сроки доставки и сами разбираете инциденты.',
+  },
+  {
+    q: 'Что такое точка перехода?',
+    a: 'Объём продаж в месяц, при котором суммарные расходы двух схем равны. Ниже этого объёма постоянные расходы своего склада не окупаются, выше — начинает выигрывать схема с собственной обработкой.',
+  },
+  {
+    q: 'Учитывается ли скорость доставки и её влияние на продажи?',
+    a: 'Нет. Калькулятор считает только деньги. На практике FBO обычно даёт более быструю доставку и лучшую видимость в поиске, и этот эффект нужно оценивать отдельно на своих данных.',
+  },
+  {
+    q: 'Можно ли работать по двум схемам одновременно?',
+    a: 'Да, и на практике это самый частый сценарий: быстро оборачиваемые позиции держат на FBO, редкие и крупногабаритные — на FBS. Посчитайте каждую группу товаров отдельно.',
+  },
+  {
+    q: 'Почему в расчёте есть возвраты?',
+    a: 'Возврат оплачивается как отдельная отправка, а на FBS ещё и добавляет обработку. При доле возвратов выше 20% схема с собственной сборкой заказов дорожает заметно быстрее.',
+  },
+];
+---
+
+<BaseLayout
+  title="FBO или FBS: калькулятор сравнения схем"
+  description="Сравнивает FBO, FBS и realFBS по вашим объёмам: комиссия, логистика, хранение и свой склад — на единицу и в месяц. Показывает точку перехода между схемами."
+  path={url}
+  crumbs={crumbs}
+  schema={[
+    softwareApplication({
+      name: 'Калькулятор сравнения FBO и FBS',
+      description: 'Сравнение схем работы маркетплейса по расходам на единицу и в месяц',
+      url,
+    }),
+    faqPage(faq, url),
+  ]}
+>
+  <div class="read">
+    <Breadcrumbs items={crumbs} />
+    <h1>FBO или FBS: что дешевле на ваших объёмах</h1>
+    <DirectAnswer text={answer} />
+
+    {
+      !rates.verified && (
+        <p class="demo-notice">
+          Ставки требуют сверки с текущими тарифами площадки: <code>src/data/commissions.json</code>.
+        </p>
+      )
+    }
+
+    <div class="calc">
+      <form class="calc__inputs" id="calc" novalidate>
+        <div class="calc__row">
+          <div class="field">
+            <label for="price">Цена продажи, ₽</label>
+            <input id="price" name="price" type="number" min="1" value="2490" inputmode="decimal" />
+          </div>
+          <div class="field">
+            <label for="sales">Продаж в месяц, шт</label>
+            <input id="sales" name="sales" type="number" min="1" value="300" inputmode="numeric" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="cat">Категория</label>
+          <select id="cat" name="cat">
+            {rates.categories.map((c) => <option value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+
+        <div class="calc__row">
+          <div class="field">
+            <label for="vol">Объём упаковки, л</label>
+            <input id="vol" name="vol" type="number" min="0.1" step="0.1" value="2" inputmode="decimal" />
+          </div>
+          <div class="field">
+            <label for="ret">Доля возвратов, %</label>
+            <input id="ret" name="ret" type="number" min="0" max="90" value="15" inputmode="decimal" />
+          </div>
+        </div>
+
+        <div class="calc__row">
+          <div class="field">
+            <label for="days">Хранение, дней</label>
+            <input id="days" name="days" type="number" min="0" value="30" inputmode="numeric" />
+          </div>
+          <div class="field">
+            <label for="own">Обработка, ₽/шт</label>
+            <input id="own" name="own" type="number" min="0" value="45" inputmode="decimal" />
+            <span class="field__hint">упаковка, сборка, отвоз в СЦ</span>
+          </div>
+        </div>
+
+        <div class="calc__row">
+          <div class="field">
+            <label for="rent">Свой склад, ₽/мес</label>
+            <input id="rent" name="rent" type="number" min="0" value="60000" inputmode="numeric" />
+          </div>
+          <div class="field">
+            <label for="delivery">Доставка, ₽/шт</label>
+            <input id="delivery" name="delivery" type="number" min="0" value="290" inputmode="decimal" />
+            <span class="field__hint">для realFBS</span>
+          </div>
+        </div>
+
+        <button class="btn btn--ghost btn--sm" type="button" id="copy-link">Скопировать ссылку на расчёт</button>
+      </form>
+
+      <output class="calc__result" for="calc" id="result">
+        <span class="stat__label">Выгоднее по деньгам</span>
+        <p class="calc__headline" id="winner">—</p>
+        <ul class="calc__lines" id="lines"></ul>
+        <p class="calc__note" id="breakeven"></p>
+        <button
+          class="btn btn--primary btn--wide"
+          type="button"
+          id="send-calc"
+          data-goal="calc_use"
+          data-goal-place="fbo-fbs"
+        >
+          Отправить расчёт в Telegram
+        </button>
+      </output>
+    </div>
+
+    <p class="calc__note">Ставки обновлены {formatDate(rates.updated)}. Источник: {rates.source}.</p>
+
+    <section class="section" id="lead">
+      <h2>Помочь с переездом между схемами</h2>
+      <p class="muted">
+        Переезд с FBO на FBS ломает поставки, если делать его без подготовки. Расскажем,
+        в каком порядке переводить матрицу и что проверить до первой отгрузки.
+      </p>
+      <LeadForm source="calc:fbo-fbs" title="" submitLabel="Отправить расчёт" />
+    </section>
+
+    <div class="article-body">
+      <h2>Как устроено сравнение схем</h2>
+      <p>
+        Три схемы работы отличаются тем, кто хранит товар и кто везёт его покупателю. На FBO товар
+        лежит на складе площадки, она же собирает и доставляет заказ. На FBS товар хранится
+        у продавца: он собирает заказ и отвозит его в сортировочный центр, дальше работает
+        площадка. На realFBS продавец организует доставку полностью, включая последнюю милю.
+      </p>
+
+      <h3>Что входит в стоимость каждой схемы</h3>
+      <p>
+        Для FBO считаются комиссия категории, последняя миля, логистика по объёму и хранение
+        за литр в сутки. Для FBS к комиссии и логистике добавляются собственные расходы:
+        упаковка, сборка заказа и отвоз в сортировочный центр — вы вводите их одной ставкой
+        на единицу — плюс постоянная аренда склада за месяц. Для realFBS логистика площадки
+        и последняя миля обнуляются, вместо них подставляется стоимость собственной доставки.
+      </p>
+      <p>
+        Возвраты умножают все переменные расходы: на одну выкупленную единицу приходится больше
+        одной отправки. При доле возвратов 20% это 1,25 отправки, и на FBS каждая из них требует
+        ещё и повторной обработки заказа руками.
+      </p>
+
+      <h3>Точка перехода и почему она важнее разницы в комиссии</h3>
+      <p>
+        Аренда склада — постоянный расход: она одинакова при 50 и при 5000 продажах в месяц.
+        Поэтому сравнивать схемы по стоимости одной единицы можно только при фиксированном
+        объёме. Точка перехода считается делением постоянных расходов на разницу переменных
+        расходов между схемами. Ниже этого объёма собственный склад не окупается, выше —
+        начинает выигрывать.
+      </p>
+      <p>
+        Практический вывод, который обычно удивляет: продавцы переезжают на FBS ради экономии
+        на комиссии, но у них не хватает объёма, чтобы окупить аренду и людей. Если ваш объём
+        ниже точки перехода в полтора-два раза, экономия не наберётся даже при росте.
+      </p>
+
+      <h3>Что остаётся за пределами расчёта</h3>
+      <p>
+        Скорость доставки влияет на конверсию и позицию карточки в выдаче, но её эффект зависит
+        от категории и не считается в рублях напрямую. Не учитываются также штрафы за просрочку
+        отгрузки на FBS, сезонные пики хранения на FBO, стоимость денег, замороженных в товаре
+        на удалённом складе, и трудозатраты на управление собственным складом. Эти факторы обычно
+        смещают выбор в сторону FBO у небольших продавцов и в сторону FBS у тех, кто уже держит
+        склад под другие каналы продаж.
+      </p>
+    </div>
+
+    <Faq items={faq} />
+    <RelatedService slug="audit-kabineta" />
+  </div>
+</BaseLayout>
+
+<script is:inline define:vars={{ rates }}>
+  (function () {
+    const form = document.getElementById('calc');
+    if (!form) return;
+
+    const fields = ['price', 'sales', 'cat', 'vol', 'ret', 'days', 'own', 'rent', 'delivery'];
+    const el = {};
+    fields.forEach(function (id) {
+      el[id] = document.getElementById(id);
+    });
+
+    const rub = function (value) {
+      return Math.round(value).toLocaleString('ru-RU') + ' ₽';
+    };
+    const clamp = function (v, min, max) {
+      return Math.min(Math.max(v, min), max);
+    };
+
+    function category() {
+      return (
+        rates.categories.find(function (c) {
+          return c.id === el.cat.value;
+        }) || rates.categories[0]
+      );
+    }
+
+    function perUnit(scheme) {
+      const price = Number(el.price.value) || 0;
+      const volume = Math.max(1, Math.ceil(Number(el.vol.value) || 1));
+      const returnShare = clamp((Number(el.ret.value) || 0) / 100, 0, 0.9);
+      const shipments = 1 / (1 - returnShare);
+      const days = Number(el.days.value) || 0;
+
+      const commission = (price * category()[scheme]) / 100;
+      const lastMile =
+        scheme === 'rfbs'
+          ? 0
+          : clamp((price * rates.lastMile.percent) / 100, rates.lastMile.min, rates.lastMile.max);
+
+      const tariff = rates.logistics[scheme];
+      const logistics = tariff.max
+        ? Math.min(tariff.base + tariff.perLiter * (volume - 1), tariff.max) * shipments
+        : 0;
+      const returnsCost = rates.returns[scheme] * (shipments - 1);
+      const storage = scheme === 'fbo' ? rates.storagePerLiterPerDay * volume * days : 0;
+      const own = scheme === 'fbo' ? 0 : (Number(el.own.value) || 0) * shipments;
+      const delivery = scheme === 'rfbs' ? (Number(el.delivery.value) || 0) * shipments : 0;
+
+      return commission + lastMile + logistics + returnsCost + storage + own + delivery;
+    }
+
+    function render() {
+      const sales = Math.max(1, Number(el.sales.value) || 1);
+      const rent = Number(el.rent.value) || 0;
+
+      const schemes = [
+        { id: 'fbo', name: 'FBO', unit: perUnit('fbo'), fixed: 0 },
+        { id: 'fbs', name: 'FBS', unit: perUnit('fbs'), fixed: rent },
+        { id: 'rfbs', name: 'realFBS', unit: perUnit('rfbs'), fixed: rent },
+      ].map(function (s) {
+        s.month = s.unit * sales + s.fixed;
+        s.effective = s.month / sales;
+        return s;
+      });
+
+      const best = schemes.slice().sort(function (a, b) {
+        return a.month - b.month;
+      })[0];
+
+      document.getElementById('winner').textContent = best.name;
+      document.getElementById('winner').dataset.sign = 'pos';
+
+      document.getElementById('lines').innerHTML = schemes
+        .map(function (s) {
+          return (
+            '<li><span>' +
+            s.name +
+            ' — на единицу</span><b>' +
+            rub(s.effective) +
+            '</b></li>' +
+            '<li><span>' +
+            s.name +
+            ' — в месяц</span><b>' +
+            rub(s.month) +
+            '</b></li>'
+          );
+        })
+        .join('');
+
+      const fbo = schemes[0];
+      const fbs = schemes[1];
+      const gap = fbo.unit - fbs.unit;
+      const note = document.getElementById('breakeven');
+      if (gap > 0 && fbs.fixed > 0) {
+        const point = Math.ceil(fbs.fixed / gap);
+        note.textContent =
+          'Точка перехода на FBS: ' +
+          point.toLocaleString('ru-RU') +
+          ' продаж в месяц. Сейчас у вас ' +
+          sales.toLocaleString('ru-RU') +
+          ' — ' +
+          (sales >= point ? 'свой склад окупается.' : 'свой склад пока не окупается.');
+      } else {
+        note.textContent =
+          'При текущих ставках переменные расходы FBS не ниже FBO — постоянные расходы склада не окупятся ни при каком объёме.';
+      }
+
+      const params = new URLSearchParams();
+      fields.forEach(function (id) {
+        params.set(id, el[id].value);
+      });
+      history.replaceState(null, '', location.pathname + '?' + params.toString());
+    }
+
+    function readState() {
+      const params = new URLSearchParams(location.search);
+      fields.forEach(function (id) {
+        const value = params.get(id);
+        if (value !== null) el[id].value = value;
+      });
+    }
+
+    form.addEventListener('input', render);
+    form.addEventListener('change', render);
+
+    document.getElementById('copy-link').addEventListener('click', function () {
+      navigator.clipboard?.writeText(location.href);
+      this.textContent = 'Ссылка скопирована';
+      const button = this;
+      setTimeout(function () {
+        button.textContent = 'Скопировать ссылку на расчёт';
+      }, 2000);
+    });
+
+    document.getElementById('send-calc').addEventListener('click', function () {
+      const sales = Number(el.sales.value) || 0;
+      const summary =
+        'Сравнение схем: цена ' +
+        rub(Number(el.price.value) || 0) +
+        ', продаж в месяц ' +
+        sales +
+        ', объём ' +
+        el.vol.value +
+        ' л, возвраты ' +
+        el.ret.value +
+        '%. Ссылка: ' +
+        location.href;
+      const field = document.querySelector('form[data-lead-form] [name="comment"]');
+      if (field) {
+        field.value = summary;
+      }
+      document.getElementById('lead').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      window.siteGoal?.('calc_use', { place: 'fbo-fbs-send' });
+    });
+
+    readState();
+    render();
+  })();
+</script>

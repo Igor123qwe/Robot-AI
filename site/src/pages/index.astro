@@ -1,0 +1,222 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import DirectAnswer from '../components/DirectAnswer.astro';
+import LeadForm from '../components/LeadForm.astro';
+import Faq from '../components/Faq.astro';
+import { allServices, allPillars, allArticles, allCases } from '../lib/content';
+import { money } from '../lib/text.mjs';
+import { faqPage } from '../lib/schema.mjs';
+import { SITE, AUTHOR } from '../../site.config.mjs';
+
+const services = (await allServices()).slice(0, 6);
+const pillars = await allPillars();
+const articles = (await allArticles()).slice(0, 6);
+const cases = (await allCases()).slice(0, 2);
+
+const answer =
+  `${SITE.brand} ведёт кабинеты продавцов на Ozon, Wildberries и Яндекс Маркете и закрывает ` +
+  'регуляторные задачи: маркировку «Честный Знак», подбор кодов ТН ВЭД и документы для импорта. ' +
+  'Работаем с ' + SITE.since + ' года, за это время обработали более ' + SITE.skuProcessed + ' SKU. ' +
+  'Ведение одной площадки стоит от 45 000 ₽ в месяц, разовый аудит кабинета — 25 000 ₽.';
+
+const faq = [
+  {
+    q: 'Чем вы отличаетесь от агентства полного цикла?',
+    a: 'Мы не берём на себя рекламу и съёмку. Наша зона — операционка кабинета и регуляторика: карточки, поставки, остатки, маркировка, коды ТН ВЭД и документы. Это те участки, где ошибка стоит денег сразу, а не через месяц.',
+  },
+  {
+    q: 'Вы работаете с самозанятыми и ИП без сотрудников?',
+    a: 'Да. Ограничение только по объёму: если у вас меньше 20 SKU и одна площадка, обычно выгоднее разовый аудит и обучение, а не ежемесячное ведение. Скажем об этом на первом созвоне.',
+  },
+  {
+    q: 'Что нужно передать для старта?',
+    a: 'Доступ в кабинет с правами менеджера, актуальную товарную матрицу с кодами ТН ВЭД, если товар импортный, и контакт человека, который принимает решения по ценам.',
+  },
+  {
+    q: 'Как быстро вы отвечаете на инцидент?',
+    a: 'В рабочее время — от 2 до 8 часов в зависимости от тарифа. Блокировка карточек и остановка отгрузок разбираются в первую очередь, независимо от тарифа.',
+  },
+  {
+    q: 'Даёте ли вы гарантию роста продаж?',
+    a: 'Нет, и никто честный не даст: продажи зависят от товара, цены и спроса. Мы отвечаем за операционные показатели — отсутствие простоев карточек, соблюдение сроков маркировки и корректность документов.',
+  },
+  {
+    q: 'Можно ли начать с одной задачи?',
+    a: 'Да. Частый вход — маркировка одной товарной группы или подбор кодов ТН ВЭД под ближайшую поставку. Дальше решаете сами, нужно ли передавать ведение целиком.',
+  },
+];
+---
+
+<BaseLayout
+  title="Сопровождение маркетплейсов: ведение, маркировка, ТН ВЭД"
+  description="Ведём кабинеты Ozon, Wildberries и Яндекс Маркета, оформляем маркировку «Честный Знак» и подбираем коды ТН ВЭД. Ведение — от 45 000 ₽ в месяц, аудит — 25 000 ₽."
+  path="/"
+  crumbs={[{ href: '/', label: 'Главная' }]}
+  schema={[faqPage(faq, '/')]}
+>
+  <section class="hero">
+    <div class="wrap">
+      <h1>Ведение кабинетов маркетплейсов и регуляторика без сюрпризов</h1>
+      <p class="hero__lead">
+        Берём на себя карточки, поставки и остатки на Ozon, Wildberries и Яндекс Маркете —
+        и отвечаем за маркировку «Честный Знак», коды ТН ВЭД и документы для импорта.
+      </p>
+      <div class="hero__actions">
+        <a class="btn btn--primary" href="/kontakty/" data-goal="cta_click" data-goal-place="hero">
+          Бесплатный разбор кабинета
+        </a>
+        <a class="btn btn--ghost" href="/tarify/">Тарифы и цены</a>
+      </div>
+    </div>
+  </section>
+
+  <div class="wrap">
+    <DirectAnswer text={answer} />
+
+    <div class="stats">
+      <div class="stat">
+        <span class="stat__value">{SITE.skuProcessed}</span>
+        <span class="stat__label">SKU в работе с {SITE.since} года</span>
+      </div>
+      <div class="stat">
+        <span class="stat__value">3</span>
+        <span class="stat__label">площадки: Ozon, WB, Яндекс Маркет</span>
+      </div>
+      <div class="stat">
+        <span class="stat__value">от {money(45000)}</span>
+        <span class="stat__label">ведение одной площадки в месяц</span>
+      </div>
+      <div class="stat">
+        <span class="stat__value">2 часа</span>
+        <span class="stat__label">реакция на блокировку карточек</span>
+      </div>
+    </div>
+
+    <section class="section">
+      <div class="section__head">
+        <h2>Услуги</h2>
+        <a href="/uslugi/">Все услуги →</a>
+      </div>
+      <div class="grid grid--2">
+        {
+          services.map((service) => (
+            <a class="card" href={`/uslugi/${service.data.slug}/`}>
+              <p class="card__title">{service.data.h1 ?? service.data.title}</p>
+              <p class="card__desc">{service.data.offer}</p>
+              <span class="card__meta">
+                <span class="badge">от {money(service.data.price_from)} / {service.data.price_unit}</span>
+              </span>
+            </a>
+          ))
+        }
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section__head">
+        <h2>База знаний</h2>
+        <a href="/baza/">Все разделы →</a>
+      </div>
+      <p class="lead">
+        Пишем о том, с чем работаем каждый день: сроки маркировки, коды, ошибки API,
+        комиссии и расчёты. Без пересказа справки площадок.
+      </p>
+      <div class="grid">
+        {
+          pillars.map((pillar) => (
+            <a class="card" href={`/baza/${pillar.data.slug}/`}>
+              <p class="card__title">{pillar.data.h1 ?? pillar.data.title}</p>
+              <p class="card__desc">{pillar.data.description}</p>
+            </a>
+          ))
+        }
+      </div>
+      {
+        articles.length > 0 && (
+          <ul class="article-list" style="margin-top:1.5rem">
+            {articles.map((item) => (
+              <li>
+                <a href={`/baza/${item.data.slug}/`}>
+                  <span class="article-list__title">{item.data.h1 ?? item.data.title}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        )
+      }
+    </section>
+
+    <section class="section">
+      <div class="section__head">
+        <h2>Калькуляторы</h2>
+        <a href="/instrumenty/">Все инструменты →</a>
+      </div>
+      <div class="grid">
+        <a class="card" href="/instrumenty/kalkulyator-ozon/">
+          <p class="card__title">Юнит-экономика Ozon</p>
+          <p class="card__desc">Считает прибыль с единицы с учётом комиссии, логистики, эквайринга и возвратов.</p>
+        </a>
+        <a class="card" href="/instrumenty/komissii-fbo-fbs/">
+          <p class="card__title">FBO или FBS</p>
+          <p class="card__desc">Сравнивает две схемы по вашим объёмам и показывает точку, где выгоднее переехать.</p>
+        </a>
+        <a class="card" href="/instrumenty/nuzhna-li-markirovka/">
+          <p class="card__title">Нужна ли маркировка</p>
+          <p class="card__desc">Проверка товарной группы по коду ТН ВЭД и по названию категории.</p>
+        </a>
+      </div>
+    </section>
+
+    {
+      cases.length > 0 && (
+        <section class="section">
+          <div class="section__head">
+            <h2>Кейсы</h2>
+            <a href="/kejsy/">Все кейсы →</a>
+          </div>
+          <div class="grid grid--2">
+            {cases.map((item) => (
+              <a class="card" href={`/kejsy/${item.data.slug}/`}>
+                <p class="card__title">{item.data.h1 ?? item.data.title}</p>
+                <p class="card__desc">{item.data.description}</p>
+                <span class="card__meta">
+                  <span class="badge badge--muted">{item.data.niche}</span>
+                  <span class="badge badge--muted">{item.data.period}</span>
+                </span>
+              </a>
+            ))}
+          </div>
+        </section>
+      )
+    }
+
+    <section class="section">
+      <div class="section__head"><h2>Кто ведёт работу</h2></div>
+      <div class="card">
+        <p class="card__title">{AUTHOR.name} — {AUTHOR.jobTitle}</p>
+        <p>{AUTHOR.description}</p>
+        <p><a href="/o-nas/">Подробнее об экспертизе и подходе →</a></p>
+      </div>
+    </section>
+
+    <Faq items={faq} />
+
+    <section class="section" aria-labelledby="home-lead">
+      <h2 id="home-lead">Бесплатный разбор кабинета</h2>
+      <div class="grid grid--2">
+        <LeadForm source="home" title="" submitLabel="Получить разбор" />
+        <div class="card">
+          <p class="card__title">Что вы получите</p>
+          <ul>
+            <li>Список ошибок в кабинете с приоритетами — что чинить в первую очередь.</li>
+            <li>Проверку, подпадает ли ваш товар под обязательную маркировку.</li>
+            <li>Оценку: справитесь сами, нужен разовый аудит или ежемесячное ведение.</li>
+          </ul>
+          <p class="muted">
+            Без презентаций и «пакетных предложений». Если помощь не нужна — так и скажем.
+          </p>
+        </div>
+      </div>
+    </section>
+  </div>
+</BaseLayout>

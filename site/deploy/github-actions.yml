@@ -1,0 +1,77 @@
+# Автодеплой по push в main (§2 ТЗ).
+#
+# Файл лежит в deploy/ как шаблон и по умолчанию не активен: скопируйте его
+# в .github/workflows/site.yml, когда заведёте секреты репозитория, — иначе
+# сборка будет падать на отсутствующих ключах.
+#
+# Секреты: SSH_HOST, SSH_USER, SSH_KEY, SITE_PATH, INDEXNOW_KEY, PUBLIC_DOMAIN.
+
+name: Сборка и деплой сайта
+
+on:
+  push:
+    branches: [main]
+    paths: ['site/**']
+  workflow_dispatch:
+
+concurrency:
+  group: site-deploy
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # dateModified берётся из git-истории файла (§5.5),
+          # поэтому нужна полная история, а не последний коммит
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - run: npm ci
+
+      - name: Валидация контента и сборка
+        env:
+          PUBLIC_DOMAIN: ${{ secrets.PUBLIC_DOMAIN }}
+          PUBLIC_BRAND: ${{ vars.PUBLIC_BRAND }}
+          PUBLIC_INN: ${{ secrets.PUBLIC_INN }}
+          PUBLIC_METRIKA_ID: ${{ vars.PUBLIC_METRIKA_ID }}
+          INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+        run: npm run build
+
+      - name: Выкладка на сервер
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+          rsync -az --delete --checksum \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            dist/ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ secrets.SITE_PATH }}/dist/"
+
+      # Состояние прошлого пинга нужно, чтобы отправлять только изменившиеся
+      # адреса: без кэша каждый деплой уведомлял бы обо всём сайте сразу
+      - name: Кэш состояния IndexNow
+        uses: actions/cache@v4
+        with:
+          path: site/.indexnow-state.json
+          key: indexnow-${{ github.sha }}
+          restore-keys: indexnow-
+
+      - name: Пинг IndexNow
+        env:
+          INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+          PUBLIC_DOMAIN: ${{ secrets.PUBLIC_DOMAIN }}
+        run: npm run indexnow

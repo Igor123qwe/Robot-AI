@@ -1,0 +1,68 @@
+---
+import { SITE, PILLARS } from '../../site.config.mjs';
+import { allServices } from '../lib/content';
+
+const services = (await allServices()).slice(0, 7);
+const year = new Date().getFullYear();
+---
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="site-footer__cols">
+      <div>
+        <h2>Услуги</h2>
+        <ul>
+          {
+            services.map((s) => (
+              <li>
+                <a href={`/uslugi/${s.data.slug}/`}>{s.data.h1 ?? s.data.title}</a>
+              </li>
+            ))
+          }
+          <li><a href="/tarify/">Тарифы и цены</a></li>
+        </ul>
+      </div>
+
+      <div>
+        <h2>База знаний</h2>
+        <ul>
+          {
+            PILLARS.map((p) => (
+              <li>
+                <a href={`/baza/${p.slug}/`}>{p.title}</a>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+
+      <div>
+        <h2>Инструменты</h2>
+        <ul>
+          <li><a href="/instrumenty/kalkulyator-ozon/">Калькулятор юнит-экономики Ozon</a></li>
+          <li><a href="/instrumenty/komissii-fbo-fbs/">Сравнение комиссий FBO и FBS</a></li>
+          <li><a href="/instrumenty/nuzhna-li-markirovka/">Нужна ли маркировка по коду</a></li>
+          <li><a href="/kejsy/">Кейсы</a></li>
+        </ul>
+      </div>
+
+      <div>
+        <h2>Контакты</h2>
+        <ul>
+          <li><a href={SITE.tgPersonal} rel="noopener">Telegram для заявок</a></li>
+          <li><a href={`mailto:${SITE.email}`}>{SITE.email}</a></li>
+          {SITE.phone && <li><a href={`tel:${SITE.phone.replace(/[^+\d]/g, '')}`}>{SITE.phone}</a></li>}
+          <li><a href="/o-nas/">Об экспертизе</a></li>
+          <li><a href="/kontakty/">Форма заявки</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="site-footer__legal">
+      <span>© {year} {SITE.brand}</span>
+      <span>ИНН {SITE.inn}</span>
+      <a href="/politika-konfidencialnosti/">Политика обработки персональных данных</a>
+      <a href="/llms.txt">llms.txt</a>
+    </div>
+  </div>
+</footer>

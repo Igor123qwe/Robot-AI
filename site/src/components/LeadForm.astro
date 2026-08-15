@@ -1,0 +1,162 @@
+---
+import { SITE } from '../../site.config.mjs';
+
+interface Props {
+  /** Что за форма — уходит в заявку и в цель Метрики */
+  source: string;
+  title?: string;
+  text?: string;
+  submitLabel?: string;
+  /** compact — без выбора маркетплейса, для форм внутри статей */
+  compact?: boolean;
+  onDark?: boolean;
+  id?: string;
+}
+
+const {
+  source,
+  title = 'Оставьте заявку',
+  text,
+  submitLabel = 'Отправить заявку',
+  compact = false,
+  onDark = false,
+  id = `lead-${Math.random().toString(36).slice(2, 8)}`,
+} = Astro.props;
+---
+
+<form
+  class={`form${onDark ? ' form--on-dark' : ''}`}
+  id={id}
+  data-lead-form
+  data-source={source}
+  method="post"
+  action={SITE.formEndpoint}
+  novalidate
+>
+  {title && <p class="cta__title">{title}</p>}
+  {text && <p class="muted">{text}</p>}
+
+  <div class="field">
+    <label for={`${id}-name`}>Как к вам обращаться</label>
+    <input id={`${id}-name`} name="name" type="text" autocomplete="name" required maxlength="80" />
+  </div>
+
+  <div class="field">
+    <label for={`${id}-contact`}>Telegram или телефон</label>
+    <input
+      id={`${id}-contact`}
+      name="contact"
+      type="text"
+      inputmode="text"
+      autocomplete="tel"
+      placeholder="@nickname или +7 900 000-00-00"
+      required
+      maxlength="80"
+    />
+  </div>
+
+  {
+    !compact && (
+      <div class="field">
+        <label for={`${id}-marketplace`}>Где продаёте</label>
+        <select id={`${id}-marketplace`} name="marketplace">
+          <option value="ozon">Ozon</option>
+          <option value="wildberries">Wildberries</option>
+          <option value="yandex-market">Яндекс Маркет</option>
+          <option value="several">Несколько площадок</option>
+          <option value="none">Пока не продаю</option>
+        </select>
+      </div>
+    )
+  }
+
+  <div class="field">
+    <label for={`${id}-comment`}>Коротко о задаче</label>
+    <textarea id={`${id}-comment`} name="comment" maxlength="1200" rows="3"></textarea>
+  </div>
+
+  {/* Honeypot: боты заполняют всё подряд, люди этого поля не видят (§8.4) */}
+  <div class="hp" aria-hidden="true">
+    <label for={`${id}-company`}>Компания</label>
+    <input id={`${id}-company`} name="company" type="text" tabindex="-1" autocomplete="off" />
+  </div>
+
+  <button class="btn btn--primary btn--wide" type="submit" data-goal="form_submit" data-goal-place={source}>
+    {submitLabel}
+  </button>
+
+  <p class="form__status" role="status" aria-live="polite" data-state=""></p>
+  <p class="form__consent">
+    Нажимая кнопку, вы соглашаетесь с
+    <a href="/politika-konfidencialnosti/">политикой обработки персональных данных</a>.
+  </p>
+</form>
+
+<script>
+  // Один обработчик на все формы страницы. Отправка без перезагрузки,
+  // явное состояние успеха и ошибки (§8.4).
+  const forms = document.querySelectorAll<HTMLFormElement>('form[data-lead-form]');
+
+  forms.forEach((form) => {
+    const status = form.querySelector<HTMLElement>('.form__status');
+    const button = form.querySelector<HTMLButtonElement>('button[type="submit"]');
+
+    const say = (message: string, state: '' | 'ok' | 'error') => {
+      if (!status) return;
+      status.textContent = message;
+      status.dataset.state = state;
+    };
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const data = new FormData(form);
+
+      if (String(data.get('company') ?? '').trim() !== '') return; // honeypot
+      const name = String(data.get('name') ?? '').trim();
+      const contact = String(data.get('contact') ?? '').trim();
+      if (name.length < 2) return say('Напишите, как к вам обращаться.', 'error');
+      if (contact.length < 4) return say('Оставьте Telegram или телефон для ответа.', 'error');
+
+      let utm = {};
+      let landing = '';
+      try {
+        utm = JSON.parse(sessionStorage.getItem('utm') ?? '{}');
+        landing = sessionStorage.getItem('landing') ?? '';
+      } catch {
+        /* нет доступа к sessionStorage — отправляем без меток */
+      }
+
+      const payload = {
+        name,
+        contact,
+        marketplace: String(data.get('marketplace') ?? ''),
+        comment: String(data.get('comment') ?? '').trim(),
+        source: form.dataset.source ?? 'unknown',
+        page: location.href,
+        title: document.title,
+        referrer: document.referrer,
+        landing,
+        utm,
+      };
+
+      button?.setAttribute('disabled', 'true');
+      say('Отправляем…', '');
+
+      try {
+        const response = await fetch(form.action, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) throw new Error(String(response.status));
+        form.reset();
+        say('Заявка отправлена. Ответим в течение рабочего дня.', 'ok');
+        (window as any).siteGoal?.('form_submit', { place: payload.source });
+      } catch {
+        say('Не получилось отправить. Напишите в Telegram — ответим быстрее.', 'error');
+      } finally {
+        button?.removeAttribute('disabled');
+      }
+    });
+  });
+</script>

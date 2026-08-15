@@ -1,0 +1,38 @@
+---
+interface Props {
+  data: {
+    title: string;
+    description?: string;
+    measured?: string;
+    rows?: { label: string; value: string }[];
+  };
+}
+const { data } = Astro.props;
+---
+
+{/*
+  Собственные данные (§5.3) — то, чего нет в других источниках, и потому
+  самый цитируемый блок. Размечается как Dataset на уровне страницы.
+*/}
+<aside class="callout callout--own-data" data-own-data="true">
+  <p class="callout__title">Наши данные</p>
+  <p><strong>{data.title}</strong></p>
+  {data.description && <p>{data.description}</p>}
+  {
+    data.rows && data.rows.length > 0 && (
+      <div class="table-scroll" role="region" tabindex="0" aria-label="Собственные измерения">
+        <table>
+          <tbody>
+            {data.rows.map((row) => (
+              <tr>
+                <th scope="row">{row.label}</th>
+                <td>{row.value}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+  {data.measured && <p class="calc__note">Методика: {data.measured}</p>}
+</aside>

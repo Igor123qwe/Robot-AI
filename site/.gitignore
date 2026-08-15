@@ -1,0 +1,20 @@
+# Зависимости и сборка
+node_modules/
+dist/
+.astro/
+.output/
+
+# Секреты
+.env
+.env.local
+.env.production
+
+# Кэш генерации OG-картинок: восстанавливается при следующей сборке
+.og-cache/
+
+# Состояние пинга IndexNow: локальное, у каждой машины своё
+.indexnow-state.json
+
+# Мусор
+.DS_Store
+*.log

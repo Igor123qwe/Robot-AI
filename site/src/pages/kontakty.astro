@@ -1,0 +1,105 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Breadcrumbs from '../components/Breadcrumbs.astro';
+import DirectAnswer from '../components/DirectAnswer.astro';
+import LeadForm from '../components/LeadForm.astro';
+import { SITE } from '../../site.config.mjs';
+import { ORG_ID } from '../lib/schema.mjs';
+import { abs } from '../../site.config.mjs';
+
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/kontakty/', label: 'Контакты' },
+];
+
+const answer =
+  `Связаться с ${SITE.brand} можно тремя способами: заявкой с этой страницы, сообщением ` +
+  `в Telegram или письмом на ${SITE.email}. Заявки разбираем в рабочие дни с 10:00 до 19:00 ` +
+  'по московскому времени, отвечаем в течение рабочего дня. Для разбора кабинета доступы ' +
+  'не нужны — достаточно описать задачу.';
+
+const contactPage = {
+  '@type': 'ContactPage',
+  '@id': `${abs('/kontakty/')}#contact`,
+  url: abs('/kontakty/'),
+  name: `Контакты — ${SITE.brand}`,
+  about: { '@id': ORG_ID },
+  mainEntity: {
+    '@id': ORG_ID,
+    contactPoint: {
+      '@type': 'ContactPoint',
+      contactType: 'customer service',
+      email: SITE.email,
+      availableLanguage: 'ru',
+      areaServed: 'RU',
+      hoursAvailable: {
+        '@type': 'OpeningHoursSpecification',
+        dayOfWeek: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
+        opens: '10:00',
+        closes: '19:00',
+      },
+    },
+  },
+};
+---
+
+<BaseLayout
+  title="Контакты: заявка на разбор кабинета"
+  description="Телеграм, почта и форма заявки для обсуждения ведения кабинетов, маркировки «Честный Знак» и подбора кодов ТН ВЭД. Отвечаем в течение рабочего дня."
+  path="/kontakty/"
+  crumbs={crumbs}
+  schema={[contactPage]}
+>
+  <div class="read">
+    <Breadcrumbs items={crumbs} />
+    <h1>Контакты</h1>
+    <DirectAnswer text={answer} />
+
+    <div class="grid grid--2">
+      <LeadForm source="kontakty" title="Заявка" submitLabel="Отправить заявку" />
+
+      <div class="card">
+        <p class="card__title">Быстрые каналы</p>
+        <ul>
+          <li>
+            Telegram: <a href={SITE.tgPersonal} rel="noopener" data-goal="cta_click" data-goal-place="kontakty-tg">
+              написать напрямую
+            </a>
+          </li>
+          <li>Почта: <a href={`mailto:${SITE.email}`}>{SITE.email}</a></li>
+          {SITE.phone && <li>Телефон: <a href={`tel:${SITE.phone.replace(/[^+\d]/g, '')}`}>{SITE.phone}</a></li>}
+          <li>Бот с чек-листом: <a href={SITE.tgBot} rel="noopener">получить файл</a></li>
+        </ul>
+
+        <p class="card__title" style="margin-top:1rem">Реквизиты</p>
+        <p class="muted">
+          {SITE.legalName}<br />
+          ИНН {SITE.inn}<br />
+          {SITE.city}, работаем по всей России удалённо
+        </p>
+
+        <p class="card__title" style="margin-top:1rem">Время ответа</p>
+        <p class="muted">
+          Заявки — в течение рабочего дня. Инциденты действующих клиентов (блокировка карточек,
+          остановка отгрузок) — от 2 часов в зависимости от тарифа.
+        </p>
+      </div>
+    </div>
+  </div>
+</BaseLayout>
+
+<script>
+  // Тариф из ссылки /kontakty/?plan=rost подставляем в комментарий,
+  // чтобы заявка приходила с контекстом, а человек не писал это руками
+  const plan = new URLSearchParams(location.search).get('plan');
+  if (plan) {
+    const names: Record<string, string> = {
+      start: 'Старт',
+      rost: 'Рост',
+      'polnyj-cikl': 'Полный цикл',
+      audit: 'Аудит кабинета',
+    };
+    const field = document.querySelector<HTMLTextAreaElement>('form[data-lead-form] [name="comment"]');
+    if (field && !field.value) field.value = `Интересует тариф «${names[plan] ?? plan}».`;
+  }
+</script>

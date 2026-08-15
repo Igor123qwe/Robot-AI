@@ -1,0 +1,57 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { PILLARS, SITE } from '../../site.config.mjs';
+---
+
+<BaseLayout
+  title="Страница не найдена — 404"
+  description="Такой страницы на сайте нет. Воспользуйтесь поиском по сайту или перейдите в один из разделов базы знаний: маркировка, ТН ВЭД, Ozon, Wildberries, Яндекс Маркет."
+  path="/404/"
+  noindex={true}
+>
+  <div class="read">
+    <h1>Страница не найдена</h1>
+    <p class="lead">
+      Возможно, материал переехал или в адресе опечатка. Попробуйте найти нужное поиском
+      или начните с раздела базы знаний.
+    </p>
+
+    <form class="form" id="search-404" role="search">
+      <div class="field">
+        <label for="q">Поиск по сайту</label>
+        <input id="q" name="q" type="search" placeholder="например: маркировка одежды" required />
+      </div>
+      <button class="btn btn--primary" type="submit">Искать</button>
+      <p class="field__hint">Поиск открывается в Яндексе с ограничением по нашему домену.</p>
+    </form>
+
+    <h2>Разделы базы знаний</h2>
+    <div class="grid">
+      {
+        PILLARS.map((pillar) => (
+          <a class="card" href={`/baza/${pillar.slug}/`}>
+            <p class="card__title">{pillar.title}</p>
+          </a>
+        ))
+      }
+    </div>
+
+    <h2>Частые направления</h2>
+    <ul>
+      <li><a href="/uslugi/">Услуги и состав работ</a></li>
+      <li><a href="/tarify/">Тарифы и цены</a></li>
+      <li><a href="/instrumenty/">Калькуляторы</a></li>
+      <li><a href="/kontakty/">Контакты</a></li>
+    </ul>
+  </div>
+</BaseLayout>
+
+<script is:inline define:vars={{ domain: SITE.domain }}>
+  document.getElementById('search-404')?.addEventListener('submit', function (event) {
+    event.preventDefault();
+    var input = document.getElementById('q');
+    var query = (input && input.value ? input.value : '').trim();
+    if (!query) return;
+    location.href = 'https://yandex.ru/search/?text=' + encodeURIComponent('site:' + domain + ' ' + query);
+  });
+</script>

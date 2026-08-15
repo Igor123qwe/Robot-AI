@@ -1,0 +1,102 @@
+---
+import { render } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import Takeaways from '../../components/Takeaways.astro';
+import AuthorCard from '../../components/AuthorCard.astro';
+import RelatedService from '../../components/RelatedService.astro';
+import CtaInline from '../../components/CtaInline.astro';
+import { allCases } from '../../lib/content';
+import { gitModified, collectionPath } from '../../lib/git-dates.mjs';
+import { article as articleSchema, review as reviewSchema, person } from '../../lib/schema.mjs';
+import { formatDate } from '../../lib/text.mjs';
+
+export async function getStaticPaths() {
+  const cases = await allCases();
+  return cases.map((entry) => ({ params: { slug: entry.data.slug }, props: { entry } }));
+}
+
+const { entry } = Astro.props;
+const { data } = entry;
+const { Content } = await render(entry as any);
+const url = `/kejsy/${data.slug}/`;
+const dateModified = gitModified(collectionPath('kejsy', entry.id), data.updated);
+
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/kejsy/', label: 'Кейсы' },
+  { href: url, label: data.h1 ?? data.title },
+];
+
+const schema = [
+  articleSchema({ data: { ...data, pillar: data.pillar }, url, dateModified, type: 'article' }),
+  person(),
+  ...(data.review ? [reviewSchema({ author: data.review.author, text: data.review.text, url })] : []),
+];
+---
+
+<BaseLayout
+  title={data.title}
+  description={data.description}
+  path={url}
+  crumbs={crumbs}
+  schema={schema}
+  noindex={data.noindex || data.demo}
+  ogType="article"
+  publishedTime={data.published}
+  modifiedTime={dateModified}
+>
+  <div class="read">
+    <Breadcrumbs items={crumbs} />
+
+    <header class="article-head">
+      <span class="badge">Кейс</span>
+      <h1>{data.h1 ?? data.title}</h1>
+      <p class="meta-line">
+        <span>{data.niche}</span>
+        <span class="meta-line__dot">{data.marketplace.join(', ')}</span>
+        <span class="meta-line__dot">{data.period}</span>
+        <span class="meta-line__dot">
+          <time datetime={dateModified.toISOString().slice(0, 10)}>{formatDate(dateModified)}</time>
+        </span>
+      </p>
+    </header>
+
+    {data.demo && <p class="demo-notice">Демонстрационный кейс: замените на реальный проект с согласия клиента.</p>}
+
+    <DirectAnswer text={data.direct_answer} />
+
+    <div class="results">
+      {
+        data.results.map((result) => (
+          <div class="result">
+            <span class="result__value">{result.value}</span>
+            <span class="result__label">{result.label}</span>
+          </div>
+        ))
+      }
+    </div>
+
+    <div class="article-body">
+      <Content />
+    </div>
+
+    {
+      data.review && (
+        <blockquote class="quote">
+          <p>{data.review.text}</p>
+          <footer>
+            {data.review.author}
+            {data.review.role ? `, ${data.review.role}` : ''}
+          </footer>
+        </blockquote>
+      )
+    }
+
+    <Takeaways items={data.takeaways} />
+    <AuthorCard />
+    <RelatedService slug={data.related_service} pillar={data.pillar} />
+    <CtaInline variant="direct" place="case-end" />
+  </div>
+</BaseLayout>

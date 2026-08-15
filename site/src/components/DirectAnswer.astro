@@ -1,0 +1,15 @@
+---
+interface Props {
+  text: string;
+}
+const { text } = Astro.props;
+---
+
+{/*
+  Блок прямого ответа (§5.3) — первый элемент после H1. Атрибут data-answer
+  оставлен намеренно: по нему блок находят и парсеры, и наши же проверки
+  сборки.
+*/}
+<div class="direct-answer" data-answer="true">
+  <p>{text}</p>
+</div>

@@ -1,0 +1,163 @@
+---
+import BaseLayout from './BaseLayout.astro';
+import Breadcrumbs from '../components/Breadcrumbs.astro';
+import DirectAnswer from '../components/DirectAnswer.astro';
+import Toc from '../components/Toc.astro';
+import Takeaways from '../components/Takeaways.astro';
+import Faq from '../components/Faq.astro';
+import AuthorCard from '../components/AuthorCard.astro';
+import RelatedService from '../components/RelatedService.astro';
+import ReadAlso from '../components/ReadAlso.astro';
+import Changelog from '../components/Changelog.astro';
+import OwnData from '../components/OwnData.astro';
+import { AUTHOR } from '../../site.config.mjs';
+import { article as articleSchema, howTo, faqPage, dataset, person, graph } from '../lib/schema.mjs';
+import { formatDate, readingTime, countWords, stripMd } from '../lib/text.mjs';
+import { pillarTitle, TYPE_LABELS } from '../lib/content';
+import type { Article } from '../lib/content';
+
+interface Props {
+  entry: Article;
+  headings: { depth: number; slug: string; text: string }[];
+  dateModified: Date;
+  related: Article[];
+}
+
+const { entry, headings, dateModified, related } = Astro.props;
+const { data } = entry;
+const url = `/baza/${data.slug}/`;
+const body = stripMd(entry.body ?? '');
+
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/baza/', label: 'База знаний' },
+  { href: `/baza/${data.pillar}/`, label: pillarTitle(data.pillar) },
+  { href: url, label: data.h1 ?? data.title },
+];
+
+// Тип статьи определяет набор разметки (§5.4): инструкция получает HowTo,
+// разбор ошибки — FAQPage, справочник — Dataset.
+const schema: unknown[] = [
+  articleSchema({
+    data,
+    url,
+    dateModified,
+    wordCount: countWords(body),
+    type: data.type,
+  }),
+  person(),
+];
+
+if (data.type === 'howto' && data.steps.length > 0) {
+  schema.push(howTo({ name: data.h1 ?? data.title, description: data.direct_answer, steps: data.steps, url }));
+}
+if (data.faq.length > 0) {
+  schema.push(faqPage(data.faq, url));
+}
+if (data.type === 'reference' || data.has_own_data) {
+  schema.push(
+    dataset({
+      name: data.own_data?.title ?? (data.h1 ?? data.title),
+      description: data.own_data?.description ?? data.description,
+      url,
+      keywords: data.entities,
+      dateModified,
+      measured: data.own_data?.measured,
+    }),
+  );
+}
+---
+
+<BaseLayout
+  title={data.title}
+  description={data.description}
+  path={url}
+  crumbs={crumbs}
+  schema={schema}
+  noindex={data.noindex || data.demo}
+  ogType="article"
+  publishedTime={data.published}
+  modifiedTime={dateModified}
+>
+  <div class="article-layout">
+    <article class="article-main">
+      <Breadcrumbs items={crumbs} />
+
+      <header class="article-head">
+        <span class="badge">{TYPE_LABELS[data.type] ?? 'Статья'}</span>
+        <h1>{data.h1 ?? data.title}</h1>
+        <p class="meta-line">
+          <span>{AUTHOR.name}</span>
+          <span class="meta-line__dot">
+            Актуально на <time datetime={dateModified.toISOString().slice(0, 10)}>{formatDate(dateModified)}</time>
+          </span>
+          <span class="meta-line__dot">{readingTime(body)} чтения</span>
+          {data.has_own_data && <span class="badge badge--own">Собственные данные</span>}
+        </p>
+      </header>
+
+      {
+        data.demo && (
+          <p class="demo-notice">
+            Демонстрационный текст. Показывает работу шаблона — перед публикацией
+            замените содержимое и проверьте все факты по первоисточникам.
+          </p>
+        )
+      }
+
+      <DirectAnswer text={data.direct_answer} />
+
+      <Toc headings={headings} variant="inline" />
+
+      {data.changelog.length > 0 && <Changelog items={data.changelog} />}
+      {data.own_data && <OwnData data={data.own_data} />}
+
+      <div class="article-body">
+        <slot />
+      </div>
+
+      <Takeaways items={data.takeaways} />
+
+      {data.faq.length > 0 && <Faq items={data.faq} />}
+
+      {
+        data.sources.length > 0 && (
+          <section class="sources">
+            <h2>Источники</h2>
+            <ol>
+              {data.sources.map((source) => (
+                <li>
+                  {source.url ? (
+                    <a href={source.url} rel="nofollow noopener" target="_blank">
+                      {source.title}
+                    </a>
+                  ) : (
+                    source.title
+                  )}
+                </li>
+              ))}
+            </ol>
+          </section>
+        )
+      }
+
+      <AuthorCard />
+
+      <RelatedService slug={data.related_service} pillar={data.pillar} />
+
+      {
+        data.tags.length > 0 && (
+          <ul class="tag-list" aria-label="Теги">
+            {data.tags.map((tag) => (
+              <li class="badge badge--muted">{tag}</li>
+            ))}
+          </ul>
+        )
+      }
+
+      <ReadAlso items={related} />
+    </article>
+
+    <Toc headings={headings} variant="aside" />
+  </div>
+</BaseLayout>

@@ -1,0 +1,83 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Breadcrumbs from '../../components/Breadcrumbs.astro';
+import DirectAnswer from '../../components/DirectAnswer.astro';
+import CtaInline from '../../components/CtaInline.astro';
+import { allPillars, allArticles, TYPE_LABELS } from '../../lib/content';
+import { formatDate } from '../../lib/text.mjs';
+import { SITE } from '../../../site.config.mjs';
+
+const pillars = await allPillars();
+const articles = await allArticles();
+const byPillar = new Map(pillars.map((p) => [p.data.slug, articles.filter((a) => a.data.pillar === p.data.slug)]));
+const latest = articles.slice(0, 8);
+
+const crumbs = [
+  { href: '/', label: 'Главная' },
+  { href: '/baza/', label: 'База знаний' },
+];
+
+const answer =
+  'База знаний собрана из практики ведения кабинетов на Ozon, Wildberries и Яндекс Маркете. ' +
+  'Материалы разбиты на шесть разделов: маркировка «Честный Знак», классификация ТН ВЭД и импорт, ' +
+  'работа с каждой из трёх площадок и юнит-экономика. Внутри раздела статьи разделены по типам: ' +
+  'инструкции, справочники кодов, разборы ошибок и сравнения схем работы.';
+---
+
+<BaseLayout
+  title="База знаний по маркетплейсам и маркировке"
+  description="Инструкции, справочники кодов, разборы ошибок и сравнения по маркировке «Честный Знак», ТН ВЭД, Ozon и Wildberries — из практики ведения кабинетов селлеров."
+  path="/baza/"
+  crumbs={crumbs}
+>
+  <div class="wrap">
+    <Breadcrumbs items={crumbs} />
+    <h1>База знаний</h1>
+    <DirectAnswer text={answer} />
+
+    <section class="section">
+      <div class="section__head"><h2>Разделы</h2></div>
+      <div class="grid">
+        {
+          pillars.map((pillar) => (
+            <a class="card" href={`/baza/${pillar.data.slug}/`}>
+              <p class="card__title">{pillar.data.h1 ?? pillar.data.title}</p>
+              <p class="card__desc">{pillar.data.description}</p>
+              <span class="card__meta">
+                <span class="badge badge--muted">
+                  {byPillar.get(pillar.data.slug)?.length ?? 0} материалов
+                </span>
+              </span>
+            </a>
+          ))
+        }
+      </div>
+    </section>
+
+    <CtaInline variant="soft" place="baza-hub" />
+
+    <section class="section">
+      <div class="section__head"><h2>Свежие материалы</h2></div>
+      <ul class="article-list">
+        {
+          latest.map((item) => (
+            <li>
+              <a href={`/baza/${item.data.slug}/`}>
+                <span class="article-list__title">{item.data.h1 ?? item.data.title}</span>
+                <span class="badge badge--muted">{TYPE_LABELS[item.data.type]}</span>
+                <span class="article-list__type">{formatDate(item.data.updated)}</span>
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+      {articles.length === 0 && <p class="muted">Первые материалы появятся в ближайшие дни.</p>}
+    </section>
+
+    <p class="muted">
+      Материалы в машиночитаемом виде: <a href="/llms.txt">llms.txt</a> и
+      <a href="/llms-full.txt">llms-full.txt</a>. Вопрос не по теме статьи — напишите
+      <a href={SITE.tgPersonal} rel="noopener">в Telegram</a>.
+    </p>
+  </div>
+</BaseLayout>

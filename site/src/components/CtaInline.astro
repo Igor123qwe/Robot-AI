@@ -1,0 +1,49 @@
+---
+import { SITE } from '../../site.config.mjs';
+
+interface Props {
+  /** soft — лид-магнит после второго H2, direct — заявка в конце статьи (§6.3) */
+  variant: 'soft' | 'direct';
+  title?: string;
+  text?: string;
+  href?: string;
+  label?: string;
+  place?: string;
+}
+
+const {
+  variant,
+  place = variant,
+  title = variant === 'soft'
+    ? 'Чек-лист: что проверить перед первой отгрузкой'
+    : 'Разберём вашу ситуацию за 20 минут',
+  text = variant === 'soft'
+    ? 'Список из 24 пунктов по маркировке, карточкам и документам — бот пришлёт файл сразу, без регистрации.'
+    : 'Посмотрим кабинет, найдём ошибки, которые стоят денег, и скажем, что чинить в первую очередь. Бесплатно и без обязательств.',
+  href = variant === 'soft' ? SITE.tgBot : '/kontakty/',
+  label = variant === 'soft' ? 'Забрать чек-лист' : 'Обсудить задачу',
+} = Astro.props;
+---
+
+<aside class={`cta cta--${variant}`}>
+  <p class="cta__title">{title}</p>
+  <p>{text}</p>
+  <div class="cta__actions">
+    <a
+      class={variant === 'soft' ? 'btn btn--primary' : 'btn btn--ghost'}
+      href={href}
+      rel={href.startsWith('http') ? 'noopener' : undefined}
+      data-goal="cta_click"
+      data-goal-place={place}
+    >
+      {label}
+    </a>
+    {
+      variant === 'direct' && (
+        <a class="btn btn--ghost" href={SITE.tgPersonal} rel="noopener" data-goal="cta_click" data-goal-place={`${place}-tg`}>
+          Написать в Telegram
+        </a>
+      )
+    }
+  </div>
+</aside>
