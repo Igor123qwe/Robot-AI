@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import threading
 import time
 
 log = logging.getLogger(__name__)
@@ -200,6 +201,9 @@ class Remote:
         self.url = url
         self._make_local = make_local
         self._local = None
+        # Один на оба входа в подъём модели: фоновый прогрев и отступление
+        # из голосового цикла живут в разных потоках.
+        self._lock = threading.Lock()
         self._down_until = 0.0
         self._said_local = False
         # Уверенность последнего распознавания — см. Recognizer.confidence.
@@ -292,15 +296,30 @@ class Remote:
         сотни мегабайт против минуты немоты в единственный важный момент.
         Кому память дороже — ROBOT_WARM_LOCAL_STT=0.
         """
-        if self._local is not None:
-            return
         try:
-            self._local = self._make_local()
+            self._поднять()
             log.info("своё распознавание прогрето и ждёт на случай, "
                      "если ПК замолчит")
         except Exception as e:                  # noqa: BLE001
             log.warning("не смог прогреть своё распознавание (%s) — "
                         "подниму, когда понадобится", e)
+
+    def _поднять(self) -> None:
+        """Поднять своё распознавание ровно один раз, кто бы ни попросил.
+
+        Просят из двух мест и из разных потоков: фоновый прогрев при старте и
+        отступление в голосовом цикле, когда ПК не ответил за две секунды.
+        Без замка оба проверяли пустоту поля, оба видели пустоту и оба
+        принимались грузить — в память вставали ДВЕ модели Whisper разом,
+        сотни мегабайт на роботе, где их и так впритык. Окно узкое: ПК должен
+        замолчать ровно пока идёт прогрев. Но это и есть тот самый случай,
+        ради которого прогрев затевался.
+        """
+        if self._local is not None:
+            return
+        with self._lock:
+            if self._local is None:
+                self._local = self._make_local()
 
     def _fallback(self, wav_bytes: bytes) -> str:
         # Узнавание по голосу живёт на ПК. Раз мы сюда попали, ПК недоступен —
@@ -309,7 +328,7 @@ class Remote:
         self.speaker, self.similarity, self.tag = "", 0.0, ""
         if self._local is None:
             log.info("поднимаю распознавание на роботе — это займёт время")
-            self._local = self._make_local()
+            self._поднять()
         if not self._said_local:
             self._said_local = True
             log.warning("распознаю сам: медленнее и хуже, чем на ПК")

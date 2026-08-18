@@ -870,6 +870,15 @@ def test_auto_meeting() -> None:
     from robot_voice.app import Meeting
     from robot_voice.people import People
 
+    # Отложенное имя не должно сгорать, когда отправить его нечем. Метка
+    # пуста в трёх штатных случаях (мгновенный приказ, спящий ПК, выключенное
+    # узнавание голоса) — и раньше поле обнулялось ДО проверки, то есть имя
+    # пропадало навсегда, а человеку заводилось второе дело.
+    отложено = Meeting("")
+    отложено._name_next = "Игорь"
+    отложено.confirm("")
+    check("имя пережило фразу без метки", отложено._name_next, "Игорь")
+
     store = Path(tempfile.mkdtemp()) / "люди.json"
     people = People(store)
 

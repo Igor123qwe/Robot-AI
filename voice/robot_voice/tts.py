@@ -618,6 +618,8 @@ class Speaker:
         self.on_volume: Callable[[float], None] | None = None
         # Последняя сказанная фраза — для «повтори».
         self.last_said = ""
+        # Сколько раз реплику обрывали на полуслове. Растёт в hush.
+        self.hushes = 0
 
         self.piper = _find_piper()
         if self.piper is None:
@@ -659,6 +661,11 @@ class Speaker:
         бросить очередь.
         """
         self.last_said = ""
+        # Считаем прерывания, а не просто чистим поле: тот, кто вёл ход,
+        # допишет last_said в своём finally уже ПОСЛЕ нас и затрёт очистку.
+        # По разнице счётчика он поймёт, что реплику оборвали, и не станет
+        # выдавать за сказанное то, чего человек не дослушал.
+        self.hushes += 1
         if self.audio_out != "browser":
             return
         # Сначала своё: реплика синтезируется по предложениям, и часть их ещё
@@ -704,7 +711,7 @@ class Speaker:
         чтобы не прозвонить в закрытую вкладку и не забыть об этом.
         """
         log.info("робот: %s", text)
-        self.last_said = text
+        было_прерываний = self.hushes
         speech = self.stream(loud=loud)
         if speech is None:
             # Синтеза нет вовсе (не встал piper): повторять нечего и незачем,
@@ -712,7 +719,14 @@ class Speaker:
             return 1
         for sentence in split_sentences(text):
             speech.feed(sentence)
-        return speech.close()
+        слышали = speech.close()
+        # Запоминаем как сказанное только то, что прозвучало целиком. Раньше
+        # поле заполнялось ДО синтеза: не встал piper — «повтори» повторяло
+        # фразу, которой человек не слышал, а оборванная «замолчи» репликой
+        # возвращалась из небытия.
+        if self.hushes == было_прерываний:
+            self.last_said = text
+        return слышали
 
 
 def _find_piper() -> str | None:
