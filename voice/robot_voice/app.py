@@ -31,6 +31,7 @@ from .people import People
 from .ros import Ros
 from .state import State
 from .stt import Recognizer, Remote
+from .tof import Дальномер
 from .tools import CUTOFF_VOLT, Timers, build_tools
 from .tts import SentenceBuffer, Speaker
 from .wake import clean_token, make_spotter, sounds_like_wake
@@ -639,6 +640,13 @@ def main() -> None:
     # облако. Отсутствие камеры выяснится в момент вопроса и будет сказано
     # вслух — это честнее, чем прятать инструмент и заставлять модель
     # выкручиваться словами.
+    # Дальномер поднимаем до сборки инструментов: он нужен и сторожу
+    # движения, и ответу «свободен ли путь». Нет его — робот живёт как жил,
+    # просто без рефлексов.
+    дальномер = Дальномер()
+    if not дальномер.запустить():
+        дальномер = None
+
     глаза = Глаза(pc_url=cfg.pc_url, api_key=cfg.api_key,
                   api_base=cfg.api_base, model=cfg.model,
                   vision_model=cfg.vision_model)
@@ -646,7 +654,7 @@ def main() -> None:
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
-                        player=player, eyes=глаза)
+                        player=player, eyes=глаза, tof=дальномер)
     brain = Brain(cfg, tools)
     # Счётчик отдаём после сборки мозга: глаза нужны инструментам, а мозг —
     # инструментам же, и по кругу это не собрать.

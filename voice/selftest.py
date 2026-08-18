@@ -3340,7 +3340,14 @@ def test_rules_reach_tools() -> None:
                         # Глаза тоже: без них не собирается look_around, и
                         # проверка объявила бы правило про взгляд битым.
                         eyes=types.SimpleNamespace(
-                            посмотреть=lambda вопрос="": "вижу стол"))
+                            посмотреть=lambda вопрос="": "вижу стол"),
+                        # И дальномер: без него не собирается path_check, к
+                        # которому теперь идёт правило про дорогу.
+                        tof=types.SimpleNamespace(
+                            беда="",
+                            взгляд=lambda: types.SimpleNamespace(
+                                свежий=True, впереди=2.0, слева=2.0, справа=2.0,
+                                ехать_можно=lambda: (True, ""))))
     есть = {t.name for t in tools}
 
     исходник = (Path(__file__).resolve().parent / "robot_voice" / "intents.py"
@@ -4240,16 +4247,16 @@ def test_look_rule() -> None:
     m = intents.parse("посмотри")
     check("«посмотри» — без вопроса", (m.tool, m.args), ("look_around", {}))
 
-    # Про дорогу спрашиваем прямо, иначе модель перечислит цвет стен, а
-    # робот всё так же не будет знать, ехать ему или нет.
+    # Про дорогу спрашиваем ДАЛЬНОМЕР, а не камеру. Он отвечает за сотую
+    # долю секунды против двух у облака и видит в темноте — для «можно ли
+    # ехать» нужно расстояние, а не рассуждение о предметах.
     for фраза in ("что впереди", "свободен ли путь", "путь свободен",
                   "свободна ли дорога", "чисто ли впереди",
                   "можно ли проехать", "не врежешься", "есть ли препятствия",
                   "куда можно поехать"):
         m = intents.parse(фраза)
-        check(f"«{фраза}» — к камере", m.tool if m else None, "look_around")
-        check(f"«{фраза}» — спрашиваем про путь",
-              "путь" in (m.args or {}).get("question", ""), True)
+        check(f"«{фраза}» — к дальномеру", m.tool if m else None, "path_check")
+        check(f"«{фраза}» — без лишних доводов", m.args, {})
 
     # А это к камере не относится, и описывать комнату в ответ — глупость.
     for фраза in ("ты видишь в этом смысл", "что ты думаешь",
@@ -4428,6 +4435,68 @@ def test_fusion() -> None:
     неизвестно = np.zeros((высота, ширина))
     check("пустая карта не обещает свободы",
           fusion.занятость(неизвестно), [0.0] * 8)
+
+
+
+def test_tof_guard() -> None:
+    """Дальномер запрещает ехать в стену — и только вперёд.
+
+    Решение принимается на месте, без модели: она отвечает секундами, а робот
+    на 0.3 м/с за секунду проезжает треть метра. Спрашивать у неё разрешения
+    значит узнавать ответ после события.
+    """
+    section("дальномер держит колёса")
+    import types
+
+    store = Path(tempfile.mkdtemp())
+    поехали: list[tuple] = []
+    ros = types.SimpleNamespace(
+        voltage=12.4, moving=False, connected=True, busy=False,
+        drive=lambda *a, **k: поехали.append((a, k)),
+        stop_motion=lambda: None)
+
+    def робот(впереди: float, свежий: bool = True):
+        взгляд = types.SimpleNamespace(
+            свежий=свежий, впереди=впереди, слева=впереди, справа=впереди,
+            ехать_можно=lambda: ((True, "") if свежий and (впереди <= 0 or впереди >= 0.3)
+                                 else (False, "дальномер молчит" if not свежий
+                                       else f"впереди препятствие в {впереди:.1f} м")))
+        тоф = types.SimpleNamespace(беда="", взгляд=lambda: взгляд)
+        return {t.name: t for t in build_tools(
+            ros, Timers(announce=lambda text, **kw: None,
+                        store=store / f"t{впереди}{свежий}.json"),
+            addressed=lambda: True, tof=тоф)}
+
+    # Стена в двадцати сантиметрах — вперёд нельзя.
+    инстр = робот(0.20)
+    поехали.clear()
+    ответ = инстр["drive"]({"direction": "вперёд", "distance": 1.0})
+    check("вперёд в стену не поехали", поехали, [])
+    check("и сказано, почему", "препятстви" in ответ.lower(), True)
+
+    # А назад — можно: датчик смотрит вперёд и про то, что сзади, не знает.
+    # Запрещать по незнанию значит выдавать его за опасность.
+    поехали.clear()
+    инстр["drive"]({"direction": "назад", "distance": 0.5})
+    check("назад пускаем", len(поехали), 1)
+
+    # Два метра — езжай.
+    инстр = робот(2.0)
+    поехали.clear()
+    инстр["drive"]({"direction": "вперёд", "distance": 1.0})
+    check("по свободному пути едем", len(поехали), 1)
+
+    # Молчащий датчик движение НЕ запрещает: робот жил без него и должен
+    # жить дальше. Отказ по отсутствию данных остановил бы его навсегда,
+    # стоит выдернуть провод.
+    инстр = робот(2.0, свежий=False)
+    поехали.clear()
+    инстр["drive"]({"direction": "вперёд", "distance": 1.0})
+    check("молчащий датчик не запирает робота", len(поехали), 1)
+
+    # Зато на вопрос отвечает честно, а не выдумывает простор.
+    check("и про молчание говорит вслух",
+          "молчит" in инстр["path_check"]({}).lower(), True)
 
 
 def test_camera() -> None:
@@ -4759,7 +4828,7 @@ def main() -> int:
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,
                  test_history,
-                 test_names, test_dialogue, test_camera, test_vision, test_camera_stream, test_shell_ascii, test_tof, test_fusion,
+                 test_names, test_dialogue, test_camera, test_vision, test_camera_stream, test_shell_ascii, test_tof, test_fusion, test_tof_guard,
                  test_look_rule):
         test()
         print("   ...")
