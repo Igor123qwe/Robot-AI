@@ -4272,6 +4272,81 @@ def test_vision() -> None:
         srv.shutdown()
 
 
+def test_camera_stream() -> None:
+    """Поток камеры забираем так же, как его забирает браузер.
+
+    Проверка появилась не от хорошей жизни: границу кадров сначала назвали
+    русским словом, и весь ответ падал при отправке — заголовки HTTP
+    кодируются в latin-1. Снимок при этом работал, статус говорил «ok», а
+    видео в пульте просто не шло, и по журналу было не понять почему.
+
+    Ловится это только тем, что кто-то действительно сходит по адресу:
+    ограда «наружу — только латиница» смотрит на словари заголовков в
+    robot_voice и такую запись не видит в принципе.
+    """
+    section("поток камеры")
+    import http.client
+    import http.server
+    import threading as thr
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "web"))
+    import server as сервер
+
+    КАДР = b"\xff\xd8jpeg\xff\xd9"
+
+    class ПоддельнаяКамера:
+        устройство = "/dev/поддельная"
+        беда = ""
+
+        def доступна(self):
+            return True
+
+        def кадр(self, ждать=0.0):
+            return КАДР
+
+        def поток(self, пределом=60.0):
+            for _ in range(3):
+                yield КАДР
+
+        def закрыть(self):
+            pass
+
+    было_камера, было_источник = сервер.КАМЕРА, сервер.CAMERA_SOURCE
+    сервер.КАМЕРА, сервер.CAMERA_SOURCE = ПоддельнаяКамера(), "usb"
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), сервер.Handler)
+    thr.Thread(target=srv.serve_forever, daemon=True).start()
+    порт = srv.server_address[1]
+    try:
+        связь = http.client.HTTPConnection("127.0.0.1", порт, timeout=10)
+        связь.request("GET", "/camera")
+        try:
+            ответ = связь.getresponse()
+        except Exception as e:            # noqa: BLE001
+            # Обрыв без ответа — это и есть та самая поломка: заголовок не
+            # закодировался, и сервер уронил соединение. Говорим словами, а
+            # не трассировкой, иначе в отчёте не видно, что именно сломалось.
+            check("поток не оборвался на заголовках", f"обрыв: {e}", "поток идёт")
+            return
+        тип = ответ.getheader("Content-Type") or ""
+        check("поток отдан", ответ.status, 200)
+        check("тип — многочастный", тип.startswith("multipart/x-mixed-replace"), True)
+        # Главное: заголовок обязан пережить кодирование в latin-1.
+        check("заголовок уходит без обрыва", тип.isascii(), True)
+        тело = ответ.read()
+        check("кадр доехал целым", КАДР in тело, True)
+        связь.close()
+
+        # Снимок — тем же путём, но одним куском.
+        связь = http.client.HTTPConnection("127.0.0.1", порт, timeout=10)
+        связь.request("GET", "/camera/snapshot")
+        ответ = связь.getresponse()
+        check("снимок отдан", (ответ.status, ответ.read()), (200, КАДР))
+        связь.close()
+    finally:
+        srv.shutdown()
+        сервер.КАМЕРА, сервер.CAMERA_SOURCE = было_камера, было_источник
+
+
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
@@ -4292,7 +4367,7 @@ def main() -> int:
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,
                  test_history,
-                 test_names, test_dialogue, test_camera, test_vision):
+                 test_names, test_dialogue, test_camera, test_vision, test_camera_stream):
         test()
         print("   ...")
     if FAILED:
