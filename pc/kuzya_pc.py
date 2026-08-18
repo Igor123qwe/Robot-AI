@@ -59,6 +59,12 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 OLLAMA = "http://127.0.0.1:11434"
 
+# Кем робот смотрит. Разговорная qwen3:4b зрения не имеет вовсе, и делить их
+# правильно: смотрит робот изредка, а разговаривает постоянно — держать ради
+# редкого взгляда тяжёлую зрячую модель в разговоре значит платить памятью и
+# скоростью за каждую фразу.
+VISION_MODEL = os.environ.get("ROBOT_PC_VISION_MODEL", "qwen2.5vl:7b")
+
 # Сколько ждём Ollama. Генерация идёт секунды, а вот дозвон должен быть
 # быстрым: если Ollama не запущена, робот должен узнать об этом сразу и уйти
 # в облако, а не молчать полминуты.
@@ -1550,6 +1556,8 @@ class Handler(BaseHTTPRequestHandler):
             self._messages()
         elif path.endswith("/stt"):
             self._stt()
+        elif path.endswith("/see"):
+            self._see()
         elif path.endswith("/tts"):
             self._tts()
         elif path.endswith("/voice/confirm"):
@@ -1668,6 +1676,58 @@ class Handler(BaseHTTPRequestHandler):
             кто, похожесть, метка = who.identify(wav, _wav_seconds(wav))
         self._json(200, {"text": text, "sure": sure, "кто": кто,
                          "похожесть": round(похожесть, 3), "метка": метка})
+
+    def _see(self) -> None:
+        """Разглядеть кадр с камеры робота.
+
+        Отдельная ручка, а не картинка внутри обычного разговора, — и это не
+        прихоть. to_ollama_messages разбирает только текст, вызовы
+        инструментов и их итоги: блок с изображением он роняет молча, без
+        единой ошибки. Модель, не увидев ничего, честно и уверенно расскажет,
+        что перед роботом, — а робот это перескажет человеку. Такую поломку
+        не видно ни в логах, ни на слух, поэтому зрение ходит своей дорогой,
+        где картинка либо доходит, либо отказ говорится вслух.
+        """
+        try:
+            req = json.loads(self._body().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            self._json(400, {"error": f"тело не JSON: {e}"})
+            return
+        кадр = (req.get("кадр") or "").strip()
+        if not кадр:
+            self._json(400, {"error": "кадра нет"})
+            return
+        вопрос = (req.get("вопрос") or "Что на картинке?").strip()
+        модель = VISION_MODEL
+        payload = {
+            "model": модель,
+            "messages": [{"role": "user", "content": вопрос, "images": [кадр]}],
+            "stream": False,
+            "options": {"num_predict": 300},
+        }
+        начали = time.monotonic()
+        try:
+            with self.server.cfg.ollama._post("/api/chat", payload,
+                                              stream=False) as ответ:
+                данные = json.loads(ответ.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            тело = e.read().decode("utf-8", "replace")[:300]
+            # Самая частая беда — зрячей модели просто нет. Сказать об этом
+            # прямо дешевле, чем оставить человека гадать: починка — одна
+            # команда, и она должна быть написана в журнале.
+            log.warning("зрение: Ollama отказала (%s) %s", e.code, тело)
+            подсказка = (f" Поставь зрячую модель: ollama pull {модель}"
+                         if "not found" in тело.lower() else "")
+            self._json(502, {"error": f"модель {модель} не ответила.{подсказка}"})
+            return
+        except Exception as e:                  # noqa: BLE001
+            log.warning("зрение: не вышло (%s)", e)
+            self._json(502, {"error": str(e)})
+            return
+        текст = ((данные.get("message") or {}).get("content") or "").strip()
+        log.info("зрение: %s разглядела кадр за %.1f с", модель,
+                 time.monotonic() - начали)
+        self._json(200, {"текст": текст, "модель": модель})
 
     # --- разговор ---
     def _messages(self) -> None:

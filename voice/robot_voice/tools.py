@@ -87,6 +87,7 @@ ABILITIES = (
     "по жанру или просто твою волну. Громкость меняю по десятибалльной: "
     "скажи «сделай на семь». Есть секундомер, считаю проценты и деление, "
     "брошу монетку или кубик и загадаю число. "
+    "Ещё я вижу: посмотрю камерой и скажу, что передо мной. "
     "Всё остальное — просто спроси, я отвечу."
 )
 
@@ -533,6 +534,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 home: Callable[[], tuple[float, float] | None] | None = None,
                 set_place: Callable[[str, float, float], None] | None = None,
                 player=None,
+                eyes=None,
                 news_url: str = "") -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
@@ -1653,6 +1655,30 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         input_schema=EMPTY_SCHEMA,
         run=news,
     ))
+    if eyes is not None:
+        def look_around(question: str = "") -> str:
+            return eyes.посмотреть(question)
+
+        tools.append(Tool(
+            name="look_around",
+            description="Посмотреть камерой и сказать, что перед роботом. "
+                        "Зови всегда, когда спрашивают про видимое: «что ты "
+                        "видишь», «кто здесь», «посмотри», «что у меня в "
+                        "руке», «какого цвета». По памяти на такое не "
+                        "отвечай — камера показывает, что сейчас, а не что "
+                        "было.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Что именно разглядеть. Пусто — "
+                                       "общее описание того, что видно.",
+                    },
+                },
+            },
+            run=look_around,
+        ))
     if set_place is not None:
         tools.append(Tool(
             name="set_home",

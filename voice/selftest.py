@@ -4204,6 +4204,74 @@ def test_camera() -> None:
         del os.environ["ROBOT_CAMERA_DEVICE"]
 
 
+def test_vision() -> None:
+    """Глаза робота: кадр берём у веб-сервера, разглядывает ПК.
+
+    Проверяется главное: если разглядеть кадр некому, робот говорит об этом
+    вслух, а не молчит и не выдумывает. Молчаливый отказ здесь опаснее
+    обычного — мост на ПК роняет картинку без единой ошибки, и модель,
+    не увидев ничего, уверенно расскажет, что перед роботом.
+    """
+    import base64
+    import http.server
+    import threading as thr
+
+    section("глаза робота")
+    from robot_voice.camera import Глаза
+
+    КАДР = b"\xff\xd8jpeg\xff\xd9"
+
+    class Ответчик(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            if self.path != "/camera/snapshot":
+                self.send_response(404); self.send_header("Content-Length", "0")
+                self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(КАДР)))
+            self.end_headers()
+            self.wfile.write(КАДР)
+
+        def do_POST(self):
+            длина = int(self.headers.get("Content-Length") or 0)
+            запрос = json.loads(self.rfile.read(длина).decode("utf-8"))
+            # Кадр обязан доехать целым и в base64 — на этом ломался мост.
+            дошло = base64.b64decode(запрос["кадр"]) == КАДР
+            ответ = json.dumps(
+                {"текст": "вижу стол" if дошло else "кадр не дошёл"},
+                ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(ответ)))
+            self.end_headers()
+            self.wfile.write(ответ)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Ответчик)
+    thr.Thread(target=srv.serve_forever, daemon=True).start()
+    адрес = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        глаза = Глаза(web_url=адрес, pc_url=адрес)
+        check("кадр забрали у веб-сервера", глаза.снимок(), КАДР)
+        check("ПК разглядел и ответил", глаза.посмотреть("что там"), "вижу стол")
+
+        # ПК молчит, облака нет — робот обязан сказать это словами.
+        слепой = Глаза(web_url=адрес, pc_url="http://127.0.0.1:1")
+        сказал = слепой.посмотреть()
+        check("про отказ сказано вслух", "компьютер не ответил" in сказал, True)
+
+        # Камеры нет вовсе — тоже вслух, и это не то же самое сообщение.
+        безглазый = Глаза(web_url="http://127.0.0.1:1", pc_url=адрес)
+        check("про отсутствие кадра сказано отдельно",
+              "камера не отдала кадр" in безглазый.посмотреть(), True)
+    finally:
+        srv.shutdown()
+
+
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
@@ -4224,7 +4292,7 @@ def main() -> int:
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,
                  test_history,
-                 test_names, test_dialogue, test_camera):
+                 test_names, test_dialogue, test_camera, test_vision):
         test()
         print("   ...")
     if FAILED:

@@ -22,6 +22,7 @@ from . import intents
 from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
+from .camera import Глаза
 from .config import Config
 from .music import LOUD as MUSIC_LOUD
 from .music import Колонка, Player, Pult
@@ -632,11 +633,18 @@ def main() -> None:
     # _listen_loop.
     listener.on_wake = lambda: player.приглушить(True)
 
+    # Глаза дать можно всегда: кадр они берут у веб-сервера, а тот сам решает,
+    # своя камера перед ним или телефон. Разглядывает ПК, не отвечает он —
+    # облако. Отсутствие камеры выяснится в момент вопроса и будет сказано
+    # вслух — это честнее, чем прятать инструмент и заставлять модель
+    # выкручиваться словами.
+    глаза = Глаза(pc_url=cfg.pc_url, api_key=cfg.api_key,
+                  api_base=cfg.api_base, model=cfg.model)
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
-                        player=player)
+                        player=player, eyes=глаза)
     brain = Brain(cfg, tools)
 
     # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.
