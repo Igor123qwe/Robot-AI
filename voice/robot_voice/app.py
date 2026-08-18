@@ -639,13 +639,17 @@ def main() -> None:
     # вслух — это честнее, чем прятать инструмент и заставлять модель
     # выкручиваться словами.
     глаза = Глаза(pc_url=cfg.pc_url, api_key=cfg.api_key,
-                  api_base=cfg.api_base, model=cfg.model)
+                  api_base=cfg.api_base, model=cfg.model,
+                  vision_model=cfg.vision_model)
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
                         player=player, eyes=глаза)
     brain = Brain(cfg, tools)
+    # Счётчик отдаём после сборки мозга: глаза нужны инструментам, а мозг —
+    # инструментам же, и по кругу это не собрать.
+    глаза.учёт = brain.записать_расход
 
     # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.
     watch = Watchdog(ros, voice, listener, recognizer=recognizer, brain=brain)

@@ -49,13 +49,20 @@ class Глаза:
     """Кадр с камеры робота плюс тот, кто его разглядит."""
 
     def __init__(self, web_url: str = "", pc_url: str = "",
-                 api_key: str = "", api_base: str = "", model: str = "") -> None:
+                 api_key: str = "", api_base: str = "", model: str = "",
+                 vision_model: str = "", учёт=None) -> None:
         порт = os.environ.get("ROBOT_WEB_PORT", "8000")
         self.web_url = (web_url or f"http://127.0.0.1:{порт}").rstrip("/")
         self.pc_url = pc_url.rstrip("/")
         self.api_key = api_key
         self.api_base = api_base
         self.model = model
+        # Смотрит младшая и быстрая; старшая — только если младшей нет.
+        self.vision_model = vision_model or model
+        # Куда сообщить, во что обошёлся взгляд. Кадр стоит примерно как
+        # полторы тысячи слов, и без этого он не попадал ни в один счётчик:
+        # расход за сеанс не двигался, хотя деньги тратились.
+        self.учёт = учёт
         # Пускать ли картинку в облако, когда ПК не отвечает. По умолчанию да:
         # робот, ослепший вместе с выключенным компьютером, — это не то, чего
         # ждёшь от «посмотри». Но кадр стоит примерно как полторы тысячи
@@ -126,6 +133,16 @@ class Глаза:
         return (ответ.json().get("текст") or "").strip()
 
     def _спросить_облако(self, кадр: bytes, вопрос: str) -> str:
+        текст = self._облаком(кадр, вопрос, self.vision_model)
+        if текст or self.vision_model == self.model:
+            return текст
+        # Младшей модели может не быть у этого ключа. Молчать об этом нельзя:
+        # человек спросил и ждёт, а починка — одна строчка в настройках.
+        log.warning("зрение: %s не ответила — смотрю моделью разговора (%s)",
+                    self.vision_model, self.model)
+        return self._облаком(кадр, вопрос, self.model)
+
+    def _облаком(self, кадр: bytes, вопрос: str, модель: str) -> str:
         try:
             import anthropic
 
@@ -133,7 +150,7 @@ class Глаза:
                                          base_url=self.api_base or None,
                                          timeout=ОТВЕТ_ЖДЁМ)
             ответ = клиент.messages.create(
-                model=self.model,
+                model=модель,
                 max_tokens=300,
                 messages=[{
                     "role": "user",
@@ -148,6 +165,13 @@ class Глаза:
         except Exception as e:                  # noqa: BLE001
             log.warning("зрение: облако отказало (%s)", e)
             return ""
+        if self.учёт is not None:
+            расход = getattr(ответ, "usage", None)
+            try:
+                self.учёт(модель, getattr(расход, "input_tokens", 0) or 0,
+                          getattr(расход, "output_tokens", 0) or 0)
+            except Exception:               # noqa: BLE001 — счёт не повод молчать
+                log.exception("не смог записать расход на взгляд")
         куски = [блок.text for блок in ответ.content
                  if getattr(блок, "type", "") == "text"]
         return "".join(куски).strip()

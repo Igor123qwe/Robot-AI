@@ -4204,6 +4204,22 @@ def test_camera() -> None:
         del os.environ["ROBOT_CAMERA_DEVICE"]
 
 
+def _поддельный_anthropic():
+    """Модуль-заглушка вместо SDK: настоящий ключ для проверок не нужен."""
+    import types as _t
+
+    ответ = _t.SimpleNamespace(
+        content=[_t.SimpleNamespace(type="text", text="вижу стол")],
+        usage=_t.SimpleNamespace(input_tokens=1500, output_tokens=20),
+    )
+
+    class Anthropic:
+        def __init__(self, **kw):
+            self.messages = _t.SimpleNamespace(create=lambda **k: ответ)
+
+    return _t.SimpleNamespace(Anthropic=Anthropic)
+
+
 def test_vision() -> None:
     """Глаза робота: кадр берём у веб-сервера, разглядывает ПК.
 
@@ -4268,6 +4284,36 @@ def test_vision() -> None:
         безглазый = Глаза(web_url="http://127.0.0.1:1", pc_url=адрес)
         check("про отсутствие кадра сказано отдельно",
               "камера не отдала кадр" in безглазый.посмотреть(), True)
+
+        # Смотрит младшая модель, а не та, которой разговаривают: на живом
+        # роботе взгляд опусом стоил двенадцать секунд молчания. Нет младшей
+        # — отступаем на старшую, а не остаёмся без ответа.
+        облачный = Глаза(web_url=адрес, pc_url="", api_key="ключ",
+                         model="старшая", vision_model="младшая")
+        звали: list[str] = []
+
+        def подделка(кадр, вопрос, модель):
+            звали.append(модель)
+            return "" if модель == "младшая" else "увидел стол"
+
+        облачный._облаком = подделка
+        check("отступили на модель разговора",
+              облачный.посмотреть(), "увидел стол")
+        check("сначала спросили младшую", звали, ["младшая", "старшая"])
+
+        # Расход за взгляд обязан куда-то попасть: кадр стоит примерно как
+        # полторы тысячи слов, и молча тратить их нельзя.
+        счёт: list[tuple] = []
+        считающий = Глаза(web_url=адрес, pc_url="", api_key="ключ",
+                          model="м", vision_model="м",
+                          учёт=lambda откуда, вход, выход: счёт.append(
+                              (откуда, вход, выход)))
+        sys.modules["anthropic"] = _поддельный_anthropic()
+        try:
+            check("облако ответило", считающий.посмотреть(), "вижу стол")
+            check("расход записан", счёт, [("м", 1500, 20)])
+        finally:
+            sys.modules.pop("anthropic", None)
     finally:
         srv.shutdown()
 
