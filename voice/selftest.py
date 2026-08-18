@@ -4176,6 +4176,34 @@ def tts_urlopen(новый):
     return старый
 
 
+def test_shell_ascii() -> None:
+    """В shell-скриптах имена переменных — только латиницей.
+
+    Третьи грабли того же рода. Сначала кириллица в адресе запроса и в
+    заголовках HTTP, потом в границе многочастного потока, теперь в имени
+    переменной shell. Общее у них одно: система принимает только латиницу, а
+    отказ выглядит не как отказ.
+
+    Здесь особенно подло: shell читает «СЛЕПОК=...» как имя команды и пишет
+    «command not found» в стандартную ошибку, после чего невозмутимо идёт
+    дальше с пустыми значениями. Скрипт не падает, проверка внутри него
+    остаётся на месте и выглядит рабочей — а не делает ничего.
+    """
+    section("в shell — только латиница")
+    import re
+
+    корень = Path(__file__).resolve().parent.parent
+    плохие: list[str] = []
+    for путь in sorted((корень / "scripts").glob("*.sh")):
+        for номер, строка in enumerate(путь.read_text().splitlines(), 1):
+            голая = строка.split("#", 1)[0]
+            # Присваивание в начале строки или после for/while/read.
+            for имя in re.findall(r"(?:^|\s|;)([A-Za-zА-Яа-яЁё_][^\s=]*)=", голая):
+                if not имя.isascii():
+                    плохие.append(f"{путь.name}:{номер}: {имя}")
+    check("русских имён переменных нет", плохие, [])
+
+
 def test_camera() -> None:
     """Камера робота: один владелец, кадры из потока, честная жалоба.
 
@@ -4473,7 +4501,7 @@ def main() -> int:
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,
                  test_history,
-                 test_names, test_dialogue, test_camera, test_vision, test_camera_stream):
+                 test_names, test_dialogue, test_camera, test_vision, test_camera_stream, test_shell_ascii):
         test()
         print("   ...")
     if FAILED:
