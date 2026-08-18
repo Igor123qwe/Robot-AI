@@ -563,9 +563,16 @@ camBtn.addEventListener('click', () => {
   img.onerror = () => {
     img.remove();
     videoHint.style.display = '';
-    videoHint.textContent = base.startsWith('/')
-      ? 'робот не смог забрать поток с телефона — запущен ли сервер в IP Webcam?'
-      : 'не удалось открыть ' + src;
+    if (!base.startsWith('/')) { videoHint.textContent = 'не удалось открыть ' + src; return; }
+    // Источников за /camera теперь два — своя камера и телефон, — и валить
+    // всё на телефон нельзя: с воткнутой в робота камерой это сбивает с
+    // толку. Спрашиваем у сервера, что именно не вышло: он вернёт ругань
+    // ffmpeg («устройство занято», «нет такого формата») или отказ телефона.
+    videoHint.textContent = 'видео не пошло — выясняю причину…';
+    fetch('/camera/status')
+      .then(r => r.json())
+      .then(o => { videoHint.textContent = (o.source || 'камера') + ': ' + (o.detail || 'нет кадра'); })
+      .catch(() => { videoHint.textContent = 'видео не пошло, и сервер не отвечает'; });
   };
   videoHint.style.display = 'none';
   videoBox.appendChild(img);

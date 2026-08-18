@@ -60,6 +60,7 @@ import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import camera as камера_модуль
 import tls
 import wsproxy
 
@@ -70,6 +71,22 @@ PORT = int(os.environ.get("ROBOT_WEB_PORT", "8000"))
 # Ноль — не поднимать вовсе.
 TLS_PORT = int(os.environ.get("ROBOT_WEB_TLS_PORT", "8443"))
 DEFAULT_PHONE = os.environ.get("ROBOT_PHONE_URL", "http://192.168.3.9:8080").rstrip("/")
+
+# Откуда брать картинку: usb — камера робота, phone — телефон с IP Webcam,
+# пусто — сама разберётся (есть камера в роботе, значит она; нет — телефон).
+# Явная настройка нужна ровно для одного случая: камера воткнута, но смотреть
+# надо с телефона, потому что он стоит в другой комнате.
+CAMERA_SOURCE = os.environ.get("ROBOT_CAMERA", "").strip().lower()
+КАМЕРА = камера_модуль.Камера()
+
+
+def камера_робота() -> bool:
+    """Показывать ли свою камеру вместо телефонной."""
+    if CAMERA_SOURCE == "usb":
+        return True
+    if CAMERA_SOURCE == "phone":
+        return False
+    return КАМЕРА.доступна()
 
 # Сколько ждать телефон, прежде чем признать его недоступным.
 CONNECT_TIMEOUT = 5
@@ -346,11 +363,20 @@ class Handler(SimpleHTTPRequestHandler):
             wsproxy.проводить(self.connection, self.headers)
             return
         if path == "/camera":
-            self.proxy_stream(phone_base(query) + "/video")
+            if камера_робота():
+                self.поток_камеры()
+            else:
+                self.proxy_stream(phone_base(query) + "/video")
         elif path == "/camera/snapshot":
-            self.proxy_once(phone_base(query) + "/shot.jpg")
+            if камера_робота():
+                self.снимок_камеры()
+            else:
+                self.proxy_once(phone_base(query) + "/shot.jpg")
         elif path == "/camera/status":
-            self.camera_status(phone_base(query))
+            if камера_робота():
+                self.состояние_камеры()
+            else:
+                self.camera_status(phone_base(query))
         elif path == "/speak/events":
             self.speak_events(query)
         elif path == "/listen/stream":
@@ -581,6 +607,57 @@ class Handler(SimpleHTTPRequestHandler):
         finally:
             upstream.close()
         self.close_connection = True
+
+    # --- своя камера ----------------------------------------------------
+    # Граница кадров в multipart-потоке. Значение произвольное, важно лишь,
+    # чтобы оно не встречалось внутри данных, — для двоичного JPEG это так.
+    ГРАНИЦА = "кадр"
+
+    def снимок_камеры(self) -> None:
+        """Один кадр со своей камеры."""
+        кадр = КАМЕРА.кадр()
+        if not кадр:
+            self.fail(503, КАМЕРА.беда or "камера не отдала кадр")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(кадр)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(кадр)
+
+    def поток_камеры(self) -> None:
+        """Кадры своей камеры в том же виде, в каком их отдаёт телефон.
+
+        Формат тот же самый не случайно: пульт показывает картинку обычным
+        <img>, и ему всё равно, кто на том конце. Значит переезд на свою
+        камеру не требует ни строчки в pult.html.
+        """
+        первый = КАМЕРА.кадр()
+        if not первый:
+            self.fail(503, КАМЕРА.беда or "камера не отдала кадр")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         f"multipart/x-mixed-replace; boundary={self.ГРАНИЦА}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            for кадр in КАМЕРА.поток():
+                self.wfile.write(
+                    f"--{self.ГРАНИЦА}\r\nContent-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(кадр)}\r\n\r\n".encode())
+                self.wfile.write(кадр)
+                self.wfile.write(b"\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # зритель закрыл вкладку — это норма
+        self.close_connection = True
+
+    def состояние_камеры(self) -> None:
+        живая = bool(КАМЕРА.кадр(ждать=2.0))
+        self.send_json({"source": f"робот: {КАМЕРА.устройство}",
+                        "online": живая,
+                        "detail": "ok" if живая else (КАМЕРА.беда or "нет кадра")})
 
     def proxy_once(self, url: str) -> None:
         try:

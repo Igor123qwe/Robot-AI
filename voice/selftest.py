@@ -4152,6 +4152,58 @@ def tts_urlopen(новый):
     return старый
 
 
+def test_camera() -> None:
+    """Камера робота: один владелец, кадры из потока, честная жалоба.
+
+    Проверяется на поддельном ffmpeg — настоящей камеры на сборочной машине
+    нет, а разбирать поток на кадры надо уметь одинаково.
+    """
+    import os
+
+    section("камера робота")
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "web"))
+    import camera as кам
+
+    двор = Path(tempfile.mkdtemp())
+
+    # Поддельная камера: выдаёт два целых кадра и молчит.
+    поддельный = двор / "ffmpeg"
+    поддельный.write_text(
+        "#!/bin/sh\n"
+        "printf '\\377\\330odin\\377\\331'\n"
+        # Держим подделку живой: на выходе процесса последний кадр
+        # намеренно стирается (мёртвая камера не должна отдавать вчерашнюю
+        # картинку), и под нагрузкой проверка ловила бы именно это.
+        "printf '\\377\\330dva\\377\\331'\n"
+        "sleep 30\n")
+    поддельный.chmod(0o755)
+    старый_путь = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{двор}:{старый_путь}"
+    try:
+        глаз = кам.Камера(устройство=str(поддельный))  # лишь бы файл существовал
+        check("камера считается доступной", глаз.доступна(), True)
+        кадр = глаз.кадр(ждать=5.0)
+        # Берём ПОСЛЕДНИЙ кадр, а не первый: показывать надо то, что перед
+        # роботом сейчас, а не то, что было в начале записи.
+        check("достался последний целый кадр", кадр, b"\xff\xd8dva\xff\xd9")
+        глаз.закрыть()
+
+        # Нет устройства — честный отказ, а не пустой кадр без объяснения.
+        слепой = кам.Камера(устройство=str(двор / "нет-такого"))
+        check("отсутствие камеры видно сразу", слепой.доступна(), False)
+        check("кадра нет", слепой.кадр(ждать=0.5), b"")
+        check("причина названа", "нет устройства" in слепой.беда, True)
+    finally:
+        os.environ["PATH"] = старый_путь
+
+    # Имя устройства берётся из настройки, если она задана.
+    os.environ["ROBOT_CAMERA_DEVICE"] = "/dev/особая"
+    try:
+        check("настройка перебивает поиск", кам.найти_устройство(), "/dev/особая")
+    finally:
+        del os.environ["ROBOT_CAMERA_DEVICE"]
+
+
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
@@ -4172,7 +4224,7 @@ def main() -> int:
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,
                  test_history,
-                 test_names, test_dialogue):
+                 test_names, test_dialogue, test_camera):
         test()
         print("   ...")
     if FAILED:
