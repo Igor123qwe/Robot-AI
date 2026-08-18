@@ -404,7 +404,8 @@ class Listener:
     def __init__(self, source, *, sample_rate: int, vad_level: int,
                  silence_ms: int, min_speech_ms: int, max_speech_ms: int = 20000,
                  start_frames: int = 2, spotter=None,
-                 command_ms: int = 10000) -> None:
+                 command_ms: int = 10000,
+                 спешим: Callable[[], bool] | None = None) -> None:
         self.pump = Pump(source)
         # Детектор имени на потоке. Есть — слушаем по имени и режем только
         # команду; нет — откатываемся на нарезку по паузам, см. utterances().
@@ -422,6 +423,12 @@ class Listener:
         # Пусто — обычная фраза, её надо распознавать. Не пусто — распознавать
         # нечего, слово уже известно, и это экономит две секунды на «стоп».
         self.instant = ""
+        # Есть ли сейчас что прерывать. Мгновенный слой затевался ради одного:
+        # «стоп» едущему роботу за доли секунды вместо двух с половиной. Когда
+        # робот стоит, спешить некуда — и держать этот слой открытым значит
+        # только собирать ложные срабатывания на обычной речи. Пусто — считаем,
+        # что спешим всегда (так ведут себя проверки и старая сборка).
+        self.спешим = спешим
         self.sample_rate = sample_rate
         self.vad = webrtcvad.Vad(vad_level)
         self.silence_frames = max(1, silence_ms // FRAME_MS)
@@ -552,7 +559,11 @@ class Listener:
                             log.exception("не смог приглушить музыку")
                     speech = list(self.preroll)
                     silence, пишем = 0, True
-                    слушаем_приказ = self.МГНОВЕННЫХ_КАДРОВ
+                    # Спрашиваем ровно здесь, в миг имени: дальше человек уже
+                    # говорит, и менять решение поздно.
+                    слушаем_приказ = (self.МГНОВЕННЫХ_КАДРОВ
+                                      if self.спешим is None or self.спешим()
+                                      else 0)
                 continue
 
             speech.append(frame)

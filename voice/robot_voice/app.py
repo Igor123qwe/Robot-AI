@@ -602,6 +602,7 @@ def main() -> None:
         max_speech_ms=cfg.max_speech_ms,
         spotter=make_spotter(cfg),
         command_ms=cfg.command_ms,
+        спешим=lambda: ros is not None and ros.busy,
     )
     voice = Voice(speaker, listener)
     voice.on_heard = lambda kind, text: _post_heard(cfg.web_endpoint, kind, text)
