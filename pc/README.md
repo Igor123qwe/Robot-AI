@@ -66,6 +66,29 @@ git clone https://github.com/salute-developers/GigaAM.git
 cd GigaAM && pip install -e .[torch]
 ```
 
+**Сразу после этого проверьте, видит ли torch видеокарту.** Это не
+формальность: на Windows `pip install torch` тянет с PyPI сборку ДЛЯ
+ПРОЦЕССОРА, и распознавание молча уезжает считаться на нём. Робот при этом
+работает — просто вшестеро медленнее, и в журнале мелькает одно
+предупреждение при запуске, которое легко пропустить.
+
+```
+python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+```
+
+Ответ `False None` означает, что видеокарта простаивает, а распознавание,
+синтез и узнавание голоса дерутся за ядра процессора — на живом роботе это
+давало разброс от 0.7 до 5.4 секунды на одной и той же фразе. Лечится
+установкой сборки под CUDA (номер после `cu` — под вашу версию драйвера,
+смотреть в `nvidia-smi`):
+
+```
+pip uninstall -y torch torchaudio
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+```
+
+Должно ответить `True 12.6`.
+
 Нужен ffmpeg в PATH. Дальше запускать с флагом:
 
 ```
