@@ -66,7 +66,40 @@ git clone https://github.com/salute-developers/GigaAM.git
 cd GigaAM && pip install -e .[torch]
 ```
 
-**Сразу после этого проверьте, видит ли torch видеокарту.** Это не
+**Ставьте это в отдельное окружение на большом диске.** Колесо `torch` с
+поддержкой видеокарты — 2.6 ГБ в архиве и около шести на диске, плюс столько
+же временно. На системном диске столько находится не всегда, а обрывается
+установка уже ПОСЛЕ удаления прежней сборки — робот остаётся без
+распознавания вовсе. Разбирать это в час ночи неприятно.
+
+```
+mkdir F:\tmp & mkdir F:\pip-cache
+set TMP=F:\tmp& set TEMP=F:\tmp& set PIP_CACHE_DIR=F:\pip-cache
+python -m venv F:\robot-venv
+F:\robot-venv\Scripts\activate
+```
+
+Три переменные обязательны: pip распаковывает колесо во временную папку, а
+она по умолчанию на системном диске — то есть само окружение уедет на F, а
+место кончится всё равно.
+
+Дальше ставьте torch ПЕРВЫМ, до GigaAM:
+
+```
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126 --no-cache-dir
+pip install faster-whisper numpy speechbrain
+git clone https://github.com/salute-developers/GigaAM.git
+cd GigaAM && pip install -e .
+```
+
+Обратите внимание: `pip install -e .` **без** `[torch]`. Именно этот довесок
+и тянет сборку для процессора — если позвать его после, он молча заменит уже
+поставленную и всё вернётся к началу.
+
+`start.cmd` найдёт это окружение сам. Лежит оно в другом месте — задайте
+`ROBOT_VENV`.
+
+**Проверьте, видит ли torch видеокарту.** Это не
 формальность: на Windows `pip install torch` тянет с PyPI сборку ДЛЯ
 ПРОЦЕССОРА, и распознавание молча уезжает считаться на нём. Робот при этом
 работает — просто вшестеро медленнее, и в журнале мелькает одно

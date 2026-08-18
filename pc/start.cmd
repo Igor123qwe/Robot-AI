@@ -26,7 +26,23 @@ echo Адрес для робота — строка IPv4 отсюда:
 ipconfig | findstr /c:"IPv4"
 echo.
 
-python kuzya_pc.py --model %MODEL% --whisper %WHISPER% --port %PORT%
+rem Своё окружение, если оно есть. Колесо torch с поддержкой видеокарты —
+rem это шесть гигабайт на диске, и на системном они находятся не всегда:
+rem установка обрывается на «No space left on device», причём УЖЕ УДАЛИВ
+rem старую сборку. Робот остаётся без распознавания вовсе.
+rem
+rem Поэтому окружение принято держать на большом диске рядом с моделями.
+rem Путь можно задать своим: set ROBOT_VENV=D:\что-угодно
+if "%ROBOT_VENV%"=="" set ROBOT_VENV=F:\robot-venv
+set PY=python
+if exist "%ROBOT_VENV%\Scripts\python.exe" (
+  set PY="%ROBOT_VENV%\Scripts\python.exe"
+  echo окружение     %ROBOT_VENV%
+) else (
+  echo окружение     системное ^(своего нет^)
+)
+
+%PY% kuzya_pc.py --model %MODEL% --whisper %WHISPER% --port %PORT%
 
 rem Сюда попадаем, только если сервер упал. Без паузы окно закроется, и
 rem причину прочитать будет негде.
