@@ -14,12 +14,20 @@ if "%OLLAMA_MODELS%"=="" echo -- OLLAMA_MODELS не задана, модели �
 
 rem Что запускать. Поменять можно прямо здесь.
 set MODEL=qwen3:4b
+rem GigaAM, а не whisper: она обучена на русском, и на этой видеокарте
+rem секунда звука разбирается за десятую долю секунды. Whisper остаётся
+rem запасным — set STT=whisper, и тогда важен размер ниже.
+set STT=gigaam
 set WHISPER=small
+rem Ксения — единственный женский голос Silero, который не сваливается в
+rem механическое чтение на длинных фразах.
+set VOICE=xenia
 set PORT=4000
 
 echo == мозг Кузи ==
 echo модель        %MODEL%
-echo распознавание %WHISPER%
+echo распознавание %STT%
+echo голос         %VOICE%
 echo порт          %PORT%
 echo.
 echo Адрес для робота — строка IPv4 отсюда:
@@ -42,7 +50,7 @@ if exist "%ROBOT_VENV%\Scripts\python.exe" (
   echo окружение     системное ^(своего нет^)
 )
 
-%PY% kuzya_pc.py --model %MODEL% --whisper %WHISPER% --port %PORT%
+%PY% kuzya_pc.py --model %MODEL% --stt %STT% --whisper %WHISPER% --voice %VOICE% --port %PORT%
 
 rem Сюда попадаем, только если сервер упал. Без паузы окно закроется, и
 rem причину прочитать будет негде.
