@@ -87,6 +87,56 @@ def слушать(ws, топик: str, секунд: float) -> None:
         print("Тишина. Либо топика нет, либо в него никто не пишет.")
 
 
+ИНТЕРЕСНОЕ = (
+    "/joint_states", "/odom", "/odom_combined", "/imu/data_raw",
+    "/ultrasonic_data_A", "/ultrasonic_data_B", "/ultrasonic_data_C",
+    "/ultrasonic_data_D", "/ultrasonic_data_E", "/ultrasonic_data_F",
+    "/RangerAvoidFlag", "/robot_charging_flag", "/robot_recharge_flag",
+    "/chassis_security", "/tf_static",
+)
+
+
+def разведать(ws, секунд: float) -> None:
+    """Подписаться на всё интересное разом и показать по образцу из каждого.
+
+    Одной командой вместо пятнадцати. Ради этого и написано: выяснять по
+    одному топику за заход — это пятнадцать раз сходить к роботу и обратно,
+    и на третьем разе человек бросает.
+    """
+    for топик in ИНТЕРЕСНОЕ:
+        ws.send(json.dumps({"op": "subscribe", "topic": топик,
+                            "id": "разведка", "throttle_rate": 200}))
+    print("\nслушаю %d топиков %.0f с…\n" % (len(ИНТЕРЕСНОЕ), секунд))
+
+    образцы: dict[str, dict] = {}
+    сколько: dict[str, int] = {}
+    срок = time.monotonic() + секунд
+    while time.monotonic() < срок:
+        try:
+            ответ = json.loads(ws.recv())
+        except Exception:                     # noqa: BLE001
+            break
+        топик = ответ.get("topic")
+        if not топик or "msg" not in ответ:
+            continue
+        сколько[топик] = сколько.get(топик, 0) + 1
+        образцы.setdefault(топик, ответ["msg"])
+
+    for топик in ИНТЕРЕСНОЕ:
+        if топик not in образцы:
+            print(f"  {топик}: молчит")
+            continue
+        сообщений = сколько.get(топик, 0)
+        герц = сообщений / max(секунд, 0.001)
+        текст = json.dumps(образцы[топик], ensure_ascii=False)
+        print(f"  {топик}  ({герц:.0f} Гц)")
+        print(f"    {текст[:600]}")
+    молчат = [т for т in ИНТЕРЕСНОЕ if т not in образцы]
+    if молчат:
+        print("\nМолчащие топики существуют, но в них никто не пишет. Для "
+              "\n«/robot_charging_*» это норма: они оживают на станции.")
+
+
 def главное() -> int:
     р = argparse.ArgumentParser(description=__doc__)
     р.add_argument("искать", nargs="?", default="",
@@ -94,10 +144,15 @@ def главное() -> int:
     р.add_argument("--адрес", default="ws://127.0.0.1:9090")
     р.add_argument("--слушать", default="", metavar="ТОПИК")
     р.add_argument("--секунд", type=float, default=3.0)
+    р.add_argument("--разведать", action="store_true",
+                   help="послушать всё интересное разом и показать образцы")
     аргс = р.parse_args()
 
     ws = связаться(аргс.адрес)
     try:
+        if аргс.разведать:
+            разведать(ws, max(аргс.секунд, 4.0))
+            return 0
         if аргс.слушать:
             слушать(ws, аргс.слушать, аргс.секунд)
             return 0
