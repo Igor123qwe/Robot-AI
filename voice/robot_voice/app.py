@@ -659,9 +659,12 @@ def main() -> None:
         ros.сторож = сторож
         ros.объявить = voice.say
 
+    # Дальномер отдаём и глазам: он даёт зрению то, чего у одного глаза нет
+    # и взяться ему неоткуда, — настоящие метры. Модель по картинке видит,
+    # что стул ближе стены, но «сорок сантиметров» сказать не может.
     глаза = Глаза(pc_url=cfg.pc_url, api_key=cfg.api_key,
                   api_base=cfg.api_base, model=cfg.model,
-                  vision_model=cfg.vision_model)
+                  vision_model=cfg.vision_model, tof=дальномер)
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,

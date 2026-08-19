@@ -385,6 +385,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"live": MIC.live})
         elif path == "/tof":
             self.сетка_дальномера()
+        elif path == "/tof/aim":
+            self.send_json(прицел())
         elif path == "/music/state":
             self.send_json({"кончилось": TRACKS.count})
         elif path.startswith("/speak/") and path.endswith(".wav"):
@@ -481,6 +483,24 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             SPEECH.broadcast({"громкость": доля})
             self.send_json({"ok": True})
+            return
+
+        if path == "/tof/aim":
+            # Куда в кадре смотрит сетка. Настраивается глазами в пульте —
+            # калибровочной доски у нас нет, а точность до пикселя тут и не
+            # нужна: зона дальномера — это конус шириной с ладонь на метре.
+            body = self.rfile.read(max(0, min(length, 512))).decode("utf-8", "replace")
+            try:
+                пришло = json.loads(body or "{}")
+                новый = {к: float(пришло[к]) for к in ("x", "y", "ш", "в")}
+            except (ValueError, KeyError, TypeError):
+                self.fail(400, "нужны числа x, y, ш, в — доли кадра")
+                return
+            if not all(0.0 <= з <= 1.0 for з in новый.values()):
+                self.fail(400, "доли кадра — от нуля до единицы")
+                return
+            записать_прицел(новый)
+            self.send_json({"ok": True, "прицел": новый})
             return
 
         if path in ("/speak/heard", "/speak/status"):
@@ -728,6 +748,47 @@ class Handler(SimpleHTTPRequestHandler):
 
     def fail(self, code: int, message: str) -> None:
         self.send_json({"online": False, "detail": message}, code)
+
+
+# Куда в кадре смотрит сетка дальномера — доли ширины и высоты картинки.
+# Умолчание считается по полям зрения: камера AR0234 даёт 130 градусов по
+# горизонтали, дальномер — 60 на 60. По модели дырочной камеры середина кадра
+# шириной tan(30°)/tan(65°) от половины — это и есть накрытая область.
+#
+# Умолчание — только начало. Оно не учитывает ни разноса между платами, ни
+# перекоса кронштейна, ни того, что видео в пульте может быть обрезано.
+# Поэтому цифры правятся глазами в пульте и запоминаются на роботе: свести
+# два поля зрения по картинке человек делает за минуту, а калибровочная доска
+# для 64 конусов шириной с ладонь — из пушки по воробьям.
+ФАЙЛ_ПРИЦЕЛА = "tof_aim.json"
+
+
+def _по_умолчанию() -> dict:
+    import math
+    доля_г = math.tan(math.radians(30.0)) / math.tan(math.radians(65.0))
+    # Вертикаль выводим из горизонтали через соотношение сторон 16:10 —
+    # пиксели квадратные, значит фокус общий.
+    фокус = 0.5 / math.tan(math.radians(65.0))
+    доля_в = math.tan(math.radians(30.0)) * фокус / (0.5 * 10 / 16)
+    return {"x": 0.5, "y": 0.5,
+            "ш": round(min(1.0, доля_г * 2), 3),
+            "в": round(min(1.0, доля_в * 2), 3)}
+
+
+def прицел() -> dict:
+    try:
+        данные = json.loads((Path.home() / ".robot-ai" / ФАЙЛ_ПРИЦЕЛА).read_text())
+        return {к: float(данные[к]) for к in ("x", "y", "ш", "в")}
+    except (OSError, ValueError, KeyError, TypeError):
+        return _по_умолчанию()
+
+
+def записать_прицел(новый: dict) -> None:
+    файл = Path.home() / ".robot-ai" / ФАЙЛ_ПРИЦЕЛА
+    файл.parent.mkdir(parents=True, exist_ok=True)
+    врем = файл.with_name(файл.name + ".tmp")
+    врем.write_text(json.dumps(новый, ensure_ascii=False))
+    врем.replace(файл)
 
 
 # Дальше этого сетка дальномера — уже не «сейчас». Полторы секунды: служба
