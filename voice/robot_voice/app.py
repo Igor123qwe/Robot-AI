@@ -119,9 +119,16 @@ class Voice:
         self.on_heard: Callable[[str, str], None] | None = None
 
     @contextlib.contextmanager
-    def quiet(self):
-        """Заглушает микрофон на время звучания реплики."""
-        self.listener.mute()
+    def quiet(self, говорю: str = ""):
+        """Заглушает микрофон на время звучания реплики.
+
+        `говорю` — текст реплики. Он уходит вниз не для журнала: перебивание
+        обязано знать, что робот произносит прямо сейчас, иначе робот
+        остановит сам себя собственным словом. Рассказ про умения содержит
+        «могу остановиться по слову стоп» — без этой проверки он обрывался бы
+        на первой же фразе.
+        """
+        self.listener.mute(говорю)
         try:
             yield
         finally:
@@ -150,7 +157,7 @@ class Voice:
         """
         if not text:
             return 0
-        with self._lock, self.quiet():
+        with self._lock, self.quiet(text):
             return self.speaker.say(text, loud=loud, on_sound=on_sound)
 
     def heard(self, text: str) -> None:
@@ -616,6 +623,10 @@ def main() -> None:
     )
     voice = Voice(speaker, listener)
     voice.on_heard = lambda kind, text: _post_heard(cfg.web_endpoint, kind, text)
+    # Перебивание: человек сказал «хватит» посреди длинной реплики — робот
+    # замолкает. Тот же hush, что и по команде «замолчи», только сработавший
+    # без участия главного цикла: цикл в это время висит в синтезе.
+    listener.on_barge = speaker.hush
 
     # Таймеры и список переживают перезапуск: автообновление может случиться в
     # любой момент, а таймер на духовку от этого пропадать не должен.
@@ -1582,6 +1593,12 @@ def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None,
     # Инструмент вызываем до заглушения микрофона: движение стартует сразу, и
     # эти доли секунды робот ещё слышит комнату.
     answer = tool(args)
+    # Инструмент отработал — засекаем ОТДЕЛЬНО от синтеза. Без этого его
+    # время пряталось внутри «синтеза», и взгляд камерой через облако давал
+    # «синтез 5097 мс» на фразе, которую ПК озвучил за двести. Чинили бы
+    # исправный синтез, а виноват был поход в облако.
+    if turn is not None:
+        turn.отметить("инструмент")
     if pending is not None and answer.endswith(_ASKS_LABEL):
         pending.ask(tool, "label", args=args)
     elif (pending is not None and answer.endswith("?")
@@ -1716,6 +1733,17 @@ def _respond(command: str, brain: Brain, voice: Voice,
                 stack.enter_context(voice.quiet())
                 speaking = True
 
+        def говорю(sentence: str) -> None:
+            """Сообщить перебиванию, что робот произносит сейчас.
+
+            Иначе робот остановит сам себя: свои слова он слышит громче
+            человека, и «стоп» внутри собственной реплики сработает раньше,
+            чем человек успеет открыть рот.
+            """
+            ухо = getattr(voice, "listener", None)
+            if ухо is not None:
+                ухо.говорю = f"{getattr(ухо, 'говорю', '')} {sentence}".strip()
+
         придержанное: list[str] = []
 
         сказано_фраз = [0]
@@ -1747,8 +1775,10 @@ def _respond(command: str, brain: Brain, voice: Voice,
                 return
             сказано_фраз[0] += 1
             log.info("робот: %s", sentence)
+            говорю(sentence)
             start_speaking()
-            if turn is not None:
+            if turn is not None and not первая_фраза[0]:
+                первая_фраза[0] = True
                 # Отдельно от «первого токена» и отдельно от «синтеза».
                 # Между первым токеном и синтезом лежит дописывание ПЕРВОЙ
                 # ФРАЗЫ: синтез получает предложения целиком, и пока модель не
@@ -1762,6 +1792,11 @@ def _respond(command: str, brain: Brain, voice: Voice,
                 озвучено.append(sentence)
 
         первый_токен = [False]
+        # Отмечаем ПЕРВУЮ фразу, а не каждую. В живом логе вышло
+        # «первая фраза 388 + первая фраза 17»: вторая засечка — это
+        # уже вторая фраза, и в разбивке она смотрелась как звено,
+        # которого нет.
+        первая_фраза = [False]
 
         def on_text(chunk: str) -> None:
             # Время до первого токена — вот что определяет, «тормозит» робот
