@@ -52,42 +52,41 @@ echo "== onnxruntime"
 echo "== какие сборки есть в репозитории"
 mkdir -p "$MODEL_DIR"
 
-# Спрашиваем список и выбираем сборку под процессор. Разбираем питоном из
-# того же venv: jq на роботе может не быть, а питон здесь есть заведомо.
-NAME="$(curl -fsSL --retry 3 --retry-delay 2 "$API" 2>/dev/null | "$VENV_PY" - <<'PY'
-import json
-import sys
+PICK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pick_turn_model.py"
+LIST_FILE="$(mktemp)"
+trap 'rm -f "$LIST_FILE"' EXIT
 
-try:
-    данные = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-
-файлы = [ф.get("rfilename", "") for ф in данные.get("siblings", [])]
-onnx = [ф for ф in файлы if ф.endswith(".onnx")]
-if not onnx:
-    sys.exit(1)
-
-# Печатаем ВСЕ найденные в stderr: если выбор окажется неверным, человек
-# должен видеть, из чего выбирали, а не гадать по одному имени.
-print("  нашлось:", ", ".join(onnx), file=sys.stderr)
-
-# Под процессор — те, где это сказано в имени. Если таких нет, берём любую,
-# кроме явно видеокартной: gpu-сборка вчетверо тяжелее и на A55 медленнее.
-свои = [ф for ф in onnx if "cpu" in ф.lower()]
-if not свои:
-    свои = [ф for ф in onnx if "gpu" not in ф.lower()]
-if not свои:
-    sys.exit(1)
-# Последняя по алфавиту — она же самая новая: имена версионированы
-# (smart-turn-v3.0, smart-turn-v3.1), и «свежее» здесь совпадает с «больше».
-print(sorted(свои)[-1])
-PY
-)" || NAME=""
+# Сперва в ФАЙЛ, потом разбор. Не через конвейер, и это не вкусовщина: программу
+# питону раньше скармливали heredoc'ом, а данные конвейером — оба идут в stdin,
+# heredoc побеждает, и разбор молча читал пустоту. Скрипт не падал, а честно
+# печатал «не удалось спросить список», и человек шёл проверять сеть, которая
+# была ни при чём.
+NAME=""
+if curl -fsSL --retry 3 --retry-delay 2 -o "$LIST_FILE" "$API"; then
+    NAME="$("$VENV_PY" "$PICK" "$LIST_FILE")" || NAME=""
+else
+    echo "  репозиторий не ответил ($API)" >&2
+fi
 
 if [ -z "$NAME" ]; then
-    echo "Не удалось спросить список у $API." >&2
+    # Список не дался — не сдаёмся. Сеть может пускать к файлам и не пускать
+    # к API, а имена сборок мы знаем. Пробуем известные по очереди: это ровно
+    # то, что человек сделал бы руками, и незачем заставлять его это делать.
+    echo "  список не дался — пробую известные имена" >&2
+    for CANDIDATE in smart-turn-v3.1-cpu.onnx smart-turn-v3.0.onnx; do
+        if curl -fsIL "https://huggingface.co/$REPO/resolve/main/$CANDIDATE" \
+                >/dev/null 2>&1; then
+            NAME="$CANDIDATE"
+            break
+        fi
+    done
+fi
+
+if [ -z "$NAME" ]; then
+    echo "" >&2
+    echo "Ни список, ни известные имена не дались." >&2
     echo "Скачай .onnx руками отсюда: https://huggingface.co/$REPO/tree/main" >&2
+    echo "(нужна сборка со словом cpu в имени, около 9 МБ)" >&2
     echo "и положи в $MODEL_DIR, потом укажи путь в ROBOT_TURN_MODEL." >&2
     exit 1
 fi
