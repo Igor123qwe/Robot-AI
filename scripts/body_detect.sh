@@ -66,6 +66,7 @@ if systemctl is-active --quiet robot-web; then
     RESTORE_PULT=1
 else
     RESTORE_PULT=0
+    echo "  robot-web не запущен — камера свободна"
 fi
 
 restore_pult() {
@@ -86,6 +87,13 @@ echo "  а на 8000 сидит наш пульт. Смотреть надо н�
 echo
 
 cd "$WORK_DIR"
+# Строгий режим снимаем ИМЕННО ЗДЕСЬ и только здесь. Скрипты окружения ROS
+# написаны без оглядки на `set -u`: setup.bash первой же строкой читает
+# AMENT_TRACE_SETUP_FILES, которой никто не объявлял, и запуск падает с
+# «unbound variable» — не дойдя до робота вовсе. Свой код от строгости
+# выигрывает, чужой ею ломается.
+set +u
 # shellcheck disable=SC1091
 source "$TROS/setup.bash"
+set -u
 exec ros2 launch mono2d_body_detection mono2d_body_detection.launch.py
