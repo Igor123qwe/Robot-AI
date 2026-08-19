@@ -2451,6 +2451,74 @@ def test_smart() -> None:
           [e.paid for e in b._live(smart=True)], [True, False])
 
 
+def test_prompt_prefix() -> None:
+    """Начало промпта обязано быть одинаковым от фразы к фразе.
+
+    Живой замер: 5212 токенов входа на КАЖДУЮ реплику, и время до первого
+    токена — 1020 мс, почти половина всей задержки. Из этих токенов тысяча —
+    системный промпт и две с половиной тысячи — схемы двадцати одного
+    инструмента.
+
+    Ollama и llama.cpp переиспользуют посчитанный KV-кэш ровно на ту длину, на
+    которую совпадает НАЧАЛО промпта. А шаблон Qwen рисует схемы инструментов
+    внутри системного блока, следом за его текстом. Подмешаешь туда справку о
+    говорящем — она встанет ПЕРЕД схемами, и две с половиной тысячи токенов
+    будут считаться заново каждую фразу. Справка же меняется постоянно: в
+    журнале говорящий скачет между Игорем, Ромой и «не узнал».
+
+    В облаке всё наоборот: там кэш явный, с отметкой на системном блоке, и
+    справка обязана идти ПОСЛЕ отметки — иначе кэш не совпадёт. Поэтому два
+    разных поведения, и оба здесь проверяются.
+    """
+    section("начало промпта не должно шевелиться")
+    from robot_voice.brain import Brain, Endpoint
+
+    мозг = Brain.__new__(Brain)
+    мозг.cfg = types.SimpleNamespace(max_tokens=1000)
+    мозг.specs = [{"name": "drive", "description": "ехать",
+                   "input_schema": {"type": "object", "properties": {}}}]
+
+    сообщения = [{"role": "user", "content": "привет"}]
+    домашняя = Endpoint(name="ПК", client=None, model="qwen3", effort="",
+                        use_cache=False)
+
+    мозг.about = "Это Игорь. Любит чай."
+    первый = мозг._params(домашняя, list(сообщения))
+    мозг.about = "Это Рома. Ему шесть лет."
+    второй = мозг._params(домашняя, list(сообщения))
+
+    check("системный промпт — простая строка",
+          isinstance(первый["system"], str), True)
+    # Вот главное: от смены говорящего системный блок не шевельнулся, значит
+    # и схемы за ним остались на прежних местах.
+    check("и он не изменился от смены говорящего",
+          первый["system"] == второй["system"], True)
+    check("справка уехала в сообщения",
+          первый["messages"][0], {"role": "system", "content": "Это Игорь. Любит чай."})
+    check("а реплика человека осталась на месте",
+          первый["messages"][-1], {"role": "user", "content": "привет"})
+    check("у второго говорящего своя справка",
+          второй["messages"][0]["content"], "Это Рома. Ему шесть лет.")
+
+    # Без справки лишнего сообщения не появляется: пустая строка «про
+    # говорящего» — это не «мы ничего о нём не знаем», это мусор в промпте.
+    мозг.about = ""
+    пусто = мозг._params(домашняя, list(сообщения))
+    check("без справки сообщений не прибавилось", len(пусто["messages"]), 1)
+
+    # В облаке — прежний порядок: справка ПОСЛЕ кэшируемого системного блока.
+    облако = Endpoint(name="облако", client=None, model="claude", effort="low",
+                      use_cache=True)
+    мозг.about = "Это Игорь."
+    небо = мозг._params(облако, list(сообщения))
+    check("в облаке системный промпт — список блоков",
+          isinstance(небо["system"], list), True)
+    check("с отметкой кэша на первом",
+          небо["system"][0].get("cache_control", {}).get("type"), "ephemeral")
+    check("и справкой после неё", небо["system"][-1]["text"], "Это Игорь.")
+    check("в сообщения ничего не подмешано", len(небо["messages"]), 1)
+
+
 def test_endpoints() -> None:
     """ПК основной, облако запасное: выключенный ПК не должен ломать разговор.
 
@@ -6348,7 +6416,7 @@ def main() -> int:
                  test_tls,
                  test_pult_and_server_agree,
                  test_thinkless, test_thinkless_habit,
-                 test_smart, test_endpoints, test_brain_money,
+                 test_smart, test_prompt_prefix, test_endpoints, test_brain_money,
                  test_history,
                  test_names, test_dialogue, test_camera, test_vision, test_camera_stream, test_shell_ascii, test_tof, test_fusion, test_tof_guard, test_reflex, test_follow, test_mapping, test_tof_in_pult, test_depth_to_eyes,
                  test_look_rule):
