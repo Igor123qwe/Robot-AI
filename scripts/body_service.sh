@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Детектор людей на BPU плюс раздача картинки всем остальным. Запускается
+# службой robot-body и работает постоянно.
+#
+# Постоянно — потому что в этом весь смысл. Детектор нужен не по команде «иди
+# за мной», а всё время: он даёт пеленг человека следованию, он же потом
+# понадобится для «кто в комнате» и «где кошка». Тридцать кадров в секунду на
+# BPU стоят десяти миллисекунд каждый и не мешают ничему.
+#
+# Но USB-камеру может держать ТОЛЬКО ОДИН процесс, и с этого момента её держит
+# hobot_usb_cam. Значит пульт и зрение обязаны брать картинку у него, а не
+# ломиться в /dev/video0 — иначе они ослепнут насовсем. Раздачей занимается
+# web_video_server: он отдаёт тот же ROS-топик обычным потоком MJPEG по HTTP,
+# который наш веб-сервер уже умеет читать (ROBOT_CAMERA_URL в ~/.robot-ai.env).
+#
+# Порядок такой:
+#     hobot_usb_cam  →  /image  →  mono2d_body_detection  →  детекции
+#                            └────→  web_video_server     →  пульт и зрение
+
+set -euo pipefail
+
+TROS="/opt/tros/humble"
+WORK_DIR="$HOME/tros_ws"
+MODEL_DIR="$TROS/lib/mono2d_body_detection/config"
+
+if [ ! -d "$MODEL_DIR" ]; then
+    echo "Нет моделей для BPU. Поставь:  sudo apt install hobot-models-basic" >&2
+    exit 1
+fi
+
+# Config копируем рядом с рабочим каталогом: путь к модели внутри узла
+# ОТНОСИТЕЛЬНЫЙ, и запуск из чужого места даёт «Model file is not exist» при
+# установленных моделях. Копия, а не ссылка: apt заменяет каталог целиком.
+mkdir -p "$WORK_DIR"
+cp -r "$MODEL_DIR" "$WORK_DIR/"
+cd "$WORK_DIR"
+
+# Строгий режим снимаем только на подключение окружения: скрипты ROS написаны
+# без оглядки на `set -u`, и setup.bash падает на необъявленной переменной.
+set +u
+# shellcheck disable=SC1091
+source "$TROS/setup.bash"
+set -u
+
+# Раздача картинки — своим процессом, чтобы падение одного не уносило другое.
+# Порт 8080: наш пульт сидит на 8000, а websocket-просмотрщик самого TogetheROS
+# на 8000 же и лезет — с ним мы не спорим, он нам не нужен.
+ros2 run web_video_server web_video_server --ros-args \
+    -p port:=8080 -p address:=0.0.0.0 &
+RAZDACHA=$!
+
+stop_all() {
+    kill "$RAZDACHA" 2>/dev/null || true
+}
+trap stop_all EXIT
+
+exec ros2 launch mono2d_body_detection mono2d_body_detection.launch.py

@@ -33,6 +33,12 @@ done
 # robot-voice и robot-autopull установлены, но выключены — включаются отдельно.
 echo "==> robot-voice установлен, но выключен."
 echo "    Включить: bash $REPO/scripts/setup_voice.sh"
+# robot-body тоже выключен, и намеренно. Он забирает камеру себе НАВСЕГДА, а
+# пульт с этого момента обязан брать картинку у него по ROBOT_CAMERA_URL.
+# Включить его, не дописав эту строку в env, — значит ослепить пульт и
+# «что видишь» разом, причём молча.
+echo "==> robot-body (детектор людей на BPU) установлен, но выключен."
+echo "    Включить: bash $REPO/scripts/setup_body.sh"
 echo "==> robot-autopull установлен, но выключен."
 echo "    Включить: sudo systemctl enable --now robot-autopull.timer"
 
