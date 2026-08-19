@@ -5191,6 +5191,82 @@ def test_camera_stream() -> None:
         сервер.КАМЕРА, сервер.CAMERA_SOURCE = было_камера, было_источник
 
 
+def test_tof_in_pult() -> None:
+    """Сетка дальномера доезжает до пульта — по-настоящему, через HTTP.
+
+    Проверка сквозная не из педантизма. Здесь сходятся три процесса: голосовая
+    служба пишет файл, веб-сервер его читает, страница рисует. Разъехаться они
+    могут молча — в имени файла, во времени, в форме ответа, — и снаружи это
+    выглядит как пустая панель, про которую не понять, дальномер сломался или
+    показ.
+    """
+    section("дальномер в пульте")
+    import http.client
+    import http.server
+    import os
+    import threading as thr
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "web"))
+    import server as сервер
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), сервер.Handler)
+    thr.Thread(target=srv.serve_forever, daemon=True).start()
+    порт = srv.server_address[1]
+
+    def спросить() -> dict:
+        связь = http.client.HTTPConnection("127.0.0.1", порт, timeout=10)
+        связь.request("GET", "/tof")
+        ответ = связь.getresponse()
+        тело = json.loads(ответ.read())
+        связь.close()
+        return тело
+
+    было = os.environ.get("HOME")
+    with tempfile.TemporaryDirectory() as дом:
+        os.environ["HOME"] = дом
+        try:
+            check("без файла — честный отказ", спросить()["есть"], False)
+
+            # Пишем сетку РУКАМИ ДРАЙВЕРА, а не своим json.dumps: иначе
+            # проверка подтвердит согласие теста с самим собой, а не двух
+            # настоящих сторон.
+            from robot_voice import tof as tof_mod
+
+            датчик = tof_mod.Дальномер.__new__(tof_mod.Дальномер)
+            датчик._выложено = 0.0
+            датчик._не_выложил = False
+            сетка = [[1.5] * 8 for _ in range(8)]
+            сетка[3][3] = 0.2
+            датчик._выложить(сетка)
+
+            ответ = спросить()
+            check("сетка доехала до пульта", ответ["есть"], True)
+            check("и в ней то, что записал драйвер", ответ["сетка"][3][3], 0.2)
+            check("порог стопа тоже приехал", ответ["стоп"], tof_mod.СТОП_БЛИЖЕ)
+
+            # Протухшую сетку отдавать нельзя. Позавчерашняя комната,
+            # показанная как сегодняшняя, хуже пустой панели: пустой не верят,
+            # а картинке верят.
+            файл = Path(дом) / ".robot-ai" / tof_mod.ФАЙЛ_СЕТКИ
+            данные = json.loads(файл.read_text())
+            данные["когда"] = time.time() - 60
+            файл.write_text(json.dumps(данные))
+            протухла = спросить()
+            check("протухшую не показываем", протухла["есть"], False)
+            check("и сказано, почему", "не сейчас" in протухла["почему"], True)
+        finally:
+            if было is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = было
+            srv.shutdown()
+
+    # Пульт и сервер должны звать одно и то же одинаково.
+    страница = (Path(__file__).resolve().parent.parent / "web" / "pult.html").read_text()
+    check("страница ходит за сеткой", "fetch('/tof')" in страница, True)
+    check("и знает про «не измерил»", "не измерил" in страница, True)
+
+
 def main() -> int:
     for test in (test_rules, test_numbers, test_when, test_timers,
                  test_alarms, test_survives_restart, test_alarm_rules,
@@ -5211,7 +5287,7 @@ def main() -> int:
                  test_thinkless, test_thinkless_habit,
                  test_smart, test_endpoints, test_brain_money,
                  test_history,
-                 test_names, test_dialogue, test_camera, test_vision, test_camera_stream, test_shell_ascii, test_tof, test_fusion, test_tof_guard, test_reflex,
+                 test_names, test_dialogue, test_camera, test_vision, test_camera_stream, test_shell_ascii, test_tof, test_fusion, test_tof_guard, test_reflex, test_tof_in_pult,
                  test_look_rule):
         test()
         print("   ...")

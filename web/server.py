@@ -383,6 +383,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.listen_stream()
         elif path == "/listen/status":
             self.send_json({"live": MIC.live})
+        elif path == "/tof":
+            self.сетка_дальномера()
         elif path == "/music/state":
             self.send_json({"кончилось": TRACKS.count})
         elif path.startswith("/speak/") and path.endswith(".wav"):
@@ -689,6 +691,32 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"source": base, "online": ok, "detail": detail})
 
     # --- вспомогательное ------------------------------------------------
+    def сетка_дальномера(self) -> None:
+        """Последняя сетка 8×8 в метрах — для пульта.
+
+        Читаем файл, который выкладывает голосовая служба. Своего порта не
+        открываем и открыть не можем: он не читается вдвоём, и второй читатель
+        не просто ничего не увидит — он отнимет байты у робота. Владелец один,
+        остальные смотрят через его окно.
+        """
+        файл = Path.home() / ".robot-ai" / "tof_last.json"
+        try:
+            данные = json.loads(файл.read_text())
+        except (OSError, ValueError):
+            self.send_json({"есть": False,
+                            "почему": "дальномер молчит или не настроен"})
+            return
+        возраст = time.time() - float(данные.get("когда") or 0)
+        сетка = данные.get("сетка")
+        if not (isinstance(сетка, list) and len(сетка) == 8) or возраст > СЕТКА_СТАРЕЕТ:
+            # Старая сетка хуже отсутствующей: пульт показал бы позавчерашнюю
+            # комнату как сегодняшнюю, и человек поверил бы картинке.
+            self.send_json({"есть": False,
+                            "почему": f"сетке {возраст:.0f} с, это уже не сейчас"})
+            return
+        self.send_json({"есть": True, "возраст": round(возраст, 2),
+                        "сетка": сетка, "стоп": СТОП_БЛИЖЕ})
+
     def send_json(self, obj: dict, code: int = 200) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
@@ -701,6 +729,14 @@ class Handler(SimpleHTTPRequestHandler):
     def fail(self, code: int, message: str) -> None:
         self.send_json({"online": False, "detail": message}, code)
 
+
+# Дальше этого сетка дальномера — уже не «сейчас». Полторы секунды: служба
+# пишет её пять раз в секунду, так что живая сетка всегда свежее.
+СЕТКА_СТАРЕЕТ = 1.5
+
+# Ближе этого робот не поедет — пульт красит такие зоны иначе. Держать в
+# согласии с СТОП_БЛИЖЕ в voice/robot_voice/tof.py.
+СТОП_БЛИЖЕ = 0.35
 
 # Сколько ждём рукопожатия от клиента. Дальше — не наш человек: браузер
 # здоровается сразу.

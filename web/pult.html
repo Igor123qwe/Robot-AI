@@ -108,6 +108,34 @@
   }
   .wheel .val { width: 42px; text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
 
+  /* --- дальномер ---
+     Восемь на восемь расстояний перед роботом. Показываем не ради красоты:
+     до сих пор единственным способом узнать, что видит датчик, был заход по
+     ssh и чтение простыни цифр. А смотреть в него приходится каждый раз,
+     когда робот отказался ехать, — то есть тогда, когда человек и так занят
+     роботом, а не терминалом. */
+  .tof { padding: 6px 12px; }
+  .tof-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 12px; color: var(--dim); margin-bottom: 4px;
+  }
+  .tof-why { font-size: 11px; }
+  .tof-grid {
+    display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px;
+  }
+  .tof-grid i {
+    aspect-ratio: 1; border-radius: 3px; font-style: normal;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 9px; font-variant-numeric: tabular-nums;
+    background: var(--line); color: var(--dim);
+  }
+  /* Цвет несёт смысл, а не украшает: красное — то, из-за чего робот встанет.
+     «Не измерил» остаётся серым и пустым — незнание нельзя красить в цвет
+     свободного пути, иначе стеклянная дверь выглядит как открытая. */
+  .tof-grid i.близко { background: var(--bad); color: #fff; }
+  .tof-grid i.рядом  { background: #7a5c1e; color: #fff; }
+  .tof-grid i.далеко { background: #24402c; color: #9ccfae; }
+
   /* --- скорость --- */
   .speed { display: flex; align-items: center; gap: 10px; padding: 6px 12px; }
   .speed label { font-size: 12px; color: var(--dim); flex: none; }
@@ -199,6 +227,14 @@
     <div class="wheel"><span class="name">ПП</span><span class="bar"><i id="wFR"></i></span><span class="val" id="vFR">0.00</span></div>
     <div class="wheel"><span class="name">ЗЛ</span><span class="bar"><i id="wRL"></i></span><span class="val" id="vRL">0.00</span></div>
     <div class="wheel"><span class="name">ЗП</span><span class="bar"><i id="wRR"></i></span><span class="val" id="vRR">0.00</span></div>
+  </div>
+
+  <div class="tof" id="tofBox" hidden>
+    <div class="tof-head">
+      <span>что видит дальномер</span>
+      <span class="tof-why" id="tofWhy"></span>
+    </div>
+    <div class="tof-grid" id="tofGrid"></div>
   </div>
 
   <div class="speed">
@@ -1033,6 +1069,47 @@ micBtn.addEventListener('click', () => (micOn ? micStop() : micStart()));
 
 // ── Главный цикл ─────────────────────────────────────────────────────────
 connect();
+// --- дальномер ---------------------------------------------------------
+// Сетку выкладывает голосовая служба, сервер её только отдаёт: порт не
+// читается вдвоём, и второй читатель отнял бы байты у самого робота.
+const tofBox = document.getElementById('tofBox');
+const tofGrid = document.getElementById('tofGrid');
+const tofWhy = document.getElementById('tofWhy');
+for (let i = 0; i < 64; i++) tofGrid.appendChild(document.createElement('i'));
+
+function drawTof(d) {
+  if (!d || !d.есть) {
+    // Прятать целиком нельзя: исчезнувшая панель читается как «всё хорошо».
+    tofBox.hidden = false;
+    tofWhy.textContent = (d && d.почему) || 'нет связи';
+    tofGrid.querySelectorAll('i').forEach(c => {
+      c.className = ''; c.textContent = '';
+    });
+    return;
+  }
+  tofBox.hidden = false;
+  tofWhy.textContent = '';
+  const стоп = d.стоп || 0.35;
+  const ячейки = tofGrid.querySelectorAll('i');
+  for (let р = 0; р < 8; р++) {
+    for (let к = 0; к < 8; к++) {
+      const м = d.сетка[р][к];
+      const c = ячейки[р * 8 + к];
+      if (!(м > 0)) {                 // ноль — «не измерил», а не «ноль метров»
+        c.className = ''; c.textContent = '';
+      } else {
+        c.className = м < стоп ? 'близко' : (м < 0.7 ? 'рядом' : 'далеко');
+        c.textContent = м.toFixed(1);
+      }
+    }
+  }
+}
+
+setInterval(() => {
+  fetch('/tof').then(r => r.json()).then(drawTof)
+               .catch(() => drawTof(null));
+}, 500);
+
 setInterval(publishCmdVel, 1000 / SEND_HZ);
 setInterval(drawWheels, 1000 / 30);
 
