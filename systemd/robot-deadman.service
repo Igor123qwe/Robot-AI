@@ -1,0 +1,22 @@
+[Unit]
+Description=Robot-AI: сторож мёртвой руки — колёса встают, если издатель /cmd_vel замолчал
+# После моста, но НЕ после голоса. Это принципиально: сторож защищает робота
+# от смерти голосового сервиса, и связывать их жизни зависимостью значит
+# уничтожить весь смысл.
+After=network.target robot-bridge.service
+Wants=robot-bridge.service
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/home/wheeltec/Robot-AI
+EnvironmentFile=-/home/wheeltec/.robot-ai.env
+ExecStart=/bin/bash /home/wheeltec/Robot-AI/scripts/deadman_service.sh
+Restart=always
+# Две секунды, а не десять: пока сторож не поднялся, робота не стережёт никто.
+RestartSec=2
+# Сторож должен пережить нехватку памяти, из-за которой умрёт охраняемый.
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

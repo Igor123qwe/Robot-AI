@@ -25,7 +25,17 @@ for f in "$REPO"/systemd/*.service "$REPO"/systemd/*.timer; do
 done
 sudo systemctl daemon-reload
 
-for unit in robot-base robot-bridge robot-web; do
+# robot-deadman включается ВМЕСТЕ с базовыми и намеренно.
+#
+# Драйвер шасси WHEELTEC не тормозит сам: Cmd_Vel_Callback пакует пришедший
+# Twist в кадр для STM32 — и всё. Ни таймера, ни таймаута; единственное
+# обнуление в деструкторе, а он при kill -9 или segfault не зовётся. То есть
+# последняя посланная скорость действует, пока не придёт следующая, и робот,
+# у которого посреди поездки умер голосовой сервис, продолжает ехать.
+#
+# Сторож — отдельный процесс: защищаемся мы как раз от смерти охраняемого.
+# Он публикует только нули, то есть навредить не может ничем.
+for unit in robot-base robot-bridge robot-web robot-deadman; do
   sudo systemctl enable "$unit"
   sudo systemctl restart "$unit"
 done
