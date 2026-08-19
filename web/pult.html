@@ -294,6 +294,7 @@
       <label>высота<input type="range" id="aimH" min="5" max="100" value="86"></label>
       <label class="aim-flip"><input type="checkbox" id="aimMirror"> зеркально</label>
       <label class="aim-flip"><input type="checkbox" id="aimUpside"> вверх ногами</label>
+      <label class="aim-flip"><input type="checkbox" id="aimSwap"> поперёк (ряды↔колонки)</label>
       <button id="aimSave">запомнить роботу</button>
       <span class="tof-why" id="aimSaid"></span>
     </div>
@@ -1190,11 +1191,11 @@ function drawTof(d) {
     for (let к = 0; к < 8; к++) {
       // Показываем сразу так, как галки просят. Иначе человек их крутит, а
       // картинка не меняется до перезапуска службы — и он решает, что галки
-      // не работают. Робот у себя разворачивает сетку тем же порядком:
-      // сперва ряды, потом колонки.
-      const р2 = aimUpside.checked ? 7 - р : р;
-      const к2 = aimMirror.checked ? 7 - к : к;
-      const м = d.сетка[р2][к2];
+      // не работают. Порядок тот же, что у робота: сперва поперёк (оно
+      // решает, что вообще считать рядом), потом ряды, потом колонки.
+      let р2 = aimUpside.checked ? 7 - р : р;
+      let к2 = aimMirror.checked ? 7 - к : к;
+      const м = aimSwap.checked ? d.сетка[к2][р2] : d.сетка[р2][к2];
       const c = ячейки[р * 8 + к];
       const o = tofOver.children[р * 8 + к];
       if (!(м > 0)) {                 // ноль — «не измерил», а не «ноль метров»
@@ -1221,6 +1222,7 @@ const aim = {
 const aimSaid = document.getElementById('aimSaid');
 const aimMirror = document.getElementById('aimMirror');
 const aimUpside = document.getElementById('aimUpside');
+const aimSwap = document.getElementById('aimSwap');
 for (let i = 0; i < 64; i++) tofOver.appendChild(document.createElement('i'));
 
 fetch('/tof/aim').then(r => r.json()).then(п => {
@@ -1228,6 +1230,7 @@ fetch('/tof/aim').then(r => r.json()).then(п => {
   aim.w.value = Math.round(п.ш * 100); aim.h.value = Math.round(п.в * 100);
   aimMirror.checked = !!п.зеркало;
   aimUpside.checked = !!п.вверхногами;
+  aimSwap.checked = !!п.поперёк;
   placeOverlay();
 }).catch(() => {});
 
@@ -1268,6 +1271,7 @@ document.getElementById('aimSave').addEventListener('click', () => {
     x: aim.x.value / 100, y: aim.y.value / 100,
     ш: aim.w.value / 100, в: aim.h.value / 100,
     зеркало: aimMirror.checked, вверхногами: aimUpside.checked,
+    поперёк: aimSwap.checked,
   });
   aimSaid.textContent = 'запоминаю…';
   fetch('/tof/aim', { method: 'POST', body: тело })
