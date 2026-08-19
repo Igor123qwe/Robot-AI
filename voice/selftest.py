@@ -2132,6 +2132,76 @@ def test_vision_track() -> None:
           глаз.подписка()["topic"], вижу.ТОПИК)
 
 
+def test_follow_with_camera() -> None:
+    """Камера подхватывает там, где дальномер потерял.
+
+    У дальномера шестьдесят градусов и восемь колонок. Шаг человека вбок — и
+    он вне поля зрения: робот встаёт и через шесть секунд говорит «Больше не
+    иду», хотя человек в двух шагах, просто правее. Ровно это и было в живом
+    журнале.
+
+    У камеры сто тридцать градусов и рамка в пикселях — втрое шире и точнее.
+    Но метров она не знает, и знать их обязательно: держать дистанцию по
+    размеру рамки значит подъезжать вплотную к худому и отставать от полного.
+    Поэтому поворот по камере, расстояние по дальномеру.
+    """
+    section("следую за тобой, глядя камерой")
+    import types
+
+    from robot_voice import follow
+    from robot_voice import vision_track as вижу
+
+    # Настоящее сообщение с живого робота, укороченное до сути.
+    def детекция(x_offset, width=409, номер=4):
+        return {"header": {"frame_id": "5148"}, "fps": 30, "targets": [
+            {"type": "person", "track_id": номер, "rois": [
+                {"type": "body", "confidence": 0.0,
+                 "rect": {"x_offset": x_offset, "y_offset": 205,
+                          "height": 261, "width": width,
+                          "do_rectify": False}}],
+             "attributes": [], "points": []}]}
+
+    глаз = вижу.Глазомер()
+    глаз.принять(детекция(x_offset=2))
+    check("человек слева опознан", глаз.держим, 4)
+    check("и пеленг влево", глаз.угол > 0, True)
+
+    # Уверенность у этого детектора ВСЕГДА ноль — так он устроен. Фильтровать
+    # по ней значит не видеть никого и никогда.
+    check("нулевая уверенность не мешает", глаз.свежий, True)
+
+    # --- камера ведёт, когда дальномер уже не видит ----------------------
+    поехали = []
+    ros = types.SimpleNamespace(publish_twist=lambda *a: поехали.append(a))
+    пусто = [[0.0] * 8 for _ in range(8)]
+    тоф = types.SimpleNamespace(
+        взгляд=lambda: types.SimpleNamespace(свежий=True, сетка=пусто),
+        мешает=lambda: "")
+    ведомый = follow.Следование(ros, тоф, глаза=глаз)
+    check("дальномер и правда никого не видит",
+          follow.найти_цель(пусто), None)
+
+    # Раньше здесь следование заканчивалось. Теперь есть камерный пеленг.
+    ведомый._стоп.clear()
+    ведомый.почему_кончилось = ""
+    import threading as th
+    поток = th.Thread(target=ведомый._вести, daemon=True)
+    поток.start()
+    time.sleep(0.6)
+    ведомый.хватит("проверка")
+    поток.join(timeout=2)
+    # publish_twist зовут и без доводов — это команда «стоять».
+    повороты = [а[2] for а in поехали if len(а) >= 3 and abs(а[2]) > 1e-6]
+    check("робот довернулся к человеку по камере", bool(повороты), True)
+    check("и доворачивался влево", all(w > 0 for w in повороты), True)
+
+    # --- без камеры всё как было -----------------------------------------
+    # Следование обязано работать и без детектора: не запущенный узел ROS не
+    # должен означать онемевшую команду.
+    слепой = follow.Следование(ros, тоф)
+    check("без глаз следование собирается", слепой.глаза, None)
+
+
 def test_plane() -> None:
     """Пол — плоскость, а не «нижние два ряда».
 
@@ -6926,7 +6996,7 @@ def main() -> int:
                  test_slicing, test_stop_while_thinking,
                  test_wake_stream, test_sound_cards, test_speech_streams,
                  test_turn_breakdown, test_turn_end, test_barge_in,
-                 test_plane, test_vision_track,
+                 test_plane, test_vision_track, test_follow_with_camera,
                  test_pc_url, test_hidden,
                  test_music_queue, test_music_volume, test_noisy_ear,
                  test_counting, test_rules_reach_tools, test_ws_proxy,

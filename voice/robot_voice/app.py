@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import intents, turn_end
+from . import intents, turn_end, vision_track
 from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
@@ -688,7 +688,14 @@ def main() -> None:
     # Следование за человеком. Пеленг и дистанцию даёт дальномер: восемь
     # колонок на шестьдесят градусов — это семь с половиной градусов на
     # колонку, точнее, чем нужно колёсам. Камера для этого не нужна вовсе.
-    ведомый = Следование(ros, дальномер, говорить=voice.say) if дальномер else None
+    # Глаза следования: детектор людей на BPU. Подписку оформляем всегда —
+    # узел могут поднять и после робота, тогда детекции просто начнут
+    # приходить. Нет узла — следование идёт по одному дальномеру, как раньше.
+    глаза = vision_track.Глазомер()
+    if ros is not None:
+        ros.людей_видно = глаза.принять
+    ведомый = (Следование(ros, дальномер, говорить=voice.say, глаза=глаза)
+               if дальномер else None)
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
