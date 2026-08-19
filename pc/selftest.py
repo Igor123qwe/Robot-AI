@@ -588,6 +588,54 @@ def test_think_switch() -> None:
     check("разбираемся однажды", o.think, False)
 
 
+def test_model_choice() -> None:
+    """Рассуждающую модель подменяем нерассуждающей — но только на скачанную.
+
+    Размышления наружу не идут: их режет фильтр по дороге к речи. А время на
+    них тратится целиком, и всё это время робот молчит — на живом роботе «Да,
+    я здесь!» стоило 695 токенов и девяти секунд, из которых восемь ушли в
+    никуда. Выключить это у гибридной модели нечем: три способа перепробованы
+    и все три записаны в kuzya_pc.py как неудачи.
+
+    Но подменять можно только на то, что уже есть на диске. Предложить
+    несуществующую модель — значит сломать разговор целиком ради скорости, а
+    неотвечающий робот хуже медленного.
+    """
+    section("выбор модели: не думать вслух")
+    from kuzya_pc import выбрать_модель, рассуждает
+
+    check("гибрид qwen3 думает", рассуждает("qwen3:4b"), True)
+    # Одно слово в имени, а поведение противоположно. Спутать их — значит
+    # либо не лечить медлительность, либо лечить несуществующую.
+    check("instruct-сборка не думает", рассуждает("qwen3:4b-instruct-2507"), False)
+    check("deepseek-r1 думает", рассуждает("deepseek-r1:7b"), True)
+    check("обычная модель не думает", рассуждает("llama3.1:8b"), False)
+
+    # Замена скачана — берём молча, но говорим почему.
+    имя, слова = выбрать_модель(
+        "qwen3:4b", ["qwen3:4b", "qwen3:4b-instruct-2507-q4_K_M", "llama3.1:8b"])
+    check("взяли нерассуждающую", имя, "qwen3:4b-instruct-2507-q4_K_M")
+    check("и объяснили почему", "думает вслух" in слова, True)
+
+    # Скачано другое квантование той же сборки — подходит. Заставлять качать
+    # ровно нашу было бы придирками.
+    имя, _ = выбрать_модель("qwen3:4b", ["qwen3:4b", "qwen3:4b-instruct-q8_0"])
+    check("чужое квантование тоже годится", имя, "qwen3:4b-instruct-q8_0")
+
+    # Замены нет — работаем как работали и называем ОДНУ команду.
+    имя, слова = выбрать_модель("qwen3:4b", ["qwen3:4b"])
+    check("без замены модель не меняем", имя, "qwen3:4b")
+    check("но команду называем", "ollama pull qwen3:4b-instruct-2507-q4_K_M" in слова, True)
+
+    # Нерассуждающую не трогаем и молчим о ней.
+    имя, слова = выбрать_модель("qwen3:4b-instruct-2507", ["qwen3:4b-instruct-2507"])
+    check("молчаливую не трогаем", (имя, слова), ("qwen3:4b-instruct-2507", ""))
+
+    # Чужое семейство не подсовываем: llama вместо qwen — это другой робот.
+    имя, _ = выбрать_модель("qwen3:4b", ["qwen3:4b", "llama3.1:8b-instruct"])
+    check("чужое семейство не берём", имя, "qwen3:4b")
+
+
 def test_tool_call() -> None:
     section("вызов инструмента через мост")
     import anthropic
@@ -899,7 +947,7 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch,
+    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch, test_model_choice,
                  test_tool_call, test_broken,
                  test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health):
         test()

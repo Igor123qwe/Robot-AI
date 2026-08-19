@@ -206,6 +206,8 @@ class Remote:
         self._lock = threading.Lock()
         self._down_until = 0.0
         self._said_local = False
+        # Соединение с ПК, живущее между фразами. См. _сессия.
+        self._session = None
         # Уверенность последнего распознавания — см. Recognizer.confidence.
         self.confidence: float | None = None
         # Кого узнал ПК по голосу и насколько похоже.
@@ -242,12 +244,30 @@ class Remote:
                 return text
         return self._fallback(wav_bytes)
 
+    def _сессия(self):
+        """HTTP-сессия к ПК, живущая между фразами.
+
+        Не украшение. Голый requests.post открывает НОВОЕ TCP-соединение на
+        каждую фразу: трёхстороннее рукопожатие, медленный старт, и всё это
+        перед тем, как уйдёт первый байт звука. По домашней сети это единицы
+        миллисекунд, по Wi-Fi — десятки, и они платятся ровно в тот момент,
+        когда человек уже договорил и ждёт.
+
+        Сессия заводится лениво и живёт до конца процесса: соединение с ПК
+        держится открытым, и следующая фраза уходит сразу.
+        """
+        if self._session is None:
+            import requests
+
+            self._session = requests.Session()
+        return self._session
+
     def _ask_pc(self, wav_bytes: bytes) -> str | None:
         import requests
 
         started = time.monotonic()
         try:
-            resp = requests.post(
+            resp = self._сессия().post(
                 self.url, data=wav_bytes,
                 headers={"Content-Type": "audio/wav"},
                 timeout=(PC_CONNECT, PC_READ),
