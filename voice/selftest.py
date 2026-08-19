@@ -4054,6 +4054,57 @@ def test_sentence_cap() -> None:
     check("предел в одну фразу тоже держится", len(сказано), 1)
 
 
+def test_silence_when_not_mine() -> None:
+    """Чужая речь получает молчание, а не «ты говоришь не со мной».
+
+    С живого робота: в открытом разговоре он услышал чужую беседу, сходил в
+    облако за семнадцать тысяч токенов и объявил вслух «Похоже, ты говоришь не
+    со мной». То есть влез в разговор, которого не касался, да ещё и за деньги.
+    Молчание тут — единственный верный ответ, и модели нужно слово, которым
+    его попросить.
+    """
+    section("не мне — молчу")
+    import contextlib as _c
+
+    from robot_voice.app import _respond
+    from robot_voice.config import МИМО
+
+    check("модель знает, чем промолчать", МИМО in SYSTEM_PROMPT, True)
+    check("и что вслух это говорить нельзя",
+          "Молчание — тоже ответ" in SYSTEM_PROMPT, True)
+
+    сказано: list[str] = []
+
+    class Речь:
+        def feed(self, ф): сказано.append(ф)
+        def close(self): return 1
+
+    class Голос:
+        speaker = types.SimpleNamespace(stream=lambda **kw: Речь(), last_said="")
+        def say(self, т, **kw): сказано.append(т); return 1
+        def hold(self): return _c.nullcontext()
+        def quiet(self): return _c.nullcontext()
+        def status(self, т): pass
+
+    class Мозг:
+        позвал: list = []
+        last_talk = 0.0
+        ответ = МИМО
+
+        def reply(self, команда, вслух, smart=False):
+            вслух(self.ответ + " ")
+            return self.ответ
+
+    мозг = Мозг()
+    _respond("что там по агентам и функционалу", мозг, Голос())
+    check("вслух не сказано ничего", сказано, [])
+
+    сказано.clear()
+    мозг.ответ = "Привет."
+    _respond("кузя привет", мозг, Голос())
+    check("а обычный ответ звучит", [ф.strip() for ф in сказано], ["Привет."])
+
+
 def test_no_narration() -> None:
     """Робот не отчитывается о том, чего не сделал.
 
@@ -5597,7 +5648,7 @@ def main() -> int:
                  test_weather, test_notes, test_repair, test_looped, test_made_up, test_speakable, test_people, test_notes_about_people, test_meeting, test_auto_meeting, test_ascii_out, test_wake_word, test_not_for_me, test_remote_voice,
                  test_unsure_does_not_drive,
                  test_odometry, test_motion_queue, test_route,
-                 test_no_broken_promise, test_chain, test_stop_stops_everything, test_instant_ignores_stale, test_sentence_cap, test_no_narration,
+                 test_no_broken_promise, test_chain, test_stop_stops_everything, test_instant_ignores_stale, test_sentence_cap, test_silence_when_not_mine, test_no_narration,
                  test_one_voice,
                  test_slicing, test_stop_while_thinking,
                  test_wake_stream, test_sound_cards, test_speech_streams,

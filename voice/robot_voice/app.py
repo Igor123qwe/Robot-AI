@@ -23,7 +23,7 @@ from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
 from .camera import Глаза
-from .config import Config
+from .config import МИМО, Config
 from .music import LOUD as MUSIC_LOUD
 from .music import Колонка, Player, Pult
 from .notes import Notes
@@ -1640,7 +1640,19 @@ def _respond(command: str, brain: Brain, voice: Voice,
         озвучено: list[str] = []
         было_прерываний = getattr(voice.speaker, "hushes", 0)
 
+        мимо = [False]
+
         def произнести(sentence: str) -> None:
+            # «Не мне» — это повод промолчать, а не сказать «это не мне».
+            # На живом роботе он в открытом разговоре услышал чужую беседу,
+            # сходил в облако за семнадцать тысяч токенов и объявил вслух:
+            # «Похоже, ты говоришь не со мной». То есть влез в разговор,
+            # которого не касался, да ещё и за деньги. Молчание тут —
+            # единственный верный ответ.
+            if sentence.strip(" .!?…").upper() == МИМО:
+                мимо[0] = True
+                log.info("модель говорит, что фраза не мне — молчу")
+                return
             # Промпт просит одну-две фразы, но четырёхмиллиардная модель
             # запреты держит плохо: на живом роботе «Кузя, ты тут?» получило
             # три реплики подряд, а из тринадцати ответов за вечер девять
@@ -1714,6 +1726,11 @@ def _respond(command: str, brain: Brain, voice: Voice,
                 for предложение in придержанное:
                     произнести(предложение)
                 said = " ".join(придержанное)
+            if мимо[0]:
+                # Не мне — значит и в память разговора это не идёт. Иначе
+                # робот запомнит служебное слово как свою реплику и однажды
+                # повторит его на «что ты сказал».
+                said = ""
         except Exception as e:
             log.exception("не смог ответить")
             start_speaking()
