@@ -536,6 +536,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 player=None,
                 eyes=None,
                 tof=None,
+                follower=None,
                 news_url: str = "") -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
@@ -807,6 +808,19 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         начало = f"Делаю {имя}" if имя else "Поехал по маршруту"
         return f"{начало}, {сколько}.{обрезано}"
 
+    def follow_me() -> str:
+        """Идти за человеком. Пеленг и дистанцию даёт дальномер.
+
+        Имя обязательно, как и для поездки: «иди за мной» из телевизора —
+        ровно та фраза, которую робот не должен принимать на свой счёт.
+        """
+        if follower is None:
+            return "Ходить за тобой я не умею: нет дальномера."
+        blocked = name_guard() or battery_guard()
+        if blocked:
+            return blocked
+        return follower.начать()
+
     def stop() -> str:
         """«Стоп» и «хватит» — это «прекрати всё», а не только тормоз колёс.
 
@@ -826,10 +840,17 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         was_moving = ros.moving
         was_busy = getattr(ros, "busy", was_moving)
         играла = player is not None and player.играет
+        # Следование — это тоже движение, и «стоп» обязано его прекращать.
+        # Иначе робот отвечает «остановился» и продолжает ехать за человеком:
+        # колёса встали на одну десятую секунды, а следующий круг цикла
+        # тронул их снова.
+        шёл_следом = follower is not None and follower.хватит("сказали стоп")
         ros.stop_motion()
         if играла:
             player.выключить()
         log.info("стоп%s", " (и музыку)" if играла else "")
+        if шёл_следом:
+            return "Больше не иду." + (" Музыку выключил." if играла else "")
         if was_moving:
             return "Остановился, музыку выключил." if играла else "Остановился."
         if играла:
@@ -1268,6 +1289,16 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 "required": ["steps"],
             },
             run=route,
+        ),
+        Tool(
+            name="follow_me",
+            description=(
+                "Идти за человеком по квартире, держась в шаге позади. "
+                "Зови на «иди за мной», «следуй за мной», «пошли со мной». "
+                "Робот сам находит того, кто перед ним, и держит метр. "
+                "Прекращается словом «стоп»."),
+            input_schema=EMPTY_SCHEMA,
+            run=follow_me,
         ),
         Tool(
             name="stop",

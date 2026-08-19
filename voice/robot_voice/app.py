@@ -31,6 +31,7 @@ from .people import People
 from .ros import Ros
 from .state import State
 from .stt import Recognizer, Remote
+from .follow import Следование
 from .tof import Дальномер
 from .tools import CUTOFF_VOLT, Timers, build_tools
 from .tts import SentenceBuffer, Speaker
@@ -665,11 +666,16 @@ def main() -> None:
     глаза = Глаза(pc_url=cfg.pc_url, api_key=cfg.api_key,
                   api_base=cfg.api_base, model=cfg.model,
                   vision_model=cfg.vision_model, tof=дальномер)
+    # Следование за человеком. Пеленг и дистанцию даёт дальномер: восемь
+    # колонок на шестьдесят градусов — это семь с половиной градусов на
+    # колонку, точнее, чем нужно колёсам. Камера для этого не нужна вовсе.
+    ведомый = Следование(ros, дальномер, говорить=voice.say) if дальномер else None
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
-                        player=player, eyes=глаза, tof=дальномер)
+                        player=player, eyes=глаза, tof=дальномер,
+                        follower=ведомый)
     brain = Brain(cfg, tools)
     # Счётчик отдаём после сборки мозга: глаза нужны инструментам, а мозг —
     # инструментам же, и по кругу это не собрать.
