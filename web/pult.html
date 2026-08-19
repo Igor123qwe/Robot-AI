@@ -1157,6 +1157,7 @@ connect();
 const tofBox = document.getElementById('tofBox');
 const tofGrid = document.getElementById('tofGrid');
 const tofWhy = document.getElementById('tofWhy');
+let кадровСетки = 0;
 for (let i = 0; i < 64; i++) tofGrid.appendChild(document.createElement('i'));
 
 function drawTof(d) {
@@ -1171,7 +1172,13 @@ function drawTof(d) {
     return;
   }
   tofBox.hidden = false;
-  tofWhy.textContent = '';
+  // Возраст сетки. Ради него это и показывается: когда видео встаёт, по
+  // одной картинке не понять, встал робот, встала сеть или встал только
+  // показ. Если числа тут идут и возраст мал — жив и робот, и связь, а
+  // виновато видео. Если возраст растёт — молчит сам робот.
+  tofWhy.textContent = (d.возраст !== undefined)
+    ? d.возраст.toFixed(1) + ' с назад, кадр ' + (++кадровСетки)
+    : '';
   const стоп = d.стоп || 0.35;
   const ячейки = tofGrid.querySelectorAll('i');
   for (let р = 0; р < 8; р++) {
