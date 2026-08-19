@@ -429,6 +429,36 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"кончилось": TRACKS.done()})
             return
 
+        if path == "/tof/aim":
+            # Куда в кадре смотрит сетка и как она развёрнута. Настраивается
+            # глазами в пульте: калибровочной доски у нас нет, а точность до
+            # пикселя тут и не нужна — зона дальномера это конус шириной с
+            # ладонь на метре.
+            #
+            # Стоит ВЫШЕ проверки «только с самого робота», и это не
+            # небрежность, а суть: пульт живёт в браузере на компьютере
+            # человека, то есть как раз не на роботе. Ниже эта ручка была
+            # недостижима в принципе — ровно та ошибка, которую человек видит
+            # как «не вышло: 400» и не может объяснить. Речь тут не идёт ни о
+            # движении, ни о голосе: это четыре числа и две галки про то, как
+            # рисовать сетку.
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(max(0, min(length, 512))).decode("utf-8", "replace")
+            try:
+                пришло = json.loads(body or "{}")
+                новый = {к: float(пришло[к]) for к in ("x", "y", "ш", "в")}
+            except (ValueError, KeyError, TypeError):
+                self.fail(400, "нужны числа x, y, ш, в — доли кадра")
+                return
+            if not all(0.0 <= з <= 1.0 for з in новый.values()):
+                self.fail(400, "доли кадра — от нуля до единицы")
+                return
+            новый["зеркало"] = bool(пришло.get("зеркало"))
+            новый["вверхногами"] = bool(пришло.get("вверхногами"))
+            записать_прицел(новый)
+            self.send_json({"ok": True, "прицел": новый})
+            return
+
         if path not in ("/speak", "/speak/stop", "/speak/heard", "/speak/status",
                         "/speak/radio", "/speak/track", "/speak/volume"):
             self.fail(404, "нет такой ручки")
@@ -483,26 +513,6 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             SPEECH.broadcast({"громкость": доля})
             self.send_json({"ok": True})
-            return
-
-        if path == "/tof/aim":
-            # Куда в кадре смотрит сетка. Настраивается глазами в пульте —
-            # калибровочной доски у нас нет, а точность до пикселя тут и не
-            # нужна: зона дальномера — это конус шириной с ладонь на метре.
-            body = self.rfile.read(max(0, min(length, 512))).decode("utf-8", "replace")
-            try:
-                пришло = json.loads(body or "{}")
-                новый = {к: float(пришло[к]) for к in ("x", "y", "ш", "в")}
-            except (ValueError, KeyError, TypeError):
-                self.fail(400, "нужны числа x, y, ш, в — доли кадра")
-                return
-            if not all(0.0 <= з <= 1.0 for з in новый.values()):
-                self.fail(400, "доли кадра — от нуля до единицы")
-                return
-            новый["зеркало"] = bool(пришло.get("зеркало"))
-            новый["вверхногами"] = bool(пришло.get("вверхногами"))
-            записать_прицел(новый)
-            self.send_json({"ok": True, "прицел": новый})
             return
 
         if path in ("/speak/heard", "/speak/status"):

@@ -5314,6 +5314,49 @@ def test_depth_to_eyes() -> None:
     check("без дальномера тоже ничего",
           камера_модуль.Глаза()._про_расстояния(), "")
 
+    # Прицел сохраняется ПО-НАСТОЯЩЕМУ, через HTTP, как это делает пульт.
+    # Проверка появилась после того, как ручка оказалась ниже двух заслонов —
+    # белого списка и запрета «только с самого робота», — и была недостижима
+    # в принципе. Человек видел «не вышло: 400» и объяснить не мог. Прямой
+    # вызов записать_прицел этого не ловит: он и так работает.
+    import http.client as _http
+    import http.server as _hs
+    import threading as _thr
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "web"))
+    import server as _сервер
+
+    было_дома = os.environ.get("HOME")
+    with tempfile.TemporaryDirectory() as дом2:
+        os.environ["HOME"] = дом2
+        srv2 = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _сервер.Handler)
+        _thr.Thread(target=srv2.serve_forever, daemon=True).start()
+        try:
+            связь = _http.HTTPConnection("127.0.0.1", srv2.server_address[1],
+                                         timeout=10)
+            связь.request("POST", "/tof/aim", json.dumps(
+                {"x": 0.5, "y": 0.5, "ш": 0.4, "в": 0.8,
+                 "зеркало": True, "вверхногами": False}))
+            ответ = связь.getresponse()
+            тело = ответ.read()
+            связь.close()
+            check("пульт может сохранить прицел", ответ.status, 200)
+            check("и галка доехала до файла",
+                  json.loads(тело)["прицел"]["зеркало"], True)
+            # И обратно тем же путём.
+            связь = _http.HTTPConnection("127.0.0.1", srv2.server_address[1],
+                                         timeout=10)
+            связь.request("GET", "/tof/aim")
+            назад = json.loads(связь.getresponse().read())
+            связь.close()
+            check("и читается обратно", (назад["ш"], назад["зеркало"]), (0.4, True))
+        finally:
+            srv2.shutdown()
+            if было_дома is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = было_дома
+
     # Пульт и робот обязаны понимать прицел одинаково: файл у них общий, а
     # код разный — они живут в разных процессах и друг друга не импортируют.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "web"))
