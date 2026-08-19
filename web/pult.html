@@ -641,16 +641,20 @@ function normalizeCamUrl(raw) {
   return u.origin + path;
 }
 
-camBtn.addEventListener('click', () => {
-  const base = normalizeCamUrl(camUrl.value);
-  camUrl.value = base;
-  localStorage.setItem('robot.camUrl', base);
+// Что показываем сейчас. Нужно сторожу ниже: он переподключает поток, а для
+// этого должен знать, что именно был должен показывать.
+let видеоБаза = '';
 
+function включитьВидео(base) {
+  видеоБаза = base;
   const old = videoBox.querySelector('img');
   if (old) old.remove();
 
   // Прокси отдаёт поток прямо по /camera, у телефона он лежит в /video.
-  const src = base.startsWith('/') ? base : base + '/video';
+  // Метка времени — чтобы браузер не подсунул поток из кэша при
+  // переподключении: он охотно отдаёт «тот же адрес» вместе с его концом.
+  const src = (base.startsWith('/') ? base : base + '/video')
+              + (base.includes('?') ? '&' : '?') + 't=' + Date.now();
   const img = document.createElement('img');
   img.src = src;
   img.onerror = () => {
@@ -669,7 +673,34 @@ camBtn.addEventListener('click', () => {
   };
   videoHint.style.display = 'none';
   videoBox.appendChild(img);
+}
+
+camBtn.addEventListener('click', () => {
+  const base = normalizeCamUrl(camUrl.value);
+  camUrl.value = base;
+  localStorage.setItem('robot.camUrl', base);
+  включитьВидео(base);
 });
+
+// Сторож потока. У живого multipart-потока img.complete равно false: ресурс
+// ещё грузится. Как только сервер закрыл раздачу, оно становится true, а
+// картинка застывает на последнем кадре — и человек видит зависшее видео,
+// про которое неоткуда узнать, что оно зависло.
+//
+// Двух совпадений подряд требуем нарочно: в первые мгновения после
+// подключения браузер успевает пометить ресурс завершённым, и одиночная
+// проверка переподключала бы поток по кругу.
+let застыло = 0;
+setInterval(() => {
+  if (!видеоБаза) return;
+  const img = videoBox.querySelector('img');
+  if (!img || !img.complete) { застыло = 0; return; }
+  застыло += 1;
+  if (застыло >= 2) {
+    застыло = 0;
+    включитьВидео(видеоБаза);
+  }
+}, 4000);
 
 camBtn.click();
 
