@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Робот — пульт</title>
 <style>
+  /* Атрибут hidden задаёт display:none с нулевой специфичностью, и любое
+     наше правило с display его молча перебивает. Спрятанное продолжает
+     показываться, причём в неожиданном месте. Ставим это правило первым и
+     с !important — дешевле, чем помнить про специфичность в каждом месте. */
+  [hidden] { display: none !important; }
   :root {
     --bg: #14161a;
     --panel: #1e2128;
@@ -50,11 +55,17 @@
   .side {
     display: flex; flex-direction: column; min-height: 0;
     width: 100%; max-width: 620px; margin: 0 auto;
+    /* Прокрутка, а не выдавливание: не поместилось — крути, но видео у
+       робота не отбирай. */
+    overflow-y: auto;
   }
 
   /* --- видео --- */
   #videoBox {
-    position: relative; flex: 1; min-height: 0;
+    /* Нижний предел обязателен. Панель дальномера растёт снизу, а видео
+       сжимается первым, потому что только у него flex — и однажды оно
+       сжимается в ноль. Двести пикселей робот всегда оставляет себе. */
+    position: relative; flex: 1; min-height: 200px;
     background: #0b0d10; display: flex; align-items: center; justify-content: center;
   }
   #videoBox img { max-width: 100%; max-height: 100%; object-fit: contain; }
@@ -120,8 +131,13 @@
     font-size: 12px; color: var(--dim); margin-bottom: 4px;
   }
   .tof-why { font-size: 11px; }
+  /* Ширину ограничиваем, и это не косметика. Без предела восемь колонок
+     растягиваются по всей панели, клетки становятся с палец, панель занимает
+     весь экран — и выдавливает видео за нижний край. На снимке из пульта
+     было ровно это: сетка есть, видео нет. */
   .tof-grid {
     display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px;
+    max-width: 232px;
   }
   .tof-grid i {
     aspect-ratio: 1; border-radius: 3px; font-style: normal;
@@ -1186,6 +1202,11 @@ function placeOverlay() {
   tofOver.style.width = дш + 'px';
   tofOver.style.height = дв + 'px';
   tofOver.hidden = !tofOverOn.checked;
+  // Когда сетка лежит на видео, отдельный квадрат под ним — то же самое
+  // дважды и полпанели впустую. Прячем, но только если наложение правда
+  // рисуется: при выключенном видео квадрат остаётся единственным способом
+  // увидеть, что там у датчика.
+  tofGrid.hidden = !tofOver.hidden;
 }
 
 tofOverOn.addEventListener('change', () => {
