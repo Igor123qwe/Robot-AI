@@ -288,11 +288,42 @@ def aplay_cmd(sample_rate: int, device: str = "") -> list[str]:
     return cmd + ["-"]
 
 
-class Speech:
+class ПервыйЗвук:
+    """Одна засечка: когда из этой реплики впервые пошёл звук.
+
+    Нужна измерителю задержки (app.Turn), и без неё самое дорогое звено не
+    видно вовсе. Снаружи заметно только, когда текст ОТДАЛИ синтезу, — а от
+    этого момента до первого сэмпла в динамике проходит холодный старт piper,
+    сам синтез и дорога до колонки. Пока это не измерено, «робот тормозит»
+    чинится наугад.
+
+    Общий предок у трёх видов реплики (свой piper, синтез на ПК, браузер): все
+    три обязаны отвечать на один и тот же вопрос одинаково, иначе цифры из
+    журнала нельзя будет сравнивать между режимами.
+    """
+
+    def __init__(self) -> None:
+        self.on_sound: Callable[[], None] | None = None
+        self._прозвучал = False
+
+    def звук_пошёл(self) -> None:
+        if self._прозвучал or self.on_sound is None:
+            return
+        self._прозвучал = True
+        try:
+            self.on_sound()
+        except Exception:                       # noqa: BLE001
+            # Измеритель не смеет ломать речь. Молчащий робот из-за неверной
+            # засечки — цена, несоизмеримая с пользой от засечки.
+            log.exception("не смог отметить первый звук")
+
+
+class Speech(ПервыйЗвук):
     """Одна реплика робота в динамик. Предложения докидываются по мере генерации."""
 
     def __init__(self, piper_cmd: list[str], sample_rate: int,
                  volume: float = 1.0, device: str = "") -> None:
+        super().__init__()
         self._piper = subprocess.Popen(
             piper_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -320,6 +351,7 @@ class Speech:
                 chunk = self._piper.stdout.read(4096)
                 if not chunk:
                     break
+                self.звук_пошёл()
                 self._aplay.stdin.write(scale(chunk, volume))
         except (BrokenPipeError, ValueError, OSError) as e:
             broken = True
@@ -343,6 +375,13 @@ class Speech:
             self._piper.stdin.flush()
         except BrokenPipeError:
             log.warning("piper: процесс закрылся раньше времени")
+        if self._pump is None:
+            # На полной громкости piper пишет прямо в aplay, минуя Python, и
+            # первый сэмпл нам не виден. Отмечаем момент отдачи текста и
+            # называем вещи своими именами: настоящий звук будет чуть позже.
+            # Гонять звук через Python ради засечки нельзя — это его главный
+            # тракт, и лишний прыжок в нём дороже любой цифры в журнале.
+            self.звук_пошёл()
 
     def close(self) -> int:
         """Дожидается, пока всё сказанное действительно прозвучит.
@@ -370,7 +409,7 @@ class Speech:
         return 1
 
 
-class RemoteSpeech:
+class RemoteSpeech(ПервыйЗвук):
     """Реплика в свой динамик, но синтезированная на ПК.
 
     Отличие от Speech только в источнике звука: там piper пишет в трубу сам,
@@ -383,6 +422,7 @@ class RemoteSpeech:
 
     def __init__(self, remote: RemoteVoice, fallback_cmd: list[str],
                  volume: float = 1.0, device: str = "") -> None:
+        super().__init__()
         self.remote = remote
         self.fallback_cmd = fallback_cmd
         self.volume = volume
@@ -417,6 +457,7 @@ class RemoteSpeech:
             try:
                 self._aplay.stdin.write(scale(pcm, self.volume))
                 self._aplay.stdin.flush()
+                self.звук_пошёл()
             except (BrokenPipeError, ValueError, OSError) as e:
                 log.warning("звук до динамика не дошёл: %s", e)
                 break
@@ -447,7 +488,7 @@ class RemoteSpeech:
         return 1
 
 
-class WebSpeech:
+class WebSpeech(ПервыйЗвук):
     """Реплика робота в браузер: каждое предложение уходит, как только готово.
 
     Синтез идёт в своём потоке — иначе он вставал бы поперёк чтения ответа
@@ -457,6 +498,7 @@ class WebSpeech:
     def __init__(self, piper_cmd: list[str], sample_rate: int, endpoint: str,
                  volume: float = 1.0, cache: "PhraseCache | None" = None,
                  remote: "RemoteVoice | None" = None) -> None:
+        super().__init__()
         self.piper_cmd = piper_cmd
         self.sample_rate = sample_rate
         self.endpoint = endpoint
@@ -527,7 +569,13 @@ class WebSpeech:
                 continue
             if self._cancelled:
                 continue
+            ушло = time.monotonic()
             heard = self._post(_as_wav(raw, rate), sentence)
+            log.info("реплика до пульта: %.0f мс, %d КБ",
+                     (time.monotonic() - ушло) * 1000.0, len(raw) // 1024)
+            # Звук родился и уехал играть. Слушает его кто-то или нет — вопрос
+            # отдельный: если вкладок нет, задержка тут ни при чём.
+            self.звук_пошёл()
             if heard:
                 self._listeners = max(self._listeners, heard)
                 seconds = max(0.0, len(raw) / 2 / rate)
@@ -536,24 +584,42 @@ class WebSpeech:
                 self._until = max(self._until, time.monotonic()) + seconds
 
     def _synthesize(self, text: str) -> tuple[bytes, int]:
-        """Звук фразы и его частота. Сначала ПК, потом свой piper."""
+        """Звук фразы и его частота. Сначала ПК, потом свой piper.
+
+        Каждый путь засекается и пишется в журнал. Три источника звука стоят
+        разного, и разница между ними — не проценты, а разы: кэш отдаёт готовое
+        мгновенно, ПК считает быстрее реального времени, а свой piper на A55
+        поднимается заново НА КАЖДОЕ ПРЕДЛОЖЕНИЕ и каждый раз грузит голосовую
+        модель с нуля. Пока это не в журнале, спорить о том, где теряется
+        секунда, можно бесконечно.
+        """
+        начало = time.monotonic()
         if self.remote is not None:
             pcm = self.remote.raw(text)
             if pcm is not None:
+                self._засечь("ПК", начало, text)
                 return scale(pcm, self.volume), self.remote.rate
         raw = None
         if self.cache is not None:
             raw = self.cache.get(text)
+        if raw is not None:
+            self._засечь("кэш", начало, text)
         if raw is None:
             raw = subprocess.run(
                 self.piper_cmd, input=text.encode(), stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, timeout=120, check=True,
             ).stdout
+            self._засечь("свой piper", начало, text)
             if self.cache is not None:
                 # В кэш кладём звук полной громкости: тише сделаем на выходе,
                 # иначе ночная громкость завела бы вторую копию каждой фразы.
                 self.cache.put(text, raw)
         return scale(raw, self.volume), self.sample_rate
+
+    @staticmethod
+    def _засечь(откуда: str, начало: float, text: str) -> None:
+        мс = (time.monotonic() - начало) * 1000.0
+        log.info("синтез (%s): %.0f мс на %d знаков", откуда, мс, len(text))
 
     def _post(self, wav: bytes, text: str) -> int:
         """Отдаёт реплику пульту. Возвращает число слушающих вкладок."""
