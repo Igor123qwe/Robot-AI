@@ -24,13 +24,21 @@ set -euo pipefail
 VOICE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/voice"
 VENV_PY="$VOICE_DIR/.venv/bin/python"
 MODEL_DIR="$HOME/smart-turn"
-MODEL_FILE="$MODEL_DIR/smart-turn-v3.onnx"
 
-# Репозиторий модели. Если авторы выпустят следующую версию, менять надо
-# здесь и только здесь: имя входа, длину окна и вид ответа код читает у самой
-# модели, а не хранит константами.
+# Репозиторий модели.
 REPO="pipecat-ai/smart-turn-v3"
-FILE_IN_REPO="smart-turn-v3.onnx"
+
+# Имя файла НЕ вшито намеренно, и это не перестраховка — на этом уже
+# споткнулись. В репозитории лежит несколько сборок сразу, имена меняются от
+# версии к версии (smart-turn-v3.0.onnx, потом smart-turn-v3.1-cpu.onnx,
+# рядом gpu-вариант вчетверо тяжелее), и угаданное имя дало ровно то, что и
+# должно было: 404 и скрипт, который «не работает».
+#
+# Поэтому список файлов спрашиваем у самого репозитория и выбираем из него.
+# Нам нужна сборка под ПРОЦЕССОР: видеокарты у робота нет, а gpu-файл вчетверо
+# больше и считает на A55 медленнее — то есть выбрать не тот файл значит
+# получить замедление там, где мы боролись за миллисекунды.
+API="https://huggingface.co/api/models/$REPO"
 
 if [ ! -x "$VENV_PY" ]; then
     echo "Нет $VENV_PY — сначала scripts/install.sh" >&2
@@ -41,20 +49,63 @@ echo "== onnxruntime"
 # Считает на CPU, видеокарты у робота нет и не будет. Колесо под aarch64 есть.
 "$VENV_PY" -m pip install --quiet --upgrade onnxruntime
 
-echo "== модель"
+echo "== какие сборки есть в репозитории"
 mkdir -p "$MODEL_DIR"
+
+# Спрашиваем список и выбираем сборку под процессор. Разбираем питоном из
+# того же venv: jq на роботе может не быть, а питон здесь есть заведомо.
+NAME="$(curl -fsSL --retry 3 --retry-delay 2 "$API" 2>/dev/null | "$VENV_PY" - <<'PY'
+import json
+import sys
+
+try:
+    данные = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+файлы = [ф.get("rfilename", "") for ф in данные.get("siblings", [])]
+onnx = [ф for ф in файлы if ф.endswith(".onnx")]
+if not onnx:
+    sys.exit(1)
+
+# Печатаем ВСЕ найденные в stderr: если выбор окажется неверным, человек
+# должен видеть, из чего выбирали, а не гадать по одному имени.
+print("  нашлось:", ", ".join(onnx), file=sys.stderr)
+
+# Под процессор — те, где это сказано в имени. Если таких нет, берём любую,
+# кроме явно видеокартной: gpu-сборка вчетверо тяжелее и на A55 медленнее.
+свои = [ф for ф in onnx if "cpu" in ф.lower()]
+if not свои:
+    свои = [ф for ф in onnx if "gpu" not in ф.lower()]
+if not свои:
+    sys.exit(1)
+# Последняя по алфавиту — она же самая новая: имена версионированы
+# (smart-turn-v3.0, smart-turn-v3.1), и «свежее» здесь совпадает с «больше».
+print(sorted(свои)[-1])
+PY
+)" || NAME=""
+
+if [ -z "$NAME" ]; then
+    echo "Не удалось спросить список у $API." >&2
+    echo "Скачай .onnx руками отсюда: https://huggingface.co/$REPO/tree/main" >&2
+    echo "и положи в $MODEL_DIR, потом укажи путь в ROBOT_TURN_MODEL." >&2
+    exit 1
+fi
+echo "  беру: $NAME"
+
+MODEL_FILE="$MODEL_DIR/$NAME"
 if [ -s "$MODEL_FILE" ]; then
-    echo "уже есть: $MODEL_FILE"
+    echo "уже скачано: $MODEL_FILE"
 else
     # Скачиваем напрямую, без huggingface_hub: одна библиотека ради одного
     # файла — это сотня мегабайт зависимостей на плату, где и так тесно.
-    URL="https://huggingface.co/$REPO/resolve/main/$FILE_IN_REPO?download=true"
+    URL="https://huggingface.co/$REPO/resolve/main/$NAME?download=true"
     echo "качаю $URL"
     if ! curl -fL --retry 3 --retry-delay 2 -o "$MODEL_FILE.tmp" "$URL"; then
         echo "" >&2
         echo "Не скачалось. Скачай файл руками и положи сюда:" >&2
         echo "    $MODEL_FILE" >&2
-        echo "Взять здесь: https://huggingface.co/$REPO" >&2
+        echo "Взять здесь: https://huggingface.co/$REPO/tree/main" >&2
         rm -f "$MODEL_FILE.tmp"
         exit 1
     fi
@@ -69,17 +120,28 @@ echo "== проверка"
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import onnxruntime as ort
 
 путь = Path(sys.argv[1])
+размер = путь.stat().st_size / 1024 / 1024
+# Проверяем ДО того, как советовать включать. Скачаться могла страница с
+# ошибкой вместо модели — она весит килобайты и открывается с невнятным
+# сообщением; узнать об этом здесь честнее, чем из молчащего робота.
 сессия = ort.InferenceSession(str(путь), providers=["CPUExecutionProvider"])
 вход = сессия.get_inputs()[0]
 выход = сессия.get_outputs()[0]
+print(f"  размер: {размер:.1f} МБ")
 print(f"  вход:  {вход.name} {вход.shape}")
 print(f"  выход: {выход.name} {выход.shape}")
-размер = путь.stat().st_size / 1024 / 1024
-print(f"  размер: {размер:.1f} МБ")
+# По имени выхода робот сам решит, вероятность ему отдают или логит. Если имя
+# невнятное — скажем об этом сейчас, пока человек ещё смотрит в экран, а не
+# через неделю по строчке «оборвали 0» в журнале.
+имя = выход.name.lower()
+if not any(с in имя for с in ("prob", "sigmoid", "logit")):
+    print(f"  ВНИМАНИЕ: по имени выхода «{выход.name}» не понять, вероятность")
+    print("  это или логит. Робот пойдёт безопасной дорогой (посчитает как")
+    print("  логит). Если в журнале будет «оборвали 0» — добавь в env:")
+    print("      ROBOT_TURN_OUTPUT=вероятность")
 PY
 
 echo
