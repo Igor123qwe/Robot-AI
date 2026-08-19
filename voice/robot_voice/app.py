@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import intents
+from . import intents, turn_end
 from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
@@ -612,6 +612,7 @@ def main() -> None:
         spotter=make_spotter(cfg),
         command_ms=cfg.command_ms,
         спешим=lambda: ros is not None and ros.busy,
+        конец_реплики=turn_end.собрать(cfg),
     )
     voice = Voice(speaker, listener)
     voice.on_heard = lambda kind, text: _post_heard(cfg.web_endpoint, kind, text)
