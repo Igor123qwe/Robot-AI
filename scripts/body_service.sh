@@ -69,6 +69,32 @@ cd "$WORK_DIR"
 # Строгий режим снимаем только на подключение окружения: скрипты ROS написаны
 # без оглядки на `set -u`, и setup.bash падает на необъявленной переменной.
 set +u
+# СНАЧАЛА РАБОЧИЙ КАТАЛОГ WHEELTEC, и вот почему это отдельная строчка.
+#
+# web_video_server — тот узел, что раздаёт картинку в пульт, — приходит НЕ с
+# TogetheROS и НЕ из нашего слоя, а из сборки wheeltec:
+#
+#     /home/wheeltec/wheeltec_ros2/install/web_video_server
+#
+# В оболочке человека он виден, потому что .bashrc сорсит этот каталог. А
+# служба systemd живёт своим окружением, его не сорсила — и `ros2 run
+# web_video_server` падал с «package not found». Молча, из-за &.
+#
+# Со стороны это выглядело как «камера не работает»: детектор при этом
+# семь часов исправно вёл людей, а пульт писал «Connection refused» на 8080.
+#
+# Каталог ищем, а не прибиваем путём: у разных сборок он зовётся по-разному, а
+# приметой служит сам пакет. Сорсим ПЕРВЫМ, чтобы наши слои — TogetheROS и
+# свой — легли поверх и имели приоритет над всем, что там может совпасть.
+for ws in "$HOME/wheeltec_ros2" "$HOME/ros2_ws" "$HOME/catkin_ws"; do
+    if [ -d "$ws/install/web_video_server" ] \
+       && [ -f "$ws/install/setup.bash" ]; then
+        # shellcheck disable=SC1091
+        source "$ws/install/setup.bash"
+        echo "раздача картинки берётся из $ws"
+        break
+    fi
+done
 # shellcheck disable=SC1091
 source "$TROS/setup.bash"
 # Поверх — свой слой сборки, если он есть. Там живёт hobot_dosod (поиск
