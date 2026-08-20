@@ -40,6 +40,22 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
 ТОПИК = "/hobot_mono2d_body_detection"
+ТОЧКИ_КИСТИ = "/hobot_hand_lmk_detection"
+ЖЕСТЫ = "/hobot_hand_gesture_detection"
+
+
+def _есть(пакет: str) -> bool:
+    """Установлен ли пакет. Нет — запуск обязан продолжиться без него.
+
+    Узел, которого нет, роняет ВЕСЬ launch: ros2 не находит исполняемый файл и
+    прекращает запуск целиком. То есть отсутствие жестов унесло бы вместе с
+    собой и детектор людей, а значит следование, пеленг и сторожа падений.
+    """
+    try:
+        get_package_share_directory(пакет)
+        return True
+    except Exception:                       # noqa: BLE001
+        return False
 
 
 def _включить(пакет: str, файл: str, **аргументы):
@@ -71,4 +87,51 @@ def generate_launch_description():
         arguments=["--ros-args", "--log-level", "warn"],
     )
 
-    return LaunchDescription([общая_память, камера, кодек, детектор])
+    # Жесты рукой: два узла поверх детектора людей. Первый ищет двадцать одну
+    # точку кисти в рамках рук, которые детектор уже нашёл, второй по этим
+    # точкам называет жест. Через жест «ладонь» работает остановка — путь к
+    # тормозам, не проходящий через микрофон.
+    #
+    # ИХ ЗАПУСК ЗДЕСЬ ИСПОЛЬЗОВАТЬ НЕЛЬЗЯ, и это та же грабля, что уже стоила
+    # нам вечера. hand_lmk_detection.launch.py первым делом подключает штатный
+    # mono2d_body_detection.launch.py — тот самый, который поднимает websocket
+    # и nginx на порту 8000. Вдобавок это был бы ВТОРОЙ mono2d и вторая
+    # попытка захватить USB-камеру, которую держать может только один процесс.
+    # Поэтому берём из их пакетов ровно по узлу и подключаем к нашей цепочке.
+    жесты = []
+    if _есть("hand_lmk_detection") and _есть("hand_gesture_detection"):
+        жесты = [
+            Node(
+                package="hand_lmk_detection",
+                executable="hand_lmk_detection",
+                output="screen",
+                parameters=[{"ai_msg_pub_topic_name": ТОЧКИ_КИСТИ},
+                            {"ai_msg_sub_topic_name": ТОПИК}],
+                arguments=["--ros-args", "--log-level", "warn"],
+            ),
+            Node(
+                package="hand_gesture_detection",
+                executable="hand_gesture_detection",
+                output="screen",
+                parameters=[{"ai_msg_pub_topic_name": ЖЕСТЫ},
+                            {"ai_msg_sub_topic_name": ТОЧКИ_КИСТИ},
+                            # Статические жесты: ладонь, палец вверх, «тише».
+                            # Динамические (щипки и круги) нам не нужны и
+                            # требуют накопления кадров, то есть задержки.
+                            {"is_dynamic_gesture": False},
+                            # Окно голосования за жест. Четверть секунды —
+                            # их же умолчание.
+                            {"time_interval_sec": 0.25}],
+                arguments=["--ros-args", "--log-level", "warn"],
+            ),
+        ]
+    else:
+        # Не молча. Робот без жестов работает как работал, но человек, который
+        # машет ему ладонью и не понимает, почему тот едет дальше, должен
+        # узнать причину из журнала, а не гадать.
+        # Отдельным пакетом они не ставятся — приходят вместе с TogetheROS.
+        # Поэтому не выдумываем apt-команду, а говорим, чем проверить.
+        print("ЖЕСТОВ НЕ БУДЕТ: нет hand_lmk_detection / "
+              "hand_gesture_detection. Проверь: ros2 pkg list | grep hand")
+
+    return LaunchDescription([общая_память, камера, кодек, детектор] + жесты)
