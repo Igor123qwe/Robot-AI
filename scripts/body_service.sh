@@ -88,12 +88,41 @@ set -u
 # он этот порт ОТБИРАЕТ, пульт после этого не поднимается вовсе, а nginx
 # демонизируется и переживает остановку детектора. Теперь мы его просто не
 # запускаем — см. scripts/mono2d_no_web.launch.py.
-ros2 run web_video_server web_video_server --ros-args \
-    -p port:=8080 -p address:=0.0.0.0 &
-RAZDACHA=$!
+# ПРОВЕРЯЕМ, ЧТО РАЗДАЧУ ВООБЩЕ ЕСТЬ ЧЕМ ЗАПУСТИТЬ. Раньше здесь стоял голый
+# `ros2 run ... &`, и когда пакета не оказывалось, он падал МОЛЧА: символ &
+# отправляет процесс в фон, а код возврата никто не смотрит.
+#
+# Со стороны это выглядит как «камера не работает»: детектор при этом
+# исправно ведёт людей, а пульт показывает
+#
+#     http://127.0.0.1:8080/stream?topic=/image: Connection refused
+#
+# и человек ищет неисправность в камере, которой нет. Вечер потерян на то,
+# чтобы узнать: не установлен один пакет.
+if ! ros2 pkg prefix web_video_server >/dev/null 2>&1; then
+    echo "ВНИМАНИЕ: пакета web_video_server нет — картинки в пульте не будет." >&2
+    echo "Детектор людей при этом работает: камеру он берёт из ROS-топика," >&2
+    echo "а не из /dev/video0, и раздача ему не нужна." >&2
+    echo "Поставить:  sudo apt install ros-\${ROS_DISTRO}-web-video-server" >&2
+    RAZDACHA=""
+else
+    ros2 run web_video_server web_video_server --ros-args \
+        -p port:=8080 -p address:=0.0.0.0 &
+    RAZDACHA=$!
+    # Дать ему подняться и убедиться, что он и правда слушает. Процесс,
+    # который стартовал и тут же умер, для `&` неотличим от живого.
+    sleep 2
+    if ! kill -0 "$RAZDACHA" 2>/dev/null; then
+        echo "ВНИМАНИЕ: раздача картинки не поднялась — смотри выше, что она" >&2
+        echo "написала. Остальное работает: детектор берёт кадры из топика." >&2
+        RAZDACHA=""
+    else
+        echo "раздача картинки: http://127.0.0.1:8080/stream?topic=/image"
+    fi
+fi
 
 stop_all() {
-    kill "$RAZDACHA" 2>/dev/null || true
+    [ -n "$RAZDACHA" ] && kill "$RAZDACHA" 2>/dev/null || true
 }
 trap stop_all EXIT
 
