@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import intents, mapping, turn_end, vision_track
+from . import intents, mapping, skills, turn_end, vision_track
 from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
@@ -819,12 +819,16 @@ def main() -> None:
             "следование",
             lambda: ведомый.идёт,
             lambda почему: ведомый.хватит(почему, ждать=False))
+    # Навыки — то, чему робот научился сам. Файл рядом с заметками и
+    # таймерами: выученное обязано пережить перезапуск, иначе робот забывает
+    # всё при каждом обновлении, а обновляется он раз в две минуты.
+    навыки = skills.Навыки(cfg.data_dir / "навыки.json")
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
                         player=player, eyes=глаза, tof=дальномер,
-                        follower=ведомый)
+                        follower=ведомый, навыки=навыки)
     brain = Brain(cfg, tools)
     # Счётчик отдаём после сборки мозга: глаза нужны инструментам, а мозг —
     # инструментам же, и по кругу это не собрать.
@@ -871,7 +875,7 @@ def main() -> None:
     while True:
         try:
             _listen_loop(cfg, listener, recognizer, brain, voice, tools,
-                         addressed, ros, people, player)
+                         addressed, ros, people, player, навыки)
         except KeyboardInterrupt:
             shutdown(None, None)
         except Exception:
@@ -1313,7 +1317,7 @@ class Turn:
 def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                  brain: Brain, voice: Voice, tools: list,
                  addressed: Addressed, ros=None, people: People | None = None,
-                 player=None) -> None:
+                 player=None, навыки=None) -> None:
     by_name = {t.name: t for t in tools}
     if people is None:
         people = People(cfg.data_dir / "люди.json")
@@ -1572,6 +1576,9 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                                    recognizer=recognizer, ros=ros):
                         log.info("цепочка прервана: сказали «стоп»")
                         break
+            elif навык_на_фразу(навыки, command, by_name, voice,
+                                recognizer, ros):
+                pass                    # выученное умение — уже выполнили
             elif intents.поддакивание(command) and not _спрашивали(voice):
                 # «Да» само по себе, когда робот ни о чём не спрашивал, сказано не
                 # ему: в окне разговора слышно и телевизор, и чужую реплику.
@@ -1776,6 +1783,60 @@ def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None,
     if turn is not None:
         turn.разложить()
     return False
+
+
+def навык_на_фразу(навыки, command: str, by_name: dict, voice: Voice,
+                   recognizer=None, ros=None) -> bool:
+    """Выполнить выученное умение, если про него и сказали. True — выполнили.
+
+    Стоит МЕЖДУ правилами и моделью, и порядок тут не случаен.
+
+    Раньше правил: правила писал человек, они точнее и быстрее, и
+    перехватывать «стоп» выученным навыком нельзя ни при каких условиях.
+
+    Раньше модели: в этом весь смысл. Навык на то и выучен, чтобы не платить
+    секундами и деньгами за то, что робот уже придумал однажды.
+
+    Шаги — это вызовы ТЕХ ЖЕ инструментов, что у робота есть. Ничего нового
+    навык сделать не может, и все сторожа остаются на местах.
+    """
+    if навыки is None:
+        return False
+    навык = навыки.найти(command)
+    if навык is None:
+        return False
+
+    log.info("узнал своё умение «%s» (звали %d раз)", навык.имя, навык.звали)
+    сорвался = False
+    беда = ""
+    for номер, шаг in enumerate(навык.шаги, 1):
+        имя = str(шаг.get("инструмент") or шаг.get("tool") or "")
+        инструмент = by_name.get(имя)
+        if инструмент is None:
+            # Инструмент пропал между версиями робота. Это не вина человека,
+            # и молчать нельзя: навык будет срываться каждый раз, а причина
+            # видна только здесь.
+            беда = f"шаг {номер}: инструмента {имя} больше нет"
+            log.warning("навык «%s»: %s", навык.имя, беда)
+            сорвался = True
+            break
+        доводы = шаг.get("аргументы", шаг.get("args", {}))
+        if _run_direct(инструмент, dict(доводы or {}), voice,
+                       recognizer=recognizer, ros=ros):
+            беда = f"шаг {номер}: сказали «стоп»"
+            сорвался = True
+            break
+
+    надо_забыть = навыки.отметить(навык, сорвался)
+    if беда:
+        навык.беда = беда
+    if надо_забыть:
+        # Спрашиваем, а не забываем молча: навык мог сорваться и потому, что
+        # человек трижды передумал. Но и молчать о трёх срывах нельзя —
+        # плохое умение иначе живёт вечно и незаметно.
+        voice.say(f"«{навык.имя}» у меня третий раз подряд срывается. "
+                  f"Скажи «забудь {навык.имя}», если оно бестолковое.")
+    return True
 
 
 def _услышали_стоп(voice: Voice, recognizer, ros) -> bool:

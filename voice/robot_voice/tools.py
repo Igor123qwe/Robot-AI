@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import counting, ru, when
+from . import counting, ru, skills, when
 from . import weather as weather_api
 
 log = logging.getLogger(__name__)
@@ -540,6 +540,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 eyes=None,
                 tof=None,
                 follower=None,
+                навыки=None,
                 news_url: str = "") -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
@@ -2157,5 +2158,103 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 run=notes_clear,
             ),
         ]
+
+    # --- навыки: то, чему робот учится сам ------------------------------
+    if навыки is not None:
+        def remember_skill(name: str, phrases: Any, steps: Any) -> str:
+            """Запомнить придуманное сочетание действий под именем.
+
+            Отвечаем ПРИЧИНОЙ отказа, а не просто «нельзя»: её услышит
+            модель и сможет поправиться, а не будет вслепую повторять то же
+            самое следующей фразой.
+            """
+            беда = навыки.запомнить(
+                name,
+                phrases if isinstance(phrases, list) else [phrases],
+                steps if isinstance(steps, list) else [])
+            if беда:
+                log.info("навык «%s» не запомнил: %s", name, беда)
+                return f"Запомнить не вышло: {беда}."
+            зовут = навыки.найти(name)
+            сколько = len(зовут.зовут) if зовут else 0
+            return (f"Запомнил как «{name}»"
+                    + (f", зови {сколько} способами." if сколько > 1 else "."))
+
+        tools.append(Tool(
+            name="remember_skill",
+            description=(
+                "Запомнить то, что ты только что придумал, как новое умение. "
+                "Зови, когда выполнил просьбу, для которой у тебя не было "
+                "готового действия и пришлось собирать его из нескольких — "
+                "чтобы в следующий раз сделать это сразу, не выдумывая "
+                "заново. Шаги перечисли те же, что сейчас выполнил."),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "Короткое имя умения, 2-3 слова"},
+                    "phrases": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Как его будут просить. Не одно слово: "
+                                       "по одному слову умение перехватит "
+                                       "чужие команды",
+                    },
+                    "steps": {
+                        "type": "array",
+                        "description": "Шаги: инструмент и его доводы",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "инструмент": {"type": "string"},
+                                "аргументы": {"type": "object"},
+                            },
+                            "required": ["инструмент"],
+                        },
+                    },
+                },
+                "required": ["name", "phrases", "steps"],
+            },
+            run=remember_skill,
+        ))
+
+        def list_skills() -> str:
+            все = навыки.все
+            if not все:
+                return "Сам я пока ничему не научился."
+            # Сортируем по частоте: человек спрашивает, чтобы вспомнить, чем
+            # пользуется, а не чтобы прочитать всё подряд.
+            все.sort(key=lambda н: н.звали, reverse=True)
+            имена = ", ".join(н.имя for н in все[:8])
+            хвост = f" И ещё {len(все) - 8}." if len(все) > 8 else ""
+            плохие = [н.имя for н in все if н.сбоев >= skills.СРЫВОВ_ХВАТИТ]
+            беспокойство = (f" «{плохие[0]}» всё время срывается, могу забыть."
+                            if плохие else "")
+            return f"Умею: {имена}.{хвост}{беспокойство}"
+
+        tools.append(Tool(
+            name="list_skills",
+            description="Чему робот научился сам. Зови на «что ты умеешь», "
+                        "«какие у тебя навыки», «чему научился».",
+            input_schema=EMPTY_SCHEMA,
+            run=list_skills,
+        ))
+
+        def forget_skill(name: str) -> str:
+            убрали = навыки.забыть(name)
+            return (f"Забыл «{убрали}»." if убрали
+                    else f"Такого умения у меня нет: {name}.")
+
+        tools.append(Tool(
+            name="forget_skill",
+            description="Забыть выученное умение. Зови на «забудь навык», "
+                        "«больше так не делай», «убери это умение».",
+            input_schema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+            run=forget_skill,
+        ))
+
 
     return tools
