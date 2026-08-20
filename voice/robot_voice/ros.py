@@ -34,6 +34,11 @@ ODOM = "/odom"
 # Жесты рукой. Топик поднимается парой узлов поверх детектора людей; нет их —
 # сообщений просто не будет, и всё остальное работает как работало.
 ЖЕСТЫ = "/hobot_hand_gesture_detection"
+# Вещи в кадре. Сеть считает НЕ постоянно: кадр уходит в неё только когда мы
+# попросим — пустым сообщением в ВЗГЛЯД. Иначе четвёртая модель отобрала бы
+# BPU у детектора людей, на котором держатся следование, падения и стоп-ладонь.
+ВЕЩИ = "/perception/detection/dosod"
+ВЗГЛЯД = "/robot_ai/look"
 # Дальше этого одометрию считаем протухшей: шасси молчит или узел упал.
 ODOM_TTL = 2.0
 # Сколько ждать, пока доедет прежняя команда, прежде чем начать новую. Больше
@@ -153,6 +158,8 @@ class Ros:
         self.людей_видно: Callable[[dict], None] | None = None
         # Куда отдавать жесты. None — узлы распознавания кисти не подняты.
         self.жесты_видно: Callable[[dict], None] | None = None
+        # Куда отдавать распознанные вещи. None — узел поиска вещей не поднят.
+        self.вещи_видно: Callable[[dict], None] | None = None
         # Все, кто умеет крутить колёса помимо drive(). См. класс Движитель.
         self._движители: list[Движитель] = []
         # Сколько команд ХОДА подряд не ушло в шасси и кричали ли мы об этом.
@@ -225,6 +232,12 @@ class Ros:
         self._send({"op": "subscribe", "topic": ЖЕСТЫ,
                     "type": "ai_msgs/msg/PerceptionTargets",
                     "throttle_rate": 50})
+        # Вещи. Без throttle: сообщения приходят только в ответ на наш запрос,
+        # то есть несколько штук в минуту, и выбрасывать из них нечего.
+        self._send({"op": "subscribe", "topic": ВЕЩИ,
+                    "type": "ai_msgs/msg/PerceptionTargets"})
+        self._send({"op": "advertise", "topic": ВЗГЛЯД,
+                    "type": "std_msgs/msg/Empty"})
 
     def _on_close(self, ws, *_a) -> None:
         log.warning("rosbridge: соединение закрыто")
@@ -259,6 +272,15 @@ class Ros:
                     если_есть(msg.get("msg") or {})
                 except Exception:               # noqa: BLE001
                     log.exception("не разобрал жест")
+            return
+
+        if msg.get("topic") == ВЕЩИ:
+            если_есть = self.вещи_видно
+            if если_есть is not None:
+                try:
+                    если_есть(msg.get("msg") or {})
+                except Exception:               # noqa: BLE001
+                    log.exception("не разобрал вещи")
             return
 
         if msg.get("topic") == ODOM:
@@ -367,6 +389,14 @@ class Ros:
             if not self._odom_at or time.monotonic() - self._odom_at > ODOM_TTL:
                 return None
             return self._odom
+
+    def посмотреть(self) -> bool:
+        """Попросить затвор отдать кадр в сеть поиска вещей.
+
+        Пустое сообщение: единственное, что нужно сказать, — «посмотри
+        сейчас». Возвращает, ушёл ли запрос; ответ придёт отдельно, в ВЕЩИ.
+        """
+        return self._send({"op": "publish", "topic": ВЗГЛЯД, "msg": {}})
 
     def publish_twist(self, x: float = 0.0, y: float = 0.0, wz: float = 0.0) -> None:
         ноль = abs(x) + abs(y) + abs(wz) <= 1e-3

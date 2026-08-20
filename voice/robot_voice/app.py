@@ -18,8 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import (falldown, gestures, intents, mapping, skills, turn_end,
-               vision_track)
+from . import (falldown, gestures, intents, mapping, skills, things,
+               turn_end, vision_track)
 from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
@@ -907,12 +907,20 @@ def main() -> None:
     # таймерами: выученное обязано пережить перезапуск, иначе робот забывает
     # всё при каждом обновлении, а обновляется он раз в две минуты.
     навыки = skills.Навыки(cfg.data_dir / "навыки.json")
+
+    # Что робот видел и где. Сеть считает только по нашему запросу, поэтому
+    # сообщения приходят редко — но каждое надо привязать к тому, ГДЕ робот
+    # тогда стоял, иначе «видел слева» через десять минут не значит ничего.
+    вещи = things.Вещи()
+    if ros is not None:
+        ros.вещи_видно = lambda сообщение: вещи.принять(сообщение, ros.odom)
+
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
                         player=player, eyes=глаза, tof=дальномер,
-                        follower=ведомый, навыки=навыки)
+                        follower=ведомый, навыки=навыки, вещи=вещи)
     brain = Brain(cfg, tools)
     # Счётчик отдаём после сборки мозга: глаза нужны инструментам, а мозг —
     # инструментам же, и по кругу это не собрать.

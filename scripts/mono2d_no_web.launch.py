@@ -32,10 +32,11 @@
 # почему детектор видит черноту, пришлось бы заново.
 
 import os
+import sys
 
 from ament_index_python import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import ExecuteProcess, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
@@ -134,4 +135,49 @@ def generate_launch_description():
         print("ЖЕСТОВ НЕ БУДЕТ: нет hand_lmk_detection / "
               "hand_gesture_detection. Проверь: ros2 pkg list | grep hand")
 
-    return LaunchDescription([общая_память, камера, кодек, детектор] + жесты)
+    # Поиск вещей: сеть DOSOD плюс наш затвор. Затвор берёт jpeg с камеры,
+    # разжимает его в bgr8 и отдаёт сети — но только когда о кадре попросили.
+    # Постоянно её пускать нельзя: один кадр стоит около ста тридцати
+    # миллисекунд BPU, и она отобрала бы плату у детектора людей, на котором
+    # держатся следование, падения и остановка по ладони.
+    #
+    # Пакет собирается отдельно (scripts/setup_things.sh) и живёт не в
+    # /opt/tros, а в рабочем каталоге — поэтому его может и не быть.
+    вещи = []
+    if _есть("hobot_dosod"):
+        вещи = [
+            ExecuteProcess(
+                cmd=[sys.executable,
+                     os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "look_relay.py")],
+                output="screen",
+            ),
+            Node(
+                package="hobot_dosod",
+                executable="hobot_dosod",
+                output="screen",
+                parameters=[
+                    {"feed_type": 0},
+                    # Обычный ros-режим, а не общая память: затвор отдаёт
+                    # обычный sensor_msgs/Image, и это ровно то, чего мы
+                    # хотим — кадр по запросу, а не поток.
+                    {"is_shared_mem_sub": 0},
+                    {"ros_img_sub_topic_name": "/robot_ai/look_image"},
+                    {"ai_msg_pub_topic_name": "/perception/detection/dosod"},
+                    {"model_file_name": "config/dosod_mlp3x_l_rep-int8.bin"},
+                    {"vocabulary_file_name": "config/offline_vocabulary.json"},
+                    # Порог у них по умолчанию 0.2 — для картинки в отладчике
+                    # сойдёт, для ответа человеку мало. Отсев по уверенности
+                    # есть и у нас (things.ВЕРИМ_ОТ), но чем меньше мусора
+                    # доедет до разбора, тем лучше.
+                    {"score_threshold": 0.3},
+                ],
+                arguments=["--ros-args", "--log-level", "warn"],
+            ),
+        ]
+    else:
+        print("ПОИСКА ВЕЩЕЙ НЕ БУДЕТ: нет hobot_dosod. "
+              "Собери: bash scripts/setup_things.sh")
+
+    return LaunchDescription(
+        [общая_память, камера, кодек, детектор] + жесты + вещи)

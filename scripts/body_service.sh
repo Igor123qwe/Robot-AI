@@ -56,6 +56,13 @@ cd "$WORK_DIR"
 set +u
 # shellcheck disable=SC1091
 source "$TROS/setup.bash"
+# Поверх — свой слой сборки, если он есть. Там живёт hobot_dosod (поиск
+# вещей): готовым пакетом он не приходит и собирается отдельно, см.
+# scripts/setup_things.sh. Нет слоя — работаем без поиска вещей.
+if [ -f "$WORK_DIR/install/setup.bash" ]; then
+    # shellcheck disable=SC1091
+    source "$WORK_DIR/install/setup.bash"
+fi
 set -u
 
 # Раздача картинки — своим процессом, чтобы падение одного не уносило другое.
