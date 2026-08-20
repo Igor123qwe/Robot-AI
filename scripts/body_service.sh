@@ -19,6 +19,7 @@
 
 set -euo pipefail
 
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TROS="/opt/tros/humble"
 WORK_DIR="$HOME/tros_ws"
 MODEL_DIR="$TROS/lib/mono2d_body_detection/config"
@@ -43,8 +44,13 @@ source "$TROS/setup.bash"
 set -u
 
 # Раздача картинки — своим процессом, чтобы падение одного не уносило другое.
-# Порт 8080: наш пульт сидит на 8000, а websocket-просмотрщик самого TogetheROS
-# на 8000 же и лезет — с ним мы не спорим, он нам не нужен.
+# Порт 8080: пульт сидит на 8000, и трогать его нельзя.
+#
+# Раньше здесь было написано «websocket-просмотрщик TogetheROS на 8000 же и
+# лезет — с ним мы не спорим, он нам не нужен». Не спорить с ним было нельзя:
+# он этот порт ОТБИРАЕТ, пульт после этого не поднимается вовсе, а nginx
+# демонизируется и переживает остановку детектора. Теперь мы его просто не
+# запускаем — см. scripts/mono2d_no_web.launch.py.
 ros2 run web_video_server web_video_server --ros-args \
     -p port:=8080 -p address:=0.0.0.0 &
 RAZDACHA=$!
@@ -54,4 +60,7 @@ stop_all() {
 }
 trap stop_all EXIT
 
-exec ros2 launch mono2d_body_detection mono2d_body_detection.launch.py
+# Запускаем СВОЙ launch, а не их. Их поднимает пятым узлом websocket, а тот
+# — nginx на порту 8000, где живёт пульт. Подробности и разбор — в шапке
+# scripts/mono2d_no_web.launch.py.
+exec ros2 launch "$REPO/scripts/mono2d_no_web.launch.py"

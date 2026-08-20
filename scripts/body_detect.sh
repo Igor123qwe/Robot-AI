@@ -20,12 +20,16 @@
 #   2. Камеру держит наш веб-сервер для пульта. hobot_usb_cam перебирает
 #      форматы /dev/video0 и умирает с «terminate called after throwing an
 #      instance of 'char*'» — без единого слова о том, что устройство занято.
-#   3. Их страничка просмотра лезет на порт 8000, где уже сидит наш пульт.
-#      Это безвредно, но заливает вывод красным, и на этом фоне настоящие
-#      ошибки теряются.
+#   3. Их launch поднимает пятым узлом свою страничку просмотра, а та —
+#      NGINX НА ПОРТУ 8000, где сидит наш пульт. Здесь было написано
+#      «безвредно, просто заливает вывод красным» — неправда, и дорогая:
+#      порт он не шумит, а отбирает. Пульт после этого не поднимается вовсе
+#      и уходит в вечный перезапуск, а сам nginx демонизируется и переживает
+#      остановку детектора. Поэтому запускаем свой launch без их странички.
 
 set -euo pipefail
 
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TROS="/opt/tros/humble"
 WORK_DIR="$HOME/tros_ws"
 MODEL_DIR="$TROS/lib/mono2d_body_detection/config"
@@ -82,8 +86,8 @@ echo "== поехали"
 echo "  топик:  $TOPIC"
 echo "  смотреть, что он отдаёт, из другого терминала:"
 echo "      ~/Robot-AI/voice/.venv/bin/python scripts/ros_topics.py --слушать $TOPIC --секунд 5"
-echo "  ошибки про nginx и порт 8000 не мешают: это их страничка просмотра,"
-echo "  а на 8000 сидит наш пульт. Смотреть надо на строки mono2d_body_det."
+echo "  их странички просмотра здесь нет намеренно: она поднимает nginx на"
+echo "  8000, а там пульт. Смотреть надо на строки mono2d_body_det."
 echo
 
 cd "$WORK_DIR"
@@ -96,4 +100,4 @@ set +u
 # shellcheck disable=SC1091
 source "$TROS/setup.bash"
 set -u
-exec ros2 launch mono2d_body_detection mono2d_body_detection.launch.py
+exec ros2 launch "$REPO/scripts/mono2d_no_web.launch.py"

@@ -49,7 +49,9 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import socket
+import subprocess
 import ssl
 import sys
 import threading
@@ -947,8 +949,60 @@ def _слушать_https() -> ThreadingHTTPServer | None:
     return сервер
 
 
+def кто_занял(порт: int) -> str:
+    """Кто держит порт — словами. Пусто, если выяснить не вышло.
+
+    Пишется ради одного случая, который уже случился и стоил часа. Детектор
+    людей поднимал через свой launch страничку просмотра TogetheROS, а та —
+    nginx НА ЭТОМ ЖЕ ПОРТУ. Пульт после этого не поднимался вовсе и уходил в
+    вечный перезапуск, а в браузере отвечал чужой «404 Not Found, nginx».
+    Снаружи это выглядит как «пульт сломался», и человек идёт чинить пульт,
+    который цел.
+
+    Разбирать вывод ss — некрасиво, и всё же это правильно: сообщение
+    «Address already in use» без имени виновника не сокращает поиск ни на
+    минуту, а с именем — сокращает до одной команды.
+    """
+    try:
+        готово = subprocess.run(["ss", "-ltnp"], capture_output=True,
+                                text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        # ss есть не везде — на машине разработчика его может не быть вовсе.
+        # Тогда просто молчим про виновника: сообщение про занятый порт
+        # человек всё равно увидит.
+        return ""
+    return разобрать_ss(готово.stdout, порт)
+
+
+def разобрать_ss(вывод: str, порт: int) -> str:
+    """Разбор вывода ss. Отдельно — чтобы это можно было проверить без ss."""
+    for строка in вывод.splitlines():
+        if f":{порт} " not in строка:
+            continue
+        имена = re.findall(r'"([^"]+)",pid=(\d+)', строка)
+        if имена:
+            return ", ".join(f"{имя} (pid {pid})" for имя, pid in имена)
+    return ""
+
+
 def main() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    except OSError as e:
+        # Молча падать с кодом 1 нельзя: systemd перезапустит, счётчик
+        # накрутится, а человек будет смотреть на чужой 404 в браузере и
+        # думать, что сломан пульт.
+        кто = кто_занял(PORT)
+        print(f"Порт {PORT} занять не вышло: {e}", file=sys.stderr, flush=True)
+        if кто:
+            print(f"Его держит: {кто}", file=sys.stderr, flush=True)
+            if "nginx" in кто:
+                print("Это страничка просмотра TogetheROS — её поднимает "
+                      "штатный launch детектора людей. Она нам не нужна:\n"
+                      "    sudo pkill -f nginx && sudo systemctl restart robot-web\n"
+                      "и обнови робота — свой launch её больше не запускает.",
+                      file=sys.stderr, flush=True)
+        raise SystemExit(1)
     server.daemon_threads = True
     безопасный = _слушать_https() if TLS_PORT else None
     print(f"пульт на порту {PORT}, камера с {DEFAULT_PHONE}", flush=True)

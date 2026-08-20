@@ -50,6 +50,21 @@ sudo systemctl daemon-reload
 sudo systemctl enable robot-body
 sudo systemctl restart robot-body
 
+# Оставшийся с прежних запусков nginx надо убрать, иначе пульт не поднимется.
+#
+# Он приходит из штатного launch детектора: тот пятым узлом поднимает
+# страничку просмотра TogetheROS, а она — nginx на порту 8000. Свой launch
+# его больше не запускает (scripts/mono2d_no_web.launch.py), но nginx
+# ДЕМОНИЗИРУЕТСЯ: единожды запущенный, он переживает и остановку детектора, и
+# перезапуск пульта, и висит, пока его не убьют.
+if command -v ss >/dev/null && sudo ss -ltnp 2>/dev/null | grep -q ':8000 .*nginx'; then
+    echo "==> порт 8000 держит nginx — это страничка просмотра TogetheROS"
+    echo "    она осталась с прежних запусков детектора; убираю, пульт без"
+    echo "    этого порта не поднимется вовсе"
+    sudo pkill -f nginx || true
+    sleep 1
+fi
+
 echo "==> перезапускаю пульт, чтобы он взял новый источник"
 sudo systemctl restart robot-web || true
 
