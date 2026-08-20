@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import counting, ru, skills, things, when
+from . import counting, diary, ru, skills, things, when
 from . import weather as weather_api
 
 log = logging.getLogger(__name__)
@@ -542,6 +542,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 follower=None,
                 навыки=None,
                 вещи=None,
+                дневник=None,
                 news_url: str = "") -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
@@ -2342,6 +2343,75 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 "а не список."),
             input_schema=EMPTY_SCHEMA,
             run=list_things,
+        ))
+
+    # --- дневник: что робот помнит про самого себя ----------------------
+    if дневник is not None:
+        def how_was_the_day(hours: Any = 24) -> str:
+            try:
+                часов = max(1.0, min(24 * 14, float(hours)))
+            except (TypeError, ValueError):
+                часов = 24.0
+            свод = дневник.свод(часов)
+            if not свод["всего"]:
+                return "За это время ничего не записано."
+            куски = [f"Событий: {свод['всего']}"]
+            реплик = свод["по_видам"].get("реплика", 0)
+            if реплик:
+                куски.append(f"разговоров {реплик}")
+            поездок = свод["по_видам"].get("следование", 0)
+            if поездок:
+                сорвалось = sum(1 for з in свод["срывы"]
+                                if з.get("что") == "следование")
+                куски.append(f"ходил за человеком {поездок} раз"
+                             + (f", срывался {сорвалось}" if сорвалось else
+                                ", без срывов"))
+            # Причины срывов важнее их числа: «потерял» и «батарея» — это
+            # разные беды, и лечатся они по-разному.
+            причины = {}
+            for з in свод["срывы"]:
+                итог = str(з.get("итог") or "?")
+                причины[итог] = причины.get(итог, 0) + 1
+            if причины:
+                куски.append("срывался из-за: " + ", ".join(
+                    f"{и} — {н}" for и, н in sorted(
+                        причины.items(), key=lambda п: -п[1])[:3]))
+            return ". ".join(куски) + "."
+
+        tools.append(Tool(
+            name="how_was_the_day",
+            description=(
+                "Что робот делал за последнее время и на чём спотыкался. "
+                "Зови на «как прошёл день», «что было сегодня», «часто ли ты "
+                "срываешься», «на что жалуешься». Считает по своему дневнику, "
+                "бесплатно и без обращения к сети."),
+            input_schema={
+                "type": "object",
+                "properties": {"hours": {
+                    "type": "number",
+                    "description": "За сколько часов смотреть, по умолчанию 24"}},
+            },
+            run=how_was_the_day,
+        ))
+
+        def what_do_i_repeat() -> str:
+            повторы = дневник.повторы()
+            if not повторы:
+                return ("Пока не вижу повторов. Мне нужно несколько дней, "
+                        "чтобы заметить привычку.")
+            # Не больше трёх: перечисление привычек вслух — это не разговор.
+            строки = [f"«{п['повод']}» — {п['раз']} раз около {п['час']} часов"
+                      for п in повторы[:3]]
+            return "Замечаю: " + "; ".join(строки) + "."
+
+        tools.append(Tool(
+            name="what_do_i_repeat",
+            description=(
+                "Что человек просит снова и снова и в какое время. Зови на "
+                "«что я обычно прошу», «замечаешь за мной что-нибудь», «есть "
+                "привычки». Это ответ по наблюдению робота, а не по догадке."),
+            input_schema=EMPTY_SCHEMA,
+            run=what_do_i_repeat,
         ))
 
     return tools
