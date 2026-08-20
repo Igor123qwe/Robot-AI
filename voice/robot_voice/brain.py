@@ -24,6 +24,7 @@ from typing import Callable
 import anthropic
 
 from .config import SYSTEM_PROMPT, Config
+from .intents import ПОЕХАЛ
 from .tools import Tool
 
 log = logging.getLogger(__name__)
@@ -308,6 +309,13 @@ class Brain:
         # «Приехал», не позвав drive. Слова робота при этом безупречны, а
         # робот стоит на месте, и человек об этом не догадывается.
         self.позвал: list[str] = []
+        # Что инструменты движения ОТВЕТИЛИ на последнем ходу. Нужно для
+        # зеркального враньё: инструмент честно сказал «Делаю объезд
+        # квартиры, 6 шагов», а модель пересказала это как «Объезд квартиры
+        # сделан» — через секунду после старта и за пять секунд до того, как
+        # маршрут развалился. Когда такое ловится, вслух должна пойти правда,
+        # а её надо где-то взять.
+        self.ответ_инструмента: str = ""
         self.endpoints: list[Endpoint] = []
         if cfg.local_api_base:
             # Основной. Ключ тут формальность: своя машина в своей сети пароля
@@ -541,6 +549,7 @@ class Brain:
         """
         messages = self.history + [{"role": "user", "content": user_text}]
         self.позвал = []
+        self.ответ_инструмента = ""
         spoken: list[str] = []
         used_in = used_out = cached = written = 0
         truncated = False
@@ -596,6 +605,10 @@ class Brain:
                     else:
                         log.info("вызываю %s(%s)", call.name, call.input)
                         output = tool(call.input or {})
+                        if call.name in ПОЕХАЛ:
+                            # Запоминаем ответ ИМЕННО движения: только про
+                            # него бывает враньё «сделано», пока колёса едут.
+                            self.ответ_инструмента = str(output or "")
                     results.append({
                         "type": "tool_result",
                         "tool_use_id": call.id,
