@@ -59,6 +59,31 @@ def _есть(пакет: str) -> bool:
         return False
 
 
+def _рядом(*имена: str) -> str:
+    """Первый из путей, который существует рядом с рабочим каталогом.
+
+    Путь к модели узел разбирает ОТНОСИТЕЛЬНО того места, откуда запущен, а
+    сами файлы приходят по-разному: деб-пакетом они лежат в подкаталоге по
+    имени платы (config/x5/...), нашей сборкой — прямо в config. Проверять
+    оба варианта дешевле, чем выяснять на роботе, почему узел не нашёл файл,
+    который лежит на месте.
+    """
+    for имя in имена:
+        if os.path.exists(имя):
+            return имя
+    return ""
+
+
+def _модель_dosod() -> str:
+    return _рядом("config/dosod_mlp3x_l_rep-int8.bin",
+                  "config/x5/dosod_mlp3x_l_rep-int8.bin")
+
+
+def _словарь_dosod() -> str:
+    return _рядом("config/offline_vocabulary.json",
+                  "config/x5/offline_vocabulary.json")
+
+
 def _включить(пакет: str, файл: str, **аргументы):
     источник = PythonLaunchDescriptionSource(
         os.path.join(get_package_share_directory(пакет), "launch", файл))
@@ -144,7 +169,8 @@ def generate_launch_description():
     # Пакет собирается отдельно (scripts/setup_things.sh) и живёт не в
     # /opt/tros, а в рабочем каталоге — поэтому его может и не быть.
     вещи = []
-    if _есть("hobot_dosod"):
+    модель = _модель_dosod()
+    if _есть("hobot_dosod") and модель:
         вещи = [
             ExecuteProcess(
                 cmd=[sys.executable,
@@ -164,8 +190,8 @@ def generate_launch_description():
                     {"is_shared_mem_sub": 0},
                     {"ros_img_sub_topic_name": "/robot_ai/look_image"},
                     {"ai_msg_pub_topic_name": "/perception/detection/dosod"},
-                    {"model_file_name": "config/dosod_mlp3x_l_rep-int8.bin"},
-                    {"vocabulary_file_name": "config/offline_vocabulary.json"},
+                    {"model_file_name": модель},
+                    {"vocabulary_file_name": _словарь_dosod()},
                     # Порог у них по умолчанию 0.2 — для картинки в отладчике
                     # сойдёт, для ответа человеку мало. Отсев по уверенности
                     # есть и у нас (things.ВЕРИМ_ОТ), но чем меньше мусора
@@ -175,9 +201,15 @@ def generate_launch_description():
                 arguments=["--ros-args", "--log-level", "warn"],
             ),
         ]
-    else:
+    elif not _есть("hobot_dosod"):
         print("ПОИСКА ВЕЩЕЙ НЕ БУДЕТ: нет hobot_dosod. "
               "Собери: bash scripts/setup_things.sh")
+    else:
+        # Пакет есть, а модели рядом нет. Поднимать узел в таком виде нельзя:
+        # он упадёт с «Model file is not exist», launch перезапустит его по
+        # кругу и зальёт журнал, в котором мы потом не найдём ничего другого.
+        print(f"ПОИСКА ВЕЩЕЙ НЕ БУДЕТ: нет модели рядом с {os.getcwd()}. "
+              "Её кладёт scripts/body_service.sh — проверь его вывод.")
 
     return LaunchDescription(
         [общая_память, камера, кодек, детектор] + жесты + вещи)

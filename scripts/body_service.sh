@@ -39,16 +39,31 @@ fi
 # каталог: `cp -r .../config "$WORK_DIR/"` вторым разом положил бы
 # config/config, и модель опять «не нашлась» бы.
 mkdir -p "$WORK_DIR/config"
-for pkg in mono2d_body_detection hand_lmk_detection hand_gesture_detection; do
-    src="$TROS/lib/$pkg/config"
-    if [ -d "$src" ]; then
+for pkg in mono2d_body_detection hand_lmk_detection hand_gesture_detection \
+           hobot_dosod; do
+    # Каталог у пакета бывает и в lib, и в share — зависит от того, пришёл он
+    # деб-пакетом или собран нами в свой слой. Берём тот, что нашёлся.
+    for src in "$TROS/lib/$pkg/config" "$TROS/share/$pkg/config" \
+               "$WORK_DIR/src/$pkg/config"; do
+        [ -d "$src" ] || continue
         cp -r "$src/." "$WORK_DIR/config/"
-    elif [ "$pkg" != "mono2d_body_detection" ]; then
-        # Не молча: человек, машущий роботу ладонью, должен узнать причину
-        # отсюда, а не гадать, почему тот едет дальше.
-        echo "ЖЕСТОВ НЕ БУДЕТ: нет $src" >&2
-    fi
+        break
+    done
 done
+
+# Модель DOSOD в их репозитории лежит в подкаталоге по имени платы
+# (config/x5/...), а узлу мы даём путь относительно рабочего каталога.
+# Поднимаем её на уровень выше, чтобы путь был один и тот же независимо от
+# того, откуда пакет взялся.
+if [ -f "$WORK_DIR/config/x5/dosod_mlp3x_l_rep-int8.bin" ] \
+   && [ ! -f "$WORK_DIR/config/dosod_mlp3x_l_rep-int8.bin" ]; then
+    cp "$WORK_DIR/config/x5/dosod_mlp3x_l_rep-int8.bin" "$WORK_DIR/config/"
+fi
+
+# Не молча. Человек, машущий роботу ладонью, должен узнать причину отсюда, а
+# не гадать, почему тот едет дальше.
+[ -d "$TROS/lib/hand_gesture_detection/config" ] \
+    || echo "ЖЕСТОВ МОЖЕТ НЕ БЫТЬ: нет config у hand_gesture_detection" >&2
 cd "$WORK_DIR"
 
 # Строгий режим снимаем только на подключение окружения: скрипты ROS написаны

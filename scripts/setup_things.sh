@@ -30,6 +30,23 @@ if [ ! -d "$TROS" ]; then
     exit 1
 fi
 
+# Может оказаться, что собирать нечего: в свежих сборках TogetheROS DOSOD уже
+# приходит готовым пакетом. Тогда нужна только модель рядом с рабочим
+# каталогом, а её кладёт body_service.sh при каждом запуске.
+set +u
+# shellcheck disable=SC1091
+source "$TROS/setup.bash"
+set -u
+if ros2 pkg list 2>/dev/null | grep -qx "hobot_dosod"; then
+    echo "hobot_dosod уже есть в TogetheROS — собирать нечего."
+    echo "Модель рядом с рабочим каталогом кладёт scripts/body_service.sh."
+    echo
+    echo "Перезапусти детектор и посмотри, что он скажет про поиск вещей:"
+    echo "    sudo systemctl restart robot-body"
+    echo "    journalctl -u robot-body -n 40 --no-pager | grep -i 'вещ\\|dosod'"
+    exit 0
+fi
+
 mkdir -p "$SRC_DIR"
 cd "$SRC_DIR"
 
