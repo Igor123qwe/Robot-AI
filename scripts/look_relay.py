@@ -20,9 +20,36 @@
 
 Запрос приходит пустым сообщением в /robot_ai/look. Пустым, потому что
 единственное, что нужно сказать, — «посмотри сейчас».
+
+ВТОРАЯ ОБЯЗАННОСТЬ: РАЗДАЧА КАРТИНКИ В ПУЛЬТ. Досталась почти бесплатно и
+завелась по живой беде.
+
+Раздачей занимался web_video_server из чужой сборки. Он работает, но у службы
+своё окружение, чужой слой в нём не подключён, и `ros2 run` падал с «package
+not found» — молча, из-за &. Со стороны это семь часов выглядело как «камера
+не работает»: детектор в те же секунды исправно вёл людей на тридцати кадрах,
+а пульт писал «Connection refused» на 8080.
+
+Раздать кадр отсюда — двадцать строк, потому что мы УЖЕ подписаны на /image, а
+там лежит готовый jpeg. Никакого сжатия и разжатия: MJPEG — это те же байты
+плюс разделитель между кадрами. Зависимость от чужого слоя сборки при этом
+исчезает совсем, а с ней и целый способ сломаться молча.
+
+Адрес нарочно тот же, что был у web_video_server:
+
+    http://127.0.0.1:8080/stream?topic=/image
+
+Менять ничего не надо ни в пульте, ни в настройках. А если настоящий
+web_video_server всё-таки поднялся и порт занял — мы отходим в сторону и
+говорим об этом в журнал: два раздатчика на одном порту не нужны.
 """
 
+import errno
+import os
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
     import rclpy
@@ -33,6 +60,12 @@ except ImportError as e:                    # pragma: no cover — только 
     print(f"Нет ROS: {e}. Запускать это надо после source /opt/tros/*/setup.bash",
           file=sys.stderr)
     raise SystemExit(1)
+
+ПОРТ_РАЗДАЧИ = int(os.environ.get("ROBOT_STREAM_PORT", "8080"))
+# Сколько ждать нового кадра, прежде чем решить, что камера встала. Две
+# секунды: камера идёт тридцать кадров в секунду, и две секунды тишины — это
+# уже не заминка.
+ЖДЁМ_КАДРА = 2.0
 
 КАМЕРА = "/image"
 ЗАПРОС = "/robot_ai/look"
@@ -77,6 +110,9 @@ class Затвор(Node):
     def __init__(self) -> None:
         super().__init__("robot_ai_look_relay")
         self._последний = None
+        self._jpeg = None
+        self._когда_кадр = 0.0
+        self._замок = threading.Lock()
         self._осталось = 0
         self._жаловались = False
         self.create_subscription(CompressedImage, КАМЕРА, self._кадр, 1)
@@ -85,11 +121,29 @@ class Затвор(Node):
         self.get_logger().info(
             f"затвор: жду запрос в {ЗАПРОС}, кадр отдам в {КАДР}")
 
+    def последний_jpeg(self):
+        """Последний кадр с камеры как есть, сжатым. None — камера молчит.
+
+        Свежесть проверяем ЗДЕСЬ, а не у того, кто спрашивает: раздача не
+        должна показывать в пульте картинку двухминутной давности как живую.
+        Застывший кадр хуже пустого экрана — по нему принимают решения.
+        """
+        with self._замок:
+            кадр, когда = self._jpeg, self._когда_кадр
+        if кадр is None or time.monotonic() - когда > ЖДЁМ_КАДРА:
+            return None
+        return кадр
+
     def _кадр(self, сообщение) -> None:
         # Храним СЖАТЫЙ кадр и не разжимаем ничего, пока не попросят: разжимать
         # тридцать кадров в секунду впустую — это тот же расход, от которого мы
         # и уходим, только на процессоре вместо BPU.
         self._последний = сообщение
+        # Копию для раздачи держим отдельно и под замком: её читает поток
+        # HTTP-сервера, а этот метод зовёт поток ROS.
+        with self._замок:
+            self._jpeg = bytes(сообщение.data)
+            self._когда_кадр = time.monotonic()
         if self._осталось > 0:
             self._осталось -= 1
             self._отдать(сообщение)
@@ -124,9 +178,106 @@ class Затвор(Node):
         self._выход.publish(сообщение)
 
 
+class _Раздача(BaseHTTPRequestHandler):
+    """MJPEG наружу. Кадр берётся из узла как есть, сжатым.
+
+    Отдаём ровно те байты, что пришли с камеры. Разжимать и сжимать обратно —
+    это тратить процессор на то, чтобы получить тот же jpeg, только хуже.
+    """
+
+    узел = None                      # ставится при запуске
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, формат, *аргументы):
+        # Молчим: иначе каждый кадр уходит строкой в журнал службы, а их
+        # тридцать в секунду.
+        pass
+
+    def _кадр_или_ошибка(self):
+        кадр = self.узел.последний_jpeg() if self.узел else None
+        if кадр is None:
+            self.send_response(503)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                "Кадра нет: камера молчит дольше двух секунд.\n"
+                "Смотри journalctl -u robot-body — жив ли hobot_usb_cam."
+                .encode())
+            return None
+        return кадр
+
+    def do_GET(self):                # noqa: N802 — имя задано базовым классом
+        путь = self.path.split("?", 1)[0].rstrip("/")
+        if путь in ("/snapshot", "/image"):
+            кадр = self._кадр_или_ошибка()
+            if кадр is None:
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(кадр)))
+            self.end_headers()
+            self.wfile.write(кадр)
+            return
+        if путь not in ("/stream", ""):
+            self.send_response(404)
+            self.end_headers()
+            return
+        # Поток. Заголовок тот же, что у web_video_server, чтобы пульт и
+        # браузер не заметили подмены.
+        if self._кадр_или_ошибка() is None:
+            return
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            while True:
+                кадр = self.узел.последний_jpeg() if self.узел else None
+                if кадр is None:
+                    return
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(
+                    f"Content-Length: {len(кадр)}\r\n\r\n".encode())
+                self.wfile.write(кадр)
+                self.wfile.write(b"\r\n")
+                # Тридцать кадров в секунду отдавать незачем: пульт смотрят
+                # глазами, а каждый лишний кадр — это байты по вайфаю.
+                time.sleep(1 / 15)
+        except (BrokenPipeError, ConnectionResetError):
+            # Пульт закрыли — обычное дело, а не беда.
+            return
+
+
+def поднять_раздачу(узел, порт: int = ПОРТ_РАЗДАЧИ):
+    """Запустить HTTP-раздачу. Отдаёт сервер или None, если порт занят.
+
+    Занятый порт — не ошибка: значит настоящий web_video_server всё-таки
+    поднялся, и два раздатчика на одном порту не нужны. Отходим в сторону и
+    говорим об этом.
+    """
+    _Раздача.узел = узел
+    try:
+        сервер = ThreadingHTTPServer(("0.0.0.0", порт), _Раздача)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            узел.get_logger().info(
+                f"порт {порт} уже занят — раздаёт кто-то другой, не мешаю")
+        else:
+            узел.get_logger().warning(f"раздача не поднялась: {e}")
+        return None
+    сервер.daemon_threads = True
+    threading.Thread(target=сервер.serve_forever, daemon=True).start()
+    узел.get_logger().info(
+        f"раздаю картинку: http://127.0.0.1:{порт}/stream?topic=/image")
+    return сервер
+
+
 def main() -> None:
     rclpy.init()
     узел = Затвор()
+    поднять_раздачу(узел)
     try:
         rclpy.spin(узел)
     except KeyboardInterrupt:

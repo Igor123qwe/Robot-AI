@@ -4146,6 +4146,109 @@ def test_робот_вообще_едет_за_человеком() -> None:
 
 
 
+
+def test_раздача_картинки_своя() -> None:
+    """Картинку в пульт робот раздаёт сам, без чужого пакета.
+
+    ЖИВАЯ БЕДА, из которой это выросло. Раздачей занимался web_video_server из
+    сборки wheeltec. Пакет есть, но у службы своё окружение, чужой слой в нём
+    не подключён, и `ros2 run` падал с «package not found» — молча, из-за &.
+
+    Со стороны это семь часов выглядело как «камера не работает»: детектор в
+    те же секунды исправно вёл людей на тридцати кадрах, а пульт писал
+    «Connection refused» на 8080.
+
+    Раздать кадр из затвора — двадцать строк, потому что он УЖЕ подписан на
+    /image, а там лежит готовый jpeg. MJPEG — это те же байты плюс разделитель
+    между кадрами: ни сжатия, ни разжатия. Зависимость от чужого слоя сборки
+    исчезает совсем, а с ней и целый способ сломаться молча.
+    """
+    section("раздача картинки")
+
+    import types
+    import urllib.error
+    import urllib.request
+
+    # Затвор живёт на плате и тянет rclpy, которого здесь нет. Подставляем
+    # заглушки: проверяем не ROS, а раздачу.
+    заглушки = {}
+    for имя in ("rclpy", "rclpy.node", "sensor_msgs", "sensor_msgs.msg",
+                "std_msgs", "std_msgs.msg"):
+        if имя not in sys.modules:
+            заглушки[имя] = sys.modules[имя] = types.ModuleType(имя)
+    sys.modules["rclpy.node"].Node = type("Node", (), {
+        "__init__": lambda s, *a, **k: None,
+        "create_subscription": lambda *a, **k: None,
+        "create_publisher": lambda *a, **k: None,
+        "get_logger": lambda s: types.SimpleNamespace(
+            info=lambda *a: None, warning=lambda *a: None,
+            error=lambda *a: None)})
+    sys.modules["sensor_msgs.msg"].CompressedImage = type("C", (), {})
+    sys.modules["sensor_msgs.msg"].Image = type("I", (), {})
+    sys.modules["std_msgs.msg"].Empty = type("E", (), {})
+
+    корень = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(корень / "scripts"))
+    try:
+        import look_relay
+    finally:
+        sys.path.pop(0)
+
+    узел = look_relay.Затвор()
+    порт = 18099
+    сервер = look_relay.поднять_раздачу(узел, порт=порт)
+    check("раздача поднялась", сервер is not None, True)
+    if сервер is None:
+        return
+
+    def спросить(путь):
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{порт}{путь}", timeout=3) as ответ:
+                return ответ.status, ответ.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            e.read()
+            return e.code, ""
+
+    try:
+        # КАДРА ЕЩЁ НЕ БЫЛО — честно говорим, что нечего показать. Пустой
+        # экран лучше застывшего: по картинке принимают решения.
+        check("без кадра — 503, а не пустой ответ", спросить("/snapshot")[0],
+              503)
+        check("и поток тоже", спросить("/stream?topic=/image")[0], 503)
+
+        jpeg = bytes.fromhex("ffd8ffe000104a464946000101") + b"\xaa" * 500 \
+            + b"\xff\xd9"
+        узел._кадр(types.SimpleNamespace(data=jpeg))
+
+        код, вид = спросить("/snapshot")
+        check("кадр пришёл — отдаём", код, 200)
+        check("и отдаём именно jpeg", вид, "image/jpeg")
+
+        код, вид = спросить("/stream?topic=/image")
+        check("поток отдаём", код, 200)
+        # Заголовок ТОТ ЖЕ, что у web_video_server: пульт и браузер не должны
+        # заметить подмены, иначе пришлось бы менять адреса в настройках.
+        check("и заголовком, как у web_video_server",
+              "multipart/x-mixed-replace" in вид, True)
+        check("чужого пути не знаем", спросить("/nonsense")[0], 404)
+
+        # КАМЕРА ЗАМОЛЧАЛА. Показывать в пульте картинку двухминутной
+        # давности как живую нельзя: застывший кадр хуже пустого экрана.
+        узел._когда_кадр -= look_relay.ЖДЁМ_КАДРА + 1
+        check("протухший кадр за живой не выдаём", спросить("/snapshot")[0],
+              503)
+
+        # ПОРТ ЗАНЯТ — не ошибка. Значит настоящий web_video_server всё-таки
+        # поднялся, и два раздатчика на одном порту не нужны.
+        check("занятый порт не отбираем",
+              look_relay.поднять_раздачу(узел, порт=порт), None)
+    finally:
+        сервер.shutdown()
+        for имя in заглушки:
+            sys.modules.pop(имя, None)
+
+
 def test_порядок_в_длинных_функциях() -> None:
     """Имя не используется раньше, чем ему что-то присвоили.
 
@@ -11863,6 +11966,7 @@ def main() -> int:
                  test_пометки_на_карте,
                  test_постоянная_карта_квартиры,
                  test_порядок_в_длинных_функциях,
+                 test_раздача_картинки_своя,
                  test_позвали_по_имени_молчать_нельзя,
                  test_детектор_не_отбирает_порт,
                  test_карта_на_пульте, test_пульт_не_быстрее_тормозов,
