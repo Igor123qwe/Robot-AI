@@ -900,20 +900,12 @@ class Взгляд:
             for к in range(8):
                 if not живые[р][к]:
                     continue
-                дн = float(plane._НАПРАВЛЕНИЯ[р][к] @ плоскость.нормаль)
-                if дн >= 0:
-                    continue
-                d0 = плоскость.отступ / дн
                 д = self.сетка[р][к]
-                if д >= d0 - 0.03:
+                if д >= СТОП_БЛИЖЕ or not self._в_коридоре(д, к):
                     continue
-                if float(точки[р][к][0]) >= СТОП_БЛИЖЕ:
-                    continue
-                if abs(float(точки[р][к][1])) > КОРИДОР:
-                    continue
-                if float(высоты[р][к]) >= ВЫШЕ_НЕ_МЕШАЕТ:
-                    continue
-                сколько += 1
+                h = float(высоты[р][к])
+                if plane.ТОЛЩИНА_ПОЛА < h < ВЫШЕ_НЕ_МЕШАЕТ:
+                    сколько += 1
         return сколько
 
     def _в_коридоре(self, д: float, к: int) -> bool:
