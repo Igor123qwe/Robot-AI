@@ -7681,14 +7681,28 @@ def _http_error(code: int, текст: str = "") -> Exception:
 
 
 def _no_connection() -> Exception:
-    """Обрыв связи так, как его создаёт SDK, а где нельзя — как получится."""
+    """Обрыв связи так, как его создаёт SDK, а где нельзя — как получится.
+
+    Запасной путь ОБЯЗАН работать без httpx, и это не теория: на сборочной
+    машине его не оказалось, и проверка упала не на том, что проверяла, а на
+    попытке изобразить обрыв связи:
+
+      TypeError: APIConnectionError.__init__() missing 1 required
+                 keyword-only argument: 'request'
+
+    Конструктор SDK требует настоящий запрос httpx, и подсунуть ему нечего.
+    Значит обходим конструктор: __new__ создаёт объект нужного ТИПА, а тип —
+    единственное, что здесь и проверяется. Ровно так же сделано в соседнем
+    _api_error чуть выше; там это работало, а здесь забылось.
+    """
     import anthropic
     try:
         import httpx
         return anthropic.APIConnectionError(
             request=httpx.Request("POST", "http://пк:4000/v1/messages"))
     except Exception:
-        return anthropic.APIConnectionError()
+        return anthropic.APIConnectionError.__new__(
+            anthropic.APIConnectionError)
 
 
 def test_history() -> None:
@@ -11267,12 +11281,23 @@ def test_vision() -> None:
                           model="м", vision_model="м",
                           учёт=lambda откуда, вход, выход: счёт.append(
                               (откуда, вход, выход)))
+        # Подменяя модуль, ЗАПОМИНАЕМ прежний и возвращаем его. Раньше здесь
+        # стоял pop, то есть модуль просто выбрасывался, — и следующий тест,
+        # которому anthropic понадобится, импортировал его заново. Импорт с
+        # нуля тянет httpx, и на сборочной машине это разваливалось так, что
+        # падал совсем другой тест и совсем в другом месте.
+        #
+        # Правило простое: подменил чужое — верни как было, а не «убери».
+        было = sys.modules.get("anthropic")
         sys.modules["anthropic"] = _поддельный_anthropic()
         try:
             check("облако ответило", считающий.посмотреть(), "вижу стол")
             check("расход записан", счёт, [("м", 1500, 20)])
         finally:
-            sys.modules.pop("anthropic", None)
+            if было is None:
+                sys.modules.pop("anthropic", None)
+            else:
+                sys.modules["anthropic"] = было
     finally:
         srv.shutdown()
 
