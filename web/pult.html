@@ -125,6 +125,29 @@
      ssh и чтение простыни цифр. А смотреть в него приходится каждый раз,
      когда робот отказался ехать, — то есть тогда, когда человек и так занят
      роботом, а не терминалом. */
+  /* --- карта вокруг ---
+     Дальномер показывает восемь колонок ПРЯМО СЕЙЧАС и только вперёд. Карта
+     показывает всё, что робот видел за последние полминуты, включая то, что
+     уже за спиной, — и именно по ней он решает, можно ли сдать назад и есть
+     ли место развернуться. До сих пор посмотреть на неё было нельзя ничем:
+     она жила в памяти службы и наружу не выходила. */
+  #mapCanvas {
+    display: block; width: 240px; max-width: 100%;
+    image-rendering: pixelated;      /* клетки 5 см — пусть будут клетками */
+    border-radius: 6px; background: #12161c;
+  }
+  .map-legend {
+    display: flex; gap: 10px; flex-wrap: wrap;
+    font-size: 11px; color: var(--dim); margin-top: 4px;
+  }
+  .map-legend span { display: flex; align-items: center; gap: 4px; }
+  .map-legend i {
+    width: 10px; height: 10px; border-radius: 2px; display: inline-block;
+  }
+  .map-legend i.занято { background: #ff4d4f; }
+  .map-legend i.свободно { background: #24402c; }
+  .map-legend i.незнаю { background: #12161c; border: 1px solid #2a323d; }
+
   .tof { padding: 6px 12px; }
   .tof-head {
     display: flex; justify-content: space-between; align-items: baseline;
@@ -278,6 +301,20 @@
     <div class="wheel"><span class="name">ПП</span><span class="bar"><i id="wFR"></i></span><span class="val" id="vFR">0.00</span></div>
     <div class="wheel"><span class="name">ЗЛ</span><span class="bar"><i id="wRL"></i></span><span class="val" id="vRL">0.00</span></div>
     <div class="wheel"><span class="name">ЗП</span><span class="bar"><i id="wRR"></i></span><span class="val" id="vRR">0.00</span></div>
+  </div>
+
+  <div class="tof" id="mapBox" hidden>
+    <div class="tof-head">
+      <span>карта вокруг</span>
+      <span class="tof-why" id="mapWhy"></span>
+      <label class="tof-on"><input type="checkbox" id="mapOn" checked> показывать</label>
+    </div>
+    <canvas id="mapCanvas" width="240" height="240"></canvas>
+    <div class="map-legend">
+      <span><i class="занято"></i>занято</span>
+      <span><i class="свободно"></i>проехал, чисто</span>
+      <span><i class="незнаю"></i>не смотрел</span>
+    </div>
   </div>
 
   <div class="tof" id="tofBox" hidden>
@@ -1172,6 +1209,102 @@ micBtn.addEventListener('click', () => (micOn ? micStop() : micStart()));
 
 // ── Главный цикл ─────────────────────────────────────────────────────────
 connect();
+// --- карта вокруг ------------------------------------------------------
+// Что это и чем отличается от сетки. Сетка — восемь колонок ПРЯМО СЕЙЧАС и
+// только вперёд. Карта — всё, что робот видел за последние полминуты, сведённое
+// по одометрии в одну картинку сверху: включая то, что уже за спиной. Именно по
+// ней он решает, можно ли сдать назад и есть ли место развернуться, — а
+// посмотреть на неё до сих пор было нельзя ничем.
+//
+// Клетки приходят сжатыми: тройками знаков со счётчиками повторов
+// («200 45.12#» — двести «не знаю», сорок пять «свободно», двенадцать
+// «занято»). Списком чисел это было бы тридцать пять килобайт на кадр.
+const mapBox = document.getElementById('mapBox');
+const mapCanvas = document.getElementById('mapCanvas');
+const mapWhy = document.getElementById('mapWhy');
+const mapOn = document.getElementById('mapOn');
+const mapCtx = mapCanvas.getContext('2d');
+let опросовКарты = 0;
+
+// Цвета трёх состояний. Три, а не два: «не смотрел» обязано отличаться от
+// «чисто» — свести их в один цвет значит нарисовать проход сквозь стеклянную
+// дверь, и человек по такой картинке пошлёт робота ехать.
+const ЦВЕТ = {
+  '#': [255, 77, 79],      // занято
+  '.': [36, 64, 44],       // свободно
+  ' ': [18, 22, 28],       // не знаю
+};
+
+function разжать(строка, сколько) {
+  const клетки = new Uint8Array(сколько);   // 0 не знаю, 1 свободно, 2 занято
+  let место = 0;
+  const куски = строка.matchAll(/(\d+)(.)/g);
+  for (const [, счёт, знак] of куски) {
+    const n = Math.min(+счёт, сколько - место);
+    const код = знак === '#' ? 2 : (знак === '.' ? 1 : 0);
+    клетки.fill(код, место, место + n);
+    место += n;
+    if (место >= сколько) break;
+  }
+  return клетки;
+}
+
+function drawMap(d) {
+  if (!mapOn.checked) { mapBox.hidden = true; return; }
+  // Прятать целиком нельзя по той же причине, что и сетку: исчезнувшая
+  // панель читается как «всё хорошо».
+  mapBox.hidden = false;
+  if (!d || !d.есть) {
+    mapWhy.textContent = (d && d.почему) || 'нет связи';
+    mapCtx.fillStyle = '#12161c';
+    mapCtx.fillRect(0, 0, mapCanvas.width, mapCanvas.height);
+    return;
+  }
+  const n = d.клеток;
+  if (mapCanvas.width !== n) { mapCanvas.width = n; mapCanvas.height = n; }
+  const клетки = разжать(d.клетки || '', n * n);
+  const кадр = mapCtx.createImageData(n, n);
+  for (let i = 0; i < клетки.length; i++) {
+    const c = ЦВЕТ[клетки[i] === 2 ? '#' : (клетки[i] === 1 ? '.' : ' ')];
+    const p = i * 4;
+    // Строка 0 карты — это НИЗ картинки: у карты y растёт влево-вверх, как в
+    // ROS, а у канвы вниз. Без переворота робот ехал бы на картинке в
+    // противоположную сторону, и это тот вид ошибки, который выглядит
+    // правдоподобно.
+    const строка = n - 1 - Math.floor(i / n);
+    const место = (строка * n + (i % n)) * 4;
+    кадр.data[место] = c[0]; кадр.data[место + 1] = c[1];
+    кадр.data[место + 2] = c[2]; кадр.data[место + 3] = 255;
+  }
+  mapCtx.putImageData(кадр, 0, 0);
+
+  // Робот поверх клеток: где стоит и куда смотрит. Без курса карта
+  // бесполезна — по ней не понять, что значит «впереди».
+  if (d.поза) {
+    const [x, y, курс] = d.поза;
+    const кx = (x - d.угол[0]) / d.клетка;
+    const кy = n - 1 - (y - d.угол[1]) / d.клетка;
+    const r = Math.max(2, d.радиус / d.клетка);
+    mapCtx.save();
+    mapCtx.translate(кx, кy);
+    // Минус: на карте y вверх, на канве вниз — поворот тоже зеркалится.
+    mapCtx.rotate(-курс);
+    mapCtx.fillStyle = 'rgba(90, 200, 250, .85)';
+    mapCtx.beginPath();
+    mapCtx.moveTo(r, 0);
+    mapCtx.lineTo(-r * 0.7, r * 0.7);
+    mapCtx.lineTo(-r * 0.7, -r * 0.7);
+    mapCtx.closePath();
+    mapCtx.fill();
+    mapCtx.restore();
+  }
+  const метров = (d.клеток * d.клетка).toFixed(0);
+  mapWhy.textContent = d.возраст.toFixed(1) + ' с назад, ' + метров + '×'
+                     + метров + ' м, замеров ' + d.замеров;
+}
+
+mapOn.addEventListener('change', () => { if (!mapOn.checked) drawMap(null); });
+
 // --- дальномер ---------------------------------------------------------
 // Сетку выкладывает голосовая служба, сервер её только отдаёт: порт не
 // читается вдвоём, и второй читатель отнял бы байты у самого робота.
@@ -1302,6 +1435,17 @@ setInterval(() => {
   if (document.hidden) return;
   fetch('/tof').then(r => r.json()).then(drawTof)
                .catch(() => drawTof(null));
+  // Карту опрашиваем реже сетки: она по построению живёт полминуты, и
+  // мгновенная свежесть ей не нужна, а весит она больше.
+  //
+  // Счётчик СВОЙ, а не кадров дальномера. Сперва было по ним — и карта не
+  // грузилась вовсе, стоило дальномеру замолчать: тот счётчик растёт только
+  // когда сетка приходит. Молчащий дальномер как раз тот случай, когда на
+  // карту и надо смотреть: она помнит то, что он видел, пока работал.
+  if (mapOn.checked && (++опросовКарты & 1)) {
+    fetch('/map').then(r => r.json()).then(drawMap)
+                 .catch(() => drawMap(null));
+  }
 }, 500);
 
 setInterval(publishCmdVel, 1000 / SEND_HZ);
