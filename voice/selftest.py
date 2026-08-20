@@ -4165,6 +4165,7 @@ def test_раздача_картинки_своя() -> None:
     """
     section("раздача картинки")
 
+    import ast
     import types
     import urllib.error
     import urllib.request
@@ -4243,6 +4244,28 @@ def test_раздача_картинки_своя() -> None:
         # поднялся, и два раздатчика на одном порту не нужны.
         check("занятый порт не отбираем",
               look_relay.поднять_раздачу(узел, порт=порт), None)
+
+        # А ТЕПЕРЬ САМОЕ ВАЖНОЕ: затвор обязан запускаться ВСЕГДА.
+        #
+        # Он делает две работы, и вторая нужна независимо от первой: отдаёт
+        # кадр по запросу для поиска вещей — и раздаёт картинку в пульт.
+        # Раньше он стоял внутри «если есть DOSOD и модель», и без них пульт
+        # оставался без картинки вовсе. Со стороны это выглядит как «камера
+        # не работает», хотя камера цела и детектор ведёт людей.
+        исходник = (Path(__file__).resolve().parent.parent / "scripts"
+                    / "mono2d_no_web.launch.py").read_text(encoding="utf-8")
+        дерево = ast.parse(исходник)
+        внутри_условия = set()
+        for узел_ast in ast.walk(дерево):
+            if isinstance(узел_ast, ast.If):
+                for малый in ast.walk(узел_ast):
+                    if isinstance(малый, ast.Constant) and \
+                            малый.value == "look_relay.py":
+                        внутри_условия.add(малый.lineno)
+        check("затвор не спрятан под условием", внутри_условия, set())
+        check("и он есть в запуске", "look_relay.py" in исходник, True)
+        check("и попадает в список узлов",
+              "+ затвор" in исходник, True)
     finally:
         сервер.shutdown()
         for имя in заглушки:
@@ -7677,7 +7700,36 @@ def _http_error(code: int, текст: str = "") -> Exception:
                 code, request=httpx.Request("POST", "http://пк:4000/v1/messages")),
             body=None)
     except Exception:
-        return cls.__new__(cls)
+        return _без_конструктора(cls, текст or f"код {code}", code)
+
+
+def _без_конструктора(cls, текст: str, code=None) -> Exception:
+    """Исключение нужного типа С НУЖНЫМ ТЕКСТОМ, в обход конструктора SDK.
+
+    Конструкторы ошибок anthropic требуют настоящий ответ httpx, а на
+    сборочной машине httpx может не оказаться. Обойти конструктор через
+    __new__ мало: объект выйдет правильного типа, но НЕМОЙ — str() у него
+    пустая.
+
+    А текст здесь важнее типа. По нему робот отличает «запрос неправилен сам
+    по себе» (тогда перебирать собеседников бессмысленно, отвергнут все) от
+    «этот собеседник не смог» (тогда следующий справится). Немая ошибка
+    выглядит как второе, и робот зря метит живых собеседников мёртвыми.
+
+    Ровно это и случилось: после первой починки крах исчез, а пять проверок
+    разошлись — все про разбор текста. Починка вылечила симптом и завела
+    новую беду взамен.
+
+    Exception.__init__ ставит args, а из них берётся str(). Остальные поля
+    кладём рядом: SDK их заполняет, и код робота может их спросить.
+    """
+    беда = cls.__new__(cls)
+    Exception.__init__(беда, текст)
+    беда.message = текст
+    беда.body = None
+    if code is not None:
+        беда.status_code = code
+    return беда
 
 
 def _no_connection() -> Exception:
@@ -7701,8 +7753,8 @@ def _no_connection() -> Exception:
         return anthropic.APIConnectionError(
             request=httpx.Request("POST", "http://пк:4000/v1/messages"))
     except Exception:
-        return anthropic.APIConnectionError.__new__(
-            anthropic.APIConnectionError)
+        return _без_конструктора(anthropic.APIConnectionError,
+                                 "Connection error.")
 
 
 def test_history() -> None:
