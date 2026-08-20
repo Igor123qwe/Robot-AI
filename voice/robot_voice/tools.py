@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import counting, diary, nightly, ru, skills, things, when
+from . import counting, diary, landmarks, nightly, ru, skills, things, when
 from . import weather as weather_api
 
 log = logging.getLogger(__name__)
@@ -544,6 +544,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 вещи=None,
                 дневник=None,
                 разбор=None,
+                пометки=None,
                 news_url: str = "") -> list[Tool]:
     """Собирает набор инструментов, привязанный к конкретному роботу.
 
@@ -2344,6 +2345,50 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 "а не список."),
             input_schema=EMPTY_SCHEMA,
             run=list_things,
+        ))
+
+    # --- пометки на карте: что где стоит --------------------------------
+    if пометки is not None:
+        def what_is_around() -> str:
+            """Что робот видит вокруг себя на своей карте.
+
+            Отвечает НАПРАВЛЕНИЯМИ И МЕТРАМИ от текущего положения, а не
+            координатами: «стол впереди слева, два метра» человек понимает
+            сразу, а «стол в точке (2.0, 1.0)» не значит для него ничего —
+            он не знает, где у робота ноль.
+            """
+            поза = tof.поза() if tof is not None and hasattr(tof, "поза") \
+                else None
+            if поза is None and follower is not None:
+                поза = getattr(getattr(follower, "ros", None), "odom", None)
+            рядом = пометки.вокруг(поза)
+            if not рядом:
+                старых = sum(1 for м in пометки.метки if м.get("прошлый_раз"))
+                if старых:
+                    return (f"Сейчас вокруг ничего не отмечено. У меня есть "
+                            f"{ru.count(старых, 'пометка', 'пометки', 'пометок')} "
+                            "с прошлого раза, но после перезагрузки я не знаю, "
+                            "где стою, и не могу им верить. Поезжу — отмечу "
+                            "заново.")
+                return ("Пока ничего не отмечено. Мне надо поездить и "
+                        "посмотреть по сторонам.")
+            куски = []
+            for класс, до, угол in рядом[:5]:
+                имя = "место, где я застреваю" if класс == "тупик" \
+                    else things.ПО_РУССКИ.get(класс, [класс])[0]
+                куски.append(f"{имя} — {landmarks.куда_словами(угол)}, "
+                             f"{до:.1f} м")
+            return "Вокруг меня: " + "; ".join(куски) + "."
+
+        tools.append(Tool(
+            name="what_is_around",
+            description=(
+                "Что стоит вокруг робота по его карте: мебель, которую он "
+                "запомнил, и места, где он застревает. Зови на «что вокруг», "
+                "«что ты видишь», «где стол», «что рядом». Отдаёт стороны и "
+                "метры от робота — перескажи как есть, не выдумывая."),
+            input_schema={"type": "object", "properties": {}},
+            run=what_is_around,
         ))
 
     # --- дневник: что робот помнит про самого себя ----------------------

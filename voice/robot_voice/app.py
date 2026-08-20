@@ -18,7 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import (diary, falldown, gestures, intents, mapping, nightly, skills,
+from . import (diary, falldown, gestures, intents, landmarks, mapping,
+               nightly, skills,
                things, turn_end, vision_track)
 from .audio import Listener, make_source
 from .brain import Brain
@@ -847,7 +848,7 @@ def main() -> None:
                     # показывает восемь колонок прямо сейчас, а карта — всё,
                     # что он видел за последние полминуты, включая то, что
                     # уже за спиной.
-                    карта.выложить(куда_карту)
+                    карта.выложить(куда_карту, пометки=пометки)
                 except Exception:               # noqa: BLE001
                     log.exception("карта не сложилась")
                     time.sleep(1.0)
@@ -955,6 +956,19 @@ def main() -> None:
     # what_i_learned и модуль nightly).
     разбор = nightly.Разбор(cfg.data_dir / "выводы.json", дневник)
 
+    # Пометки на карте: мебель и трудные места. Отдельно от карты занятости —
+    # та забывает половину за тридцать пять секунд, и правильно делает, а
+    # стол стоит годами.
+    пометки = landmarks.Пометки(cfg.data_dir / "пометки.json")
+    if пометки.с_прошлого_раза:
+        log.info("карта: помню %d пометок с прошлого раза, но координаты у "
+                 "них от прошлого запуска — подтвержу, когда увижу сам",
+                 пометки.с_прошлого_раза)
+    if вещи is not None:
+        вещи.пометки = пометки
+    if ведомый is not None:
+        ведомый.пометки = пометки
+
     def _разбирать_по_ночам() -> None:
         """Раз в сутки, в тихие часы.
 
@@ -995,7 +1009,7 @@ def main() -> None:
                         player=player, eyes=глаза, tof=дальномер,
                         follower=ведомый, навыки=навыки, вещи=вещи,
                         дневник=дневник,
-                        разбор=разбор)
+                        разбор=разбор, пометки=пометки)
     brain = Brain(cfg, tools)
     # Счётчик отдаём после сборки мозга: глаза нужны инструментам, а мозг —
     # инструментам же, и по кругу это не собрать.
