@@ -415,7 +415,7 @@ class Ros:
         сказать = getattr(self, "скорость_дальномеру", None)
         if сказать is not None:
             try:
-                сказать(x)
+                сказать(x, wz)
             except Exception:              # noqa: BLE001
                 log.exception("не смог сказать дальномеру про скорость")
         ушло = self._send({
