@@ -176,7 +176,7 @@
   .wheel .val { width: 34px; text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
 
   /* --- карта ----------------------------------------------------------- */
-  #mapCanvas {
+  #mapCanvas, #flatCanvas {
     display: block; width: 100%; aspect-ratio: 1;
     image-rendering: pixelated;      /* клетки по пять сантиметров — пусть будут клетками */
     border-radius: 8px; background: #0d1116;
@@ -394,6 +394,7 @@
       <label class="чип"><input type="checkbox" id="tofOverOn" checked>сетка</label>
       <label class="чип"><input type="checkbox" id="mapOn" checked>карта</label>
       <label class="чип"><input type="checkbox" id="wheelsOn" checked>колёса</label>
+      <label class="чип"><input type="checkbox" id="flatOn">квартира</label>
     </div>
 
     <div class="карточка" id="mapBox" hidden>
@@ -403,6 +404,16 @@
         <span><i class="занято"></i>занято</span>
         <span><i class="свободно"></i>чисто</span>
         <span><i class="незнаю"></i>не смотрел</span>
+      </div>
+    </div>
+
+    <div class="карточка" id="flatBox" hidden>
+      <div class="шапочка"><b>план квартиры</b><span class="мелко" id="flatWhy"></span></div>
+      <canvas id="flatCanvas" width="200" height="200"></canvas>
+      <div class="map-legend">
+        <span><i class="занято"></i>стены</span>
+        <span><i class="свободно"></i>проезжал</span>
+        <span><i class="незнаю"></i>не был</span>
       </div>
     </div>
 
@@ -1493,6 +1504,95 @@ function drawMap(d) {
 
 mapOn.addEventListener('change', () => { if (!mapOn.checked) drawMap(null); });
 
+// --- план квартиры -----------------------------------------------------
+// ДРУГАЯ КАРТА, не та, что выше, и путать их нельзя. «Карта вокруг» — шесть
+// метров и полминуты памяти; она ЗАБЫВАЕТ нарочно, потому что стул унесли, а
+// кот ушёл. План квартиры копится месяцами и не тускнеет вовсе: стены за
+// сутки не двигаются.
+//
+// Панель появилась после живой жалобы: «карту не сохраняет, каждый раз заново
+// рисует». Жалоба была про «карту вокруг», и та правда рисуется заново — так
+// и задумано. А постоянная карта существовала и НЕ ПОКАЗЫВАЛАСЬ НИГДЕ, то
+// есть была неотличима от несуществующей.
+//
+// Выключена по умолчанию: смотрят на неё редко, а место она занимает.
+const flatBox = document.getElementById('flatBox');
+const flatCanvas = document.getElementById('flatCanvas');
+const flatWhy = document.getElementById('flatWhy');
+const flatOn = document.getElementById('flatOn');
+const flatCtx = flatCanvas.getContext('2d');
+
+// Цвета свои, приглушённее: у постоянной карты другой смысл. Красный тут не
+// «осторожно, препятствие», а «здесь стена» — это знание, а не тревога.
+const ЦВЕТ_ПЛАНА = {
+  '#': [198, 90, 80],      // стены и мебель
+  '.': [40, 72, 52],       // проезжал
+  ' ': [16, 20, 26],       // не был
+};
+
+function drawFlat(d) {
+  if (!flatOn.checked) { flatBox.hidden = true; return; }
+  flatBox.hidden = false;
+  if (!d || !d.есть) {
+    flatWhy.textContent = (d && d.почему) || 'нет связи';
+    flatCtx.fillStyle = '#101419';
+    flatCtx.fillRect(0, 0, flatCanvas.width, flatCanvas.height);
+    return;
+  }
+  const n = d.клеток;
+  if (flatCanvas.width !== n) { flatCanvas.width = n; flatCanvas.height = n; }
+  // Разжатие ОБЩЕЕ с картой вокруг: три знака со счётчиками повторов. Своя
+  // азбука здесь означала бы вторую реализацию одного и того же.
+  const клетки = разжать(d.клетки || '', n * n);
+  const кадр = flatCtx.createImageData(n, n);
+  for (let i = 0; i < клетки.length; i++) {
+    const c = ЦВЕТ_ПЛАНА[клетки[i] === 2 ? '#' : (клетки[i] === 1 ? '.' : ' ')];
+    const p = i * 4;
+    // Тот же переворот, что у карты вокруг: строка 0 — низ картинки.
+    const строка = n - 1 - Math.floor(i / n);
+    const место = (строка * n + (i % n)) * 4;
+    кадр.data[место] = c[0]; кадр.data[место + 1] = c[1];
+    кадр.data[место + 2] = c[2]; кадр.data[место + 3] = 255;
+  }
+  flatCtx.putImageData(кадр, 0, 0);
+
+  // Робот на плане. Ноль плана — в середине карты, а не там, где робот.
+  if (d.поза) {
+    const [x, y, курс] = d.поза;
+    const кx = x / d.клетка + d.середина;
+    const кy = n - 1 - (y / d.клетка + d.середина);
+    flatCtx.save();
+    flatCtx.translate(кx, кy);
+    flatCtx.rotate(-курс);
+    flatCtx.fillStyle = 'rgba(90, 200, 250, .9)';
+    flatCtx.beginPath();
+    flatCtx.moveTo(3, 0);
+    flatCtx.lineTo(-2, 2);
+    flatCtx.lineTo(-2, -2);
+    flatCtx.closePath();
+    flatCtx.fill();
+    flatCtx.restore();
+  }
+
+  // ПОЧЕМУ НЕ КОПИТСЯ — говорим прямо. Робот, который не копит карту, снаружи
+  // неотличим от робота, который копит и теряет: человек видит пустую панель
+  // и решает, что сломано. А ответ обычно простой — покажи роботу стол.
+  if (!d.копим && d.почему) {
+    flatWhy.textContent = 'не копится';
+    flatWhy.title = d.почему;
+  } else {
+    const м2 = (d.метров || 0).toFixed(1);
+    flatWhy.textContent = м2 + ' м² · ' + (d.поездок || 0) + ' поездок';
+    flatWhy.title = 'известно клеток: ' + (d.известно || 0)
+                  + ', клетка ' + (d.клетка * 100).toFixed(0) + ' см';
+  }
+}
+
+flatOn.addEventListener('change', () => {
+  if (!flatOn.checked) drawFlat(null);
+  else fetch('/flat').then(r => r.json()).then(drawFlat).catch(() => drawFlat(null));
+});
+
 // --- ящик настроек -----------------------------------------------------
 // Одна кнопка на всё, что настраивают раз в месяц: адрес камеры и прицел
 // сетки. Раньше это лежало на главном экране и занимало место, нужное
@@ -1682,6 +1782,12 @@ setInterval(() => {
   if (mapOn.checked && (++опросовКарты & 1)) {
     fetch('/map').then(r => r.json()).then(drawMap)
                  .catch(() => drawMap(null));
+  }
+  // План квартиры — совсем редко: робот и выкладывает его раз в пять секунд,
+  // а меняется он месяцами. Каждый десятый круг — это раз в пять секунд.
+  if (flatOn.checked && опросовКарты % 10 === 0) {
+    fetch('/flat').then(r => r.json()).then(drawFlat)
+                  .catch(() => drawFlat(null));
   }
 }, 500);
 
