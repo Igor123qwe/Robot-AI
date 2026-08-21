@@ -21,7 +21,7 @@ from typing import Callable
 from . import (atlas as atlas_mod, diary, falldown, gestures, intents,
                landmarks, mapping,
                nightly, skills,
-               things, turn_end, vision_track)
+               survey, things, turn_end, vision_track)
 from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
@@ -958,6 +958,20 @@ def main() -> None:
     ведомый = (Следование(ros, дальномер, говорить=voice.say, глаза=пеленг,
                           карта=карта)
                if дальномер else None)
+    # Обход квартиры. Заводим рядом со следованием и по тем же правилам:
+    # это второй источник движения, и Ros обязан про него знать — иначе
+    # кнопка СТОП в пульте во время обхода не сработает вовсе.
+    # Вещи ему раздадим ниже, там же, где и следованию пометки: узнавание
+    # предметов заводится позже, а перенести сюда его нельзя — оно висит на
+    # подписке, которой в этот миг ещё нет.
+    обходчик = (survey.Обход(ros, дальномер, план=план, карта=карта,
+                             пометки=пометки, говорить=voice.say)
+                if дальномер is not None and ros is not None else None)
+    if обходчик is not None:
+        ros.завести_движитель(
+            "обход квартиры",
+            lambda: обходчик.идёт,
+            lambda почему: обходчик.хватит(почему, ждать=False))
     if ведомый is not None and ros is not None:
         # Заявляем следование как источник движения. Без этой строки Ros про
         # него не знал, и кнопка СТОП в пульте во время следования не работала
@@ -1084,13 +1098,16 @@ def main() -> None:
     вещи.пометки = пометки
     if ведомый is not None:
         ведомый.пометки = пометки
+    if обходчик is not None:
+        обходчик.вещи = вещи
 
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
                         player=player, eyes=глаза, tof=дальномер,
-                        follower=ведомый, навыки=навыки, вещи=вещи,
+                        follower=ведомый, обходчик=обходчик,
+                        навыки=навыки, вещи=вещи,
                         дневник=дневник,
                         разбор=разбор, пометки=пометки)
     brain = Brain(cfg, tools)
