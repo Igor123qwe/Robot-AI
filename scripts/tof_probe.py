@@ -10,6 +10,17 @@
 несколько вариантов запроса и печатает ответ КАК ЕСТЬ, байтами. По этому
 выводу протокол уточняется за пять минут.
 
+ЗАПУСКАТЬ ИЗ КОРНЯ РЕПОЗИТОРИЯ И ПРИ ОСТАНОВЛЕННОЙ СЛУЖБЕ:
+
+    sudo systemctl stop robot-voice
+    cd ~/Robot-AI && python3 scripts/tof_probe.py --карта 30
+    sudo systemctl start robot-voice
+
+Обе строчки не для красоты. Из домашнего каталога скрипта просто нет —
+«python3: can't open file '/home/wheeltec/scripts/tof_probe.py'». А порт
+дальномера держит robot-voice, и второй читатель поделит байты пополам:
+показания испортятся ровно в тот миг, когда их измеряют.
+
     python3 scripts/tof_probe.py --смотреть   # живая сетка в метрах
     python3 scripts/tof_probe.py --свои       # запомнить свои же детали
     python3 scripts/tof_probe.py              # найти сам, послушать
