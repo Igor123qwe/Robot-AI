@@ -37,9 +37,47 @@ set +u
 # shellcheck disable=SC1091
 source "$TROS/setup.bash"
 set -u
-if ros2 pkg list 2>/dev/null | grep -qx "hobot_dosod"; then
+# СПЕРВА УБЕДИМСЯ, ЧТО СПРАШИВАТЬ ЕСТЬ У КОГО.
+#
+# Здесь стояло `ros2 pkg list 2>/dev/null | grep -qx hobot_dosod`, и у этой
+# проверки два разных исхода выглядели одинаково: «пакета нет» и «ros2 не
+# ответил». Второй случай молча уводил в ветку сборки — а она клонирует
+# семьдесят пять мегабайт и собирает поверх того, что уже лежит в
+# /opt/tros/humble. Colcon на это честно ругается:
+#
+#     'hobot_dosod' is in: /opt/tros/humble
+#     If a package in a merged underlay workspace is overridden ...
+#     undefined behavior at run time
+#
+# То есть цена ошибки — не потерянные полчаса, а перекрытый пакет, который
+# однажды поведёт себя не так, как отлаженный. Спрашиваем прямо и проверяем,
+# что ответ вообще был.
+СПИСОК="$(ros2 pkg list 2>/dev/null || true)"
+if [ -z "$СПИСОК" ]; then
+    echo "ros2 не отвечает: 'ros2 pkg list' вернул пустоту." >&2
+    echo "Собирать вслепую нельзя — можно перекрыть готовый пакет." >&2
+    echo "Проверь окружение:  source $TROS/setup.bash && ros2 pkg list | head" >&2
+    exit 1
+fi
+if printf '%s\n' "$СПИСОК" | grep -qx "hobot_dosod"; then
     echo "hobot_dosod уже есть в TogetheROS — собирать нечего."
-    echo "Модель рядом с рабочим каталогом кладёт scripts/body_service.sh."
+    echo "А вот МОДЕЛИ у пакета из репозитория может не быть: деб-пакет её"
+    echo "не несёт, и узел тогда пишет «Model file is not exist». Кладём."
+    if [ ! -f "$WORK_DIR/config/dosod_mlp3x_l_rep-int8.bin" ]; then
+        mkdir -p "$SRC_DIR" "$WORK_DIR/config"
+        cd "$SRC_DIR"
+        if [ -d hobot_dosod/.git ]; then
+            git -C hobot_dosod pull --ff-only || true
+        else
+            git clone --depth 1 https://github.com/D-Robotics/hobot_dosod.git
+        fi
+        cp hobot_dosod/config/x5/dosod_mlp3x_l_rep-int8.bin "$WORK_DIR/config/"
+        cp hobot_dosod/config/offline_vocabulary.json "$WORK_DIR/config/"
+        echo "модель и словарь положены в $WORK_DIR/config"
+    else
+        echo "модель уже лежит в $WORK_DIR/config — трогать не буду"
+    fi
+    echo
     echo
     echo "Перезапусти детектор и посмотри, что он скажет про поиск вещей:"
     echo "    sudo systemctl restart robot-body"
