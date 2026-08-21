@@ -52,14 +52,14 @@ set -u
 # То есть цена ошибки — не потерянные полчаса, а перекрытый пакет, который
 # однажды поведёт себя не так, как отлаженный. Спрашиваем прямо и проверяем,
 # что ответ вообще был.
-СПИСОК="$(ros2 pkg list 2>/dev/null || true)"
-if [ -z "$СПИСОК" ]; then
+PKG_LIST="$(ros2 pkg list 2>/dev/null || true)"
+if [ -z "$PKG_LIST" ]; then
     echo "ros2 не отвечает: 'ros2 pkg list' вернул пустоту." >&2
     echo "Собирать вслепую нельзя — можно перекрыть готовый пакет." >&2
     echo "Проверь окружение:  source $TROS/setup.bash && ros2 pkg list | head" >&2
     exit 1
 fi
-if printf '%s\n' "$СПИСОК" | grep -qx "hobot_dosod"; then
+if printf '%s\n' "$PKG_LIST" | grep -qx "hobot_dosod"; then
     echo "hobot_dosod уже есть в TogetheROS — собирать нечего."
     echo "А вот МОДЕЛИ у пакета из репозитория может не быть: деб-пакет её"
     echo "не несёт, и узел тогда пишет «Model file is not exist». Кладём."
