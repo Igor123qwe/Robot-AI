@@ -409,7 +409,7 @@
 
     <div class="карточка" id="flatBox" hidden>
       <div class="шапочка"><b>план квартиры</b><span class="мелко" id="flatWhy"></span></div>
-      <canvas id="flatCanvas" width="200" height="200"></canvas>
+      <canvas id="flatCanvas" width="900" height="900"></canvas>
       <div class="map-legend">
         <span><i class="занято"></i>стены</span>
         <span><i class="свободно"></i>проезжал</span>
@@ -1530,49 +1530,156 @@ const ЦВЕТ_ПЛАНА = {
   ' ': [16, 20, 26],       // не был
 };
 
+// Русские имена классов сети — те же, что робот говорит вслух. Список
+// короткий нарочно: на плане подписывается только мебель, которая стоит на
+// месте, а не всё, что сеть умеет назвать.
+const ИМЯ_ВЕЩИ = {
+  'chair': 'стул', 'couch': 'диван', 'bed': 'кровать',
+  'dining table': 'стол', 'tv': 'телевизор', 'refrigerator': 'холодильник',
+  'oven': 'духовка', 'sink': 'раковина', 'toilet': 'унитаз',
+  'microwave': 'СВЧ', 'potted plant': 'цветок', 'vase': 'ваза',
+  'clock': 'часы', 'bench': 'скамья', 'toaster': 'тостер',
+};
+
+// Во сколько раз рисуем крупнее, чем клеток в кадре. План на 200×200 пикселей
+// — это ноготь: стены в один пиксель, подписи не влезают вовсе. Человек
+// смотрит на план, чтобы УЗНАТЬ свою квартиру, а узнать её в пятне 200×200
+// нельзя. Рисуем в 900 и обрезаем по known-краю, чтобы жильё занимало кадр.
+const ПЛАН_ПИКСЕЛЕЙ = 900;
+// Сколько клеток пустоты оставляем вокруг известного. Восемь — это 80 см:
+// достаточно, чтобы стена не упиралась в самый край и было видно, что за ней
+// ничего не разведано.
+const ПЛАН_ПОЛЯ = 8;
+
 function drawFlat(d) {
   if (!flatOn.checked) { flatBox.hidden = true; return; }
   flatBox.hidden = false;
+  const ш = flatCanvas.width, в = flatCanvas.height;
+  flatCtx.fillStyle = '#0d1016';
+  flatCtx.fillRect(0, 0, ш, в);
   if (!d || !d.есть) {
     flatWhy.textContent = (d && d.почему) || 'нет связи';
-    flatCtx.fillStyle = '#101419';
-    flatCtx.fillRect(0, 0, flatCanvas.width, flatCanvas.height);
     return;
   }
   const n = d.клеток;
-  if (flatCanvas.width !== n) { flatCanvas.width = n; flatCanvas.height = n; }
+  if (flatCanvas.width !== ПЛАН_ПИКСЕЛЕЙ) {
+    flatCanvas.width = flatCanvas.height = ПЛАН_ПИКСЕЛЕЙ;
+  }
   // Разжатие ОБЩЕЕ с картой вокруг: три знака со счётчиками повторов. Своя
   // азбука здесь означала бы вторую реализацию одного и того же.
   const клетки = разжать(d.клетки || '', n * n);
-  const кадр = flatCtx.createImageData(n, n);
-  for (let i = 0; i < клетки.length; i++) {
-    const c = ЦВЕТ_ПЛАНА[клетки[i] === 2 ? '#' : (клетки[i] === 1 ? '.' : ' ')];
-    const p = i * 4;
-    // Тот же переворот, что у карты вокруг: строка 0 — низ картинки.
-    const строка = n - 1 - Math.floor(i / n);
-    const место = (строка * n + (i % n)) * 4;
-    кадр.data[место] = c[0]; кадр.data[место + 1] = c[1];
-    кадр.data[место + 2] = c[2]; кадр.data[место + 3] = 255;
-  }
-  flatCtx.putImageData(кадр, 0, 0);
 
-  // Робот на плане. Ноль плана — в середине карты, а не там, где робот.
+  // --- обрезаем по известному ------------------------------------------
+  // Квартира занимает угол поля 20×20 м, и рисовать всё поле — значит
+  // показывать человеку пустоту в девяти десятых кадра. Ищем края known и
+  // растягиваем на них.
+  let сx0 = n, сy0 = n, сx1 = -1, сy1 = -1;
+  for (let i = 0; i < клетки.length; i++) {
+    if (!клетки[i]) continue;                       // 0 — не был
+    const x = i % n, y = (i / n) | 0;
+    if (x < сx0) сx0 = x;
+    if (x > сx1) сx1 = x;
+    if (y < сy0) сy0 = y;
+    if (y > сy1) сy1 = y;
+  }
+  if (сx1 < 0) {                                     // ничего не известно
+    flatWhy.textContent = 'пусто';
+    return;
+  }
+  сx0 = Math.max(0, сx0 - ПЛАН_ПОЛЯ); сy0 = Math.max(0, сy0 - ПЛАН_ПОЛЯ);
+  сx1 = Math.min(n - 1, сx1 + ПЛАН_ПОЛЯ); сy1 = Math.min(n - 1, сy1 + ПЛАН_ПОЛЯ);
+  // Квадратим окно: иначе план растягивается, и комнаты выходят кривыми.
+  const бок = Math.max(сx1 - сx0 + 1, сy1 - сy0 + 1);
+  const мx = (сx0 + сx1) / 2, мy = (сy0 + сy1) / 2;
+  сx0 = Math.round(мx - бок / 2); сy0 = Math.round(мy - бок / 2);
+  const пкл = ПЛАН_ПИКСЕЛЕЙ / бок;                   // пикселей на клетку
+
+  // --- сами клетки ------------------------------------------------------
+  for (let y = 0; y < бок; y++) {
+    for (let x = 0; x < бок; x++) {
+      const кx = сx0 + x, кy = сy0 + y;
+      if (кx < 0 || кy < 0 || кx >= n || кy >= n) continue;
+      const з = клетки[кy * n + кx];
+      if (!з) continue;
+      const c = ЦВЕТ_ПЛАНА[з === 2 ? '#' : '.'];
+      flatCtx.fillStyle = 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+      // Строка 0 — низ картинки, как и у карты вокруг.
+      flatCtx.fillRect(x * пкл, (бок - 1 - y) * пкл,
+                       Math.ceil(пкл), Math.ceil(пкл));
+    }
+  }
+
+  // --- сетка по метрам --------------------------------------------------
+  // Без неё план — пятно без размера. С ней сразу видно, что коридор два
+  // метра, а комната четыре: человек читает свою квартиру, а не картинку.
+  const вметре = 1 / d.клетка;
+  flatCtx.strokeStyle = 'rgba(255,255,255,.07)';
+  flatCtx.lineWidth = 1;
+  flatCtx.beginPath();
+  for (let к = Math.ceil(сx0 / вметре) * вметре; к <= сx0 + бок; к += вметре) {
+    const п = (к - сx0) * пкл;
+    flatCtx.moveTo(п, 0); flatCtx.lineTo(п, ПЛАН_ПИКСЕЛЕЙ);
+  }
+  for (let к = Math.ceil(сy0 / вметре) * вметре; к <= сy0 + бок; к += вметре) {
+    const п = (бок - 1 - (к - сy0)) * пкл;
+    flatCtx.moveTo(0, п); flatCtx.lineTo(ПЛАН_ПИКСЕЛЕЙ, п);
+  }
+  flatCtx.stroke();
+
+  const вэкран = (x, y) => [
+    (x / d.клетка + d.середина - сx0) * пкл,
+    (бок - 1 - (y / d.клетка + d.середина - сy0)) * пкл,
+  ];
+
+  // --- мебель -----------------------------------------------------------
+  // То, ради чего план и заводился: «стол вот тут, диван вон там». Виденное
+  // в прошлый раз рисуем тусклее — это память, а не сегодняшнее наблюдение.
+  const шрифт = Math.max(11, Math.round(ПЛАН_ПИКСЕЛЕЙ / 55));
+  flatCtx.font = шрифт + 'px system-ui, sans-serif';
+  flatCtx.textAlign = 'center';
+  for (const м of (d.пометки || [])) {
+    const [пx, пy] = вэкран(м.x, м.y);
+    if (пx < 0 || пy < 0 || пx > ПЛАН_ПИКСЕЛЕЙ || пy > ПЛАН_ПИКСЕЛЕЙ) continue;
+    const свежая = !м.старое;
+    flatCtx.fillStyle = свежая ? 'rgba(250, 205, 90, .95)'
+                               : 'rgba(250, 205, 90, .45)';
+    flatCtx.beginPath();
+    flatCtx.arc(пx, пy, Math.max(3, пкл * 0.35), 0, Math.PI * 2);
+    flatCtx.fill();
+    const имя = ИМЯ_ВЕЩИ[м.класс] || м.класс;
+    flatCtx.fillStyle = свежая ? 'rgba(255,255,255,.92)' : 'rgba(255,255,255,.5)';
+    flatCtx.fillText(имя, пx, пy - шрифт * 0.6);
+  }
+
+  // --- робот ------------------------------------------------------------
   if (d.поза) {
     const [x, y, курс] = d.поза;
-    const кx = x / d.клетка + d.середина;
-    const кy = n - 1 - (y / d.клетка + d.середина);
+    const [пx, пy] = вэкран(x, y);
+    const р = Math.max(7, пкл * 0.9);
     flatCtx.save();
-    flatCtx.translate(кx, кy);
+    flatCtx.translate(пx, пy);
     flatCtx.rotate(-курс);
-    flatCtx.fillStyle = 'rgba(90, 200, 250, .9)';
+    flatCtx.fillStyle = 'rgba(90, 200, 250, .95)';
     flatCtx.beginPath();
-    flatCtx.moveTo(3, 0);
-    flatCtx.lineTo(-2, 2);
-    flatCtx.lineTo(-2, -2);
+    flatCtx.moveTo(р, 0);
+    flatCtx.lineTo(-р * 0.7, р * 0.7);
+    flatCtx.lineTo(-р * 0.7, -р * 0.7);
     flatCtx.closePath();
     flatCtx.fill();
     flatCtx.restore();
   }
+
+  // --- линейка ----------------------------------------------------------
+  const линейка = вметре * пкл;
+  flatCtx.strokeStyle = 'rgba(255,255,255,.75)';
+  flatCtx.lineWidth = 2;
+  flatCtx.beginPath();
+  flatCtx.moveTo(14, ПЛАН_ПИКСЕЛЕЙ - 16);
+  flatCtx.lineTo(14 + линейка, ПЛАН_ПИКСЕЛЕЙ - 16);
+  flatCtx.stroke();
+  flatCtx.fillStyle = 'rgba(255,255,255,.75)';
+  flatCtx.textAlign = 'left';
+  flatCtx.fillText('1 м', 14, ПЛАН_ПИКСЕЛЕЙ - 22);
 
   // ПОЧЕМУ НЕ КОПИТСЯ — говорим прямо. Робот, который не копит карту, снаружи
   // неотличим от робота, который копит и теряет: человек видит пустую панель
@@ -1582,7 +1689,9 @@ function drawFlat(d) {
     flatWhy.title = d.почему;
   } else {
     const м2 = (d.метров || 0).toFixed(1);
-    flatWhy.textContent = м2 + ' м² · ' + (d.поездок || 0) + ' поездок';
+    const вещей = (d.пометки || []).length;
+    flatWhy.textContent = м2 + ' м² · ' + (d.поездок || 0) + ' поездок'
+                        + (вещей ? ' · ' + вещей + ' вещей' : '');
     flatWhy.title = 'известно клеток: ' + (d.известно || 0)
                   + ', клетка ' + (d.клетка * 100).toFixed(0) + ' см';
   }
