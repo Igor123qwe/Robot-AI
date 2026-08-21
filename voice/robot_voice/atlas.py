@@ -165,7 +165,7 @@ class Атлас:
         if занятые is None:
             return 0
         поза = getattr(быстрая, "поза", None)
-        if poза_плоха(поза):
+        if поза_плоха(поза):
             return 0
         рx, рy, курс = поза
         cos, sin = math.cos(курс), math.sin(курс)
@@ -376,7 +376,7 @@ class Атлас:
             return False
 
 
-def poза_плоха(поза) -> bool:
+def поза_плоха(поза) -> bool:
     """Годится ли поза для счёта. То же имя, что в landmarks, тот же смысл."""
     if поза is None:
         return True
