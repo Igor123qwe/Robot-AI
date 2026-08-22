@@ -32,20 +32,16 @@ import logging
 import math
 import time
 
-from . import landmarks, vocabulary
+from . import landmarks, rig, vocabulary
 
 log = logging.getLogger(__name__)
 
 ТОПИК = "/perception/detection/dosod"
 ТИП = "ai_msgs/msg/PerceptionTargets"
-# Куда просить кадр. Пустое сообщение: единственное, что нужно сказать
-# затвору, — «посмотри сейчас».
-ЗАПРОС = "/robot_ai/look"
-
 # Поле зрения камеры и ширина кадра — те же, что у пеленга людей, и по той же
 # причине: в PerceptionTargets размеров кадра нет вовсе, взять их неоткуда.
-ПОЛЕ_КАМЕРЫ = 130.0
-ШИРИНА_КАДРА = 640.0
+ПОЛЕ_КАМЕРЫ = rig.КАМЕРА_ПОЛЕ_ГОР
+ШИРИНА_КАДРА = rig.КАМЕРА_ШИРИНА
 
 # Насколько уверенной должна быть сеть. У DOSOD порог по умолчанию 0.2 — для
 # картинки в отладчике сойдёт, для ответа человеку мало: на этом пороге в их
