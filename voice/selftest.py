@@ -6222,17 +6222,46 @@ def test_раздача_картинки_своя() -> None:
     # Затвор живёт на плате и тянет rclpy, которого здесь нет. Подставляем
     # заглушки: проверяем не ROS, а раздачу.
     заглушки = {}
-    for имя in ("rclpy", "rclpy.node", "sensor_msgs", "sensor_msgs.msg",
-                "std_msgs", "std_msgs.msg"):
+    for имя in ("rclpy", "rclpy.node", "rclpy.qos", "sensor_msgs",
+                "sensor_msgs.msg", "std_msgs", "std_msgs.msg"):
         if имя not in sys.modules:
             заглушки[имя] = sys.modules[имя] = types.ModuleType(имя)
-    sys.modules["rclpy.node"].Node = type("Node", (), {
-        "__init__": lambda s, *a, **k: None,
-        "create_subscription": lambda *a, **k: None,
-        "create_publisher": lambda *a, **k: None,
-        "get_logger": lambda s: types.SimpleNamespace(
-            info=lambda *a: None, warning=lambda *a: None,
-            error=lambda *a: None)})
+
+    class _УзелПонарошку:
+        """Узел ROS понарошку: запоминает подписки и таймеры, ничего не шлёт."""
+
+        def __init__(self, *a, **k):
+            self.подписки = []
+            self.таймеры = []
+            self.сказано = []
+            self.чужие_типы = []
+
+        def create_subscription(self, тип, топик, обработчик, качество):
+            self.подписки.append((тип, топик, обработчик, качество))
+            return types.SimpleNamespace(топик=топик)
+
+        def create_publisher(self, *a, **k):
+            return types.SimpleNamespace(publish=lambda *_: None)
+
+        def create_timer(self, период, что):
+            таймер = types.SimpleNamespace(период=период, что=что,
+                                           cancel=lambda: None)
+            self.таймеры.append(таймер)
+            return таймер
+
+        def get_publishers_info_by_topic(self, _топик):
+            return [types.SimpleNamespace(topic_type=т)
+                    for т in self.чужие_типы]
+
+        def get_logger(self):
+            запомнить = self.сказано.append
+            return types.SimpleNamespace(
+                info=lambda *a: запомнить(("info", " ".join(map(str, a)))),
+                warning=lambda *a: запомнить(("warn", " ".join(map(str, a)))),
+                error=lambda *a: запомнить(("error", " ".join(map(str, a)))))
+
+    sys.modules["rclpy.node"].Node = _УзелПонарошку
+    sys.modules["rclpy.qos"].qos_profile_sensor_data = "как у датчика"
     sys.modules["sensor_msgs.msg"].CompressedImage = type("C", (), {})
     sys.modules["sensor_msgs.msg"].Image = type("I", (), {})
     sys.modules["std_msgs.msg"].Empty = type("E", (), {})
@@ -6342,6 +6371,84 @@ def test_раздача_картинки_своя() -> None:
         check("и отвечает туда, откуда мы читаем",
               параметры.get("ai_msg_pub_topic_name"),
               "/perception/detection/dosod")
+
+        # ── ТИП ПОДПИСКИ НЕ УГАДЫВАЕМ, А СПРАШИВАЕМ У ROS ─────────────────
+        #
+        # ЖИВАЯ БЕДА, ВТОРАЯ СЕРИЯ. Раздатчик поднялся, порт занял, узел жив,
+        # `ros2 topic hz /image` показывает тридцать кадров — а пульт пуст.
+        # Причина: подписка была жёстко на CompressedImage, а камера в этой
+        # сборке отдавала сырой Image. Подписка с НЕВЕРНЫМ типом — не ошибка
+        # и не исключение: ROS просто не связывает её ни с одним
+        # публикатором, и обработчик не вызывается ни разу. Единственный след
+        # снаружи — `ros2 topic echo` ворчит про «больше одного типа»: это мы
+        # сами и есть, своей несвязанной подпиской.
+        сырая = look_relay.Затвор()
+        check("до ответа ROS на камеру не подписываемся", сырая._подписка,
+              None)
+        сырая.чужие_типы = [look_relay.СЫРОЙ]
+        сырая._искать_камеру()
+        check("камера отдаёт сырое — подписались сырым", сырая._тип,
+              look_relay.СЫРОЙ)
+        check("и обработчиком для сырого",
+              сырая.подписки[-1][2], сырая._кадр_сырой)
+
+        # НАДЁЖНОСТЬ КАК У ДАТЧИКА — второй способ не получить ни кадра при
+        # живой камере. Камеры публикуют best_effort; подписка по умолчанию
+        # просит reliable, и такая пара НЕ СВЯЗЫВАЕТСЯ — снова молча.
+        check("надёжность просим как у датчика", сырая.подписки[-1][3],
+              sys.modules["rclpy.qos"].qos_profile_sensor_data)
+
+        сжатая = look_relay.Затвор()
+        сжатая.чужие_типы = [look_relay.СЖАТЫЙ]
+        сжатая._искать_камеру()
+        check("камера отдаёт jpeg — подписались сжатым", сжатая._тип,
+              look_relay.СЖАТЫЙ)
+        check("и больше не ищем", сжатая._поиск, None)
+
+        # Камеры нет вовсе — ждём, потом подписываемся вслепую и ГОВОРИМ об
+        # этом. Молчание здесь и есть та самая беда на семь часов.
+        немая = look_relay.Затвор()
+        немая._искать_камеру()
+        check("камеру ждём, а не сдаёмся сразу", немая._тип, None)
+        немая._встали -= look_relay.ЖДЁМ_КАМЕРУ + 1
+        немая._искать_камеру()
+        check("не дождались — подписались вслепую", немая._тип,
+              look_relay.СЖАТЫЙ)
+        check("и сказали об этом в журнал",
+              any(вид == "warn" for вид, _ in немая.сказано), True)
+
+        # СТОРОЖ: раз в минуту напоминает, что кадров нет, и называет, кто
+        # публикует в /image. Одна строка в журнале против часов поисков.
+        немая.сказано.clear()
+        немая.чужие_типы = [look_relay.СЫРОЙ]
+        немая._как_там_камера()
+        жалобы = [текст for вид, текст in немая.сказано if вид == "warn"]
+        check("сторож жалуется на молчащую камеру", len(жалобы), 1)
+        check("и называет, что там на самом деле течёт",
+              look_relay.СЫРОЙ in жалобы[0], True)
+        немая._как_там_камера()
+        check("но не чаще раза в минуту",
+              len([т for в, т in немая.сказано if в == "warn"]), 1)
+
+        # СЫРОЙ КАДР НЕ ЖМЁМ ЗАРАНЕЕ. Сжимать тридцать кадров в секунду
+        # впустую — тот же расход, от которого мы и уходим, только на
+        # процессоре вместо BPU.
+        кадр = types.SimpleNamespace(encoding="bgr8", height=2, width=2,
+                                     data=bytes(range(12)), header=None)
+        сырая._кадр_сырой(кадр)
+        check("сырой кадр заранее не жмём", сырая._jpeg, None)
+        check("но помним его", сырая._сырой is кадр, True)
+        try:
+            import numpy as _np
+            развёрнут = look_relay._в_bgr(кадр)
+            check("и умеем развернуть в bgr", развёрнут.shape, (2, 2, 3))
+            check("не переставляя каналов", int(развёрнут[0, 0, 0]), 0)
+            check("а rgb — переставляя", int(look_relay._в_bgr(
+                types.SimpleNamespace(encoding="rgb8", height=2, width=2,
+                                      data=bytes(range(12))))[0, 0, 0]), 2)
+            _ = _np
+        except ImportError:                 # pragma: no cover — numpy есть в CI
+            pass
     finally:
         сервер.shutdown()
         for имя in заглушки:

@@ -54,6 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import CompressedImage, Image
     from std_msgs.msg import Empty
 except ImportError as e:                    # pragma: no cover — только на плате
@@ -75,6 +76,37 @@ except ImportError as e:                    # pragma: no cover — только 
 # моргнуть, робот мог качнуться на повороте, а второй попытки человек не
 # делает — он спросил один раз. Три кадра стоят четырёх десятых секунды BPU.
 КАДРОВ_НА_ЗАПРОС = 3
+
+# Как часто спрашивать у ROS, кто публикует в /image, пока публикатора нет.
+ИЩЕМ_КАМЕРУ_РАЗ_В = 0.5
+# Сколько ждать камеру, прежде чем подписаться вслепую и сказать об этом
+# громко. Пятнадцать секунд: узлы камеры и кодека поднимаются вместе с нами,
+# и первые секунды топика может не быть просто потому, что мы стартовали
+# быстрее.
+ЖДЁМ_КАМЕРУ = 15.0
+# Как часто жаловаться в журнал, что кадров нет. Раз в минуту: чаще — и
+# журнал заплывёт, реже — и человек успеет решить, что «камера не работает»,
+# так и не увидев ни строчки о причине.
+ЖАЛУЕМСЯ_РАЗ_В = 60.0
+
+# ТИПЫ, КОТОРЫЕ МЫ УМЕЕМ ЧИТАТЬ С КАМЕРЫ.
+#
+# Их два, и это не запас на будущее, а живая беда. hobot_usb_cam публикует в
+# /image либо сжатый jpeg (sensor_msgs/CompressedImage), либо сырой кадр
+# (sensor_msgs/Image) — в зависимости от pixel_format, который задаётся не у
+# нас, а в их файле запуска, и может поменяться от обновления их пакета.
+#
+# Подписка с НЕВЕРНЫМ типом не ошибка и не исключение: ROS просто не свяжет
+# её ни с одним публикатором, и обработчик не вызовется НИ РАЗУ. Снаружи это
+# выглядит идеально: узел жив, порт занят, `ros2 topic hz /image` показывает
+# тридцать кадров — а в пульте пусто. Единственный след — `ros2 topic echo`
+# ворчит, что на топике «больше одного типа»: это мы сами и есть, со своей
+# несвязанной подпиской.
+#
+# Поэтому тип не угадываем, а СПРАШИВАЕМ у ROS: get_publishers_info_by_topic
+# говорит, что там на самом деле течёт.
+СЖАТЫЙ = "sensor_msgs/msg/CompressedImage"
+СЫРОЙ = "sensor_msgs/msg/Image"
 
 
 def _разжать(данные):
@@ -105,21 +137,160 @@ def _разжать(данные):
         return None
 
 
+def _в_bgr(сообщение):
+    """Сырой кадр (sensor_msgs/Image) → массив bgr8. None — не осилили.
+
+    Кодировок у камеры может быть несколько, и молчаливо принять чужую за
+    свою нельзя: перепутанные каналы — это не «чуть другой цвет», а синие
+    люди на входе сети, которая после этого не находит ничего и не жалуется.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    кодировка = (getattr(сообщение, "encoding", "") or "").lower()
+    высота = int(getattr(сообщение, "height", 0))
+    ширина = int(getattr(сообщение, "width", 0))
+    данные = bytes(сообщение.data)
+    if not высота or not ширина or not данные:
+        return None
+    if кодировка in ("bgr8", "rgb8"):
+        кадр = np.frombuffer(данные, dtype=np.uint8)[:высота * ширина * 3]
+        кадр = кадр.reshape(высота, ширина, 3)
+        return кадр if кодировка == "bgr8" else кадр[:, :, ::-1].copy()
+    if кодировка == "mono8":
+        серый = np.frombuffer(данные, dtype=np.uint8)[:высота * ширина]
+        return np.repeat(серый.reshape(высота, ширина, 1), 3, axis=2)
+    # nv12 — родной формат платы, и без cv2 его не развернуть руками дёшево.
+    if кодировка in ("nv12", "yuv420sp"):
+        try:
+            import cv2
+        except ImportError:
+            return None
+        сырое = np.frombuffer(данные, dtype=np.uint8)
+        нужно = высота * ширина * 3 // 2
+        if сырое.size < нужно:
+            return None
+        return cv2.cvtColor(сырое[:нужно].reshape(высота * 3 // 2, ширина),
+                            cv2.COLOR_YUV2BGR_NV12)
+    return None
+
+
+def _в_jpeg(кадр):
+    """Массив bgr8 → байты jpeg. None — сжать нечем."""
+    try:
+        import cv2
+        вышло, буфер = cv2.imencode(".jpg", кадр)
+        return bytes(буфер) if вышло else None
+    except ImportError:
+        pass
+    try:
+        import io
+
+        from PIL import Image as PILImage
+        память = io.BytesIO()
+        PILImage.fromarray(кадр[:, :, ::-1]).save(память, format="JPEG")
+        return память.getvalue()
+    except ImportError:
+        return None
+
+
 class Затвор(Node):
 
     def __init__(self) -> None:
         super().__init__("robot_ai_look_relay")
         self._последний = None
         self._jpeg = None
+        self._сырой = None
         self._когда_кадр = 0.0
         self._замок = threading.Lock()
         self._осталось = 0
         self._жаловались = False
-        self.create_subscription(CompressedImage, КАМЕРА, self._кадр, 1)
+        self._тип = None
+        self._подписка = None
+        self._встали = time.monotonic()
+        self._ныли = 0.0
         self.create_subscription(Empty, ЗАПРОС, self._просят, 1)
         self._выход = self.create_publisher(Image, КАДР, 1)
         self.get_logger().info(
             f"затвор: жду запрос в {ЗАПРОС}, кадр отдам в {КАДР}")
+        # Подписываемся не сразу, а когда узнаем тип: см. СЖАТЫЙ/СЫРОЙ выше.
+        self._поиск = self.create_timer(ИЩЕМ_КАМЕРУ_РАЗ_В, self._искать_камеру)
+        self._сторож = self.create_timer(ЖАЛУЕМСЯ_РАЗ_В, self._как_там_камера)
+
+    # ── откуда берём кадры ────────────────────────────────────────────────
+
+    def _типы_на_камере(self):
+        """Какие типы сообщений реально публикуются в /image."""
+        спросить = getattr(self, "get_publishers_info_by_topic", None)
+        if спросить is None:                # pragma: no cover — древний rclpy
+            return []
+        try:
+            return [и.topic_type for и in спросить(КАМЕРА)]
+        except Exception:                   # pragma: no cover — гонка при старте
+            return []
+
+    def _искать_камеру(self) -> None:
+        типы = [т for т in self._типы_на_камере() if т in (СЖАТЫЙ, СЫРОЙ)]
+        if not типы:
+            if time.monotonic() - self._встали < ЖДЁМ_КАМЕРУ:
+                return
+            # Камеры так и нет. Подписываемся на сжатый — он у нас обычный, —
+            # но говорим об этом громко: молчание здесь и есть та самая беда,
+            # когда «камера не работает» без единой строчки в журнале.
+            чужие = self._типы_на_камере()
+            self.get_logger().warning(
+                f"{КАМЕРА}: за {ЖДЁМ_КАМЕРУ:.0f} с публикатора не видно"
+                + (f" (есть чужие типы: {', '.join(sorted(set(чужие)))})"
+                   if чужие else "")
+                + ". Подписываюсь на сжатый вслепую. "
+                  "Проверь hobot_usb_cam в journalctl -u robot-body")
+            self._подписаться(СЖАТЫЙ)
+            return
+        # Если камера почему-то отдаёт оба типа сразу — берём сжатый: его же
+        # ждёт кодек (codec_sub_topic=/image), значит он и есть настоящий.
+        self._подписаться(СЖАТЫЙ if СЖАТЫЙ in типы else типы[0])
+
+    def _подписаться(self, тип: str) -> None:
+        if self._подписка is not None:
+            return
+        self._тип = тип
+        сжатый = тип == СЖАТЫЙ
+        # НАДЁЖНОСТЬ БЕРЁМ КАК У ДАТЧИКА, а не по умолчанию, и это второй
+        # способ не получить ни одного кадра при живой камере. Камеры почти
+        # всегда публикуют best_effort; подписка по умолчанию просит reliable,
+        # а reliable-подписка с best_effort-публикатором НЕ СВЯЗЫВАЕТСЯ —
+        # молча, без ошибки. Обратная сторона совместима: best_effort-подписка
+        # спокойно читает и reliable-публикатора, так что этот выбор безопасен
+        # в обе стороны.
+        self._подписка = self.create_subscription(
+            CompressedImage if сжатый else Image, КАМЕРА,
+            self._кадр if сжатый else self._кадр_сырой,
+            qos_profile_sensor_data)
+        self.get_logger().info(
+            f"камера: подписался на {КАМЕРА}, тип {тип.split('/')[-1]}")
+        if self._поиск is not None:
+            self._поиск.cancel()
+            self._поиск = None
+
+    def _как_там_камера(self) -> None:
+        """Раз в минуту сказать в журнал, если кадров нет. Молчать нельзя.
+
+        Пустой пульт без единой строчки в журнале — это часы поисков там, где
+        одна строка называет причину.
+        """
+        if self.последний_jpeg() is not None:
+            return
+        сейчас = time.monotonic()
+        if сейчас - self._встали < ЖДЁМ_КАМЕРУ or \
+                сейчас - self._ныли < ЖАЛУЕМСЯ_РАЗ_В:
+            return
+        self._ныли = сейчас
+        типы = sorted(set(self._типы_на_камере()))
+        self.get_logger().warning(
+            f"камера: кадров нет уже {сейчас - self._встали:.0f} с. "
+            f"Подписан на {self._тип or 'ничего'}, "
+            f"в {КАМЕРА} публикуют: {', '.join(типы) if типы else 'никто'}")
 
     def последний_jpeg(self):
         """Последний кадр с камеры как есть, сжатым. None — камера молчит.
@@ -129,10 +300,32 @@ class Затвор(Node):
         Застывший кадр хуже пустого экрана — по нему принимают решения.
         """
         with self._замок:
-            кадр, когда = self._jpeg, self._когда_кадр
-        if кадр is None or time.monotonic() - когда > ЖДЁМ_КАДРА:
+            кадр, сырой, когда = self._jpeg, self._сырой, self._когда_кадр
+        if когда == 0.0 or time.monotonic() - когда > ЖДЁМ_КАДРА:
             return None
+        if кадр is not None:
+            return кадр
+        if сырой is None:
+            return None
+        # Камера отдаёт сырые кадры — сжимаем ЗДЕСЬ, по запросу пульта, а не
+        # тридцать раз в секунду впустую. Тот же принцип, что и с разжатием.
+        массив = _в_bgr(сырой)
+        кадр = _в_jpeg(массив) if массив is not None else None
+        if кадр is None:
+            self._не_осилили(
+                f"нечем сжать кадр {getattr(сырой, 'encoding', '?')} в jpeg: "
+                "нет ни cv2, ни PIL. Пульт останется без картинки")
+            return None
+        with self._замок:
+            if self._сырой is сырой:
+                self._jpeg = кадр
         return кадр
+
+    def _не_осилили(self, что: str) -> None:
+        """Сказать один раз. Повторять тридцать раз в секунду незачем."""
+        if not self._жаловались:
+            self._жаловались = True
+            self.get_logger().error(что)
 
     def _кадр(self, сообщение) -> None:
         # Храним СЖАТЫЙ кадр и не разжимаем ничего, пока не попросят: разжимать
@@ -143,6 +336,19 @@ class Затвор(Node):
         # HTTP-сервера, а этот метод зовёт поток ROS.
         with self._замок:
             self._jpeg = bytes(сообщение.data)
+            self._сырой = None
+            self._когда_кадр = time.monotonic()
+        if self._осталось > 0:
+            self._осталось -= 1
+            self._отдать(сообщение)
+
+    def _кадр_сырой(self, сообщение) -> None:
+        # То же самое, но кадр пришёл несжатым. Сжатия здесь нет нарочно:
+        # см. последний_jpeg().
+        self._последний = сообщение
+        with self._замок:
+            self._сырой = сообщение
+            self._jpeg = None
             self._когда_кадр = time.monotonic()
         if self._осталось > 0:
             self._осталось -= 1
@@ -157,18 +363,26 @@ class Затвор(Node):
             self._осталось -= 1
             self._отдать(self._последний)
 
-    def _отдать(self, сжатый) -> None:
-        кадр = _разжать(bytes(сжатый.data))
+    def _отдать(self, пришло) -> None:
+        # Кадр от камеры уже сырой и уже в том виде, который сеть понимает, —
+        # отдаём как есть, без круга «разжать и собрать заново».
+        if self._тип == СЫРОЙ:
+            кодировка = (getattr(пришло, "encoding", "") or "").lower()
+            if кодировка in ("bgr8", "nv12"):
+                self._выход.publish(пришло)
+                return
+            кадр = _в_bgr(пришло)
+        else:
+            кадр = _разжать(bytes(пришло.data))
         if кадр is None:
-            if not self._жаловались:
-                self._жаловались = True
-                self.get_logger().error(
-                    "нечем разжать jpeg: нет ни cv2, ни PIL. "
-                    "Поиск вещей работать не будет")
+            self._не_осилили(
+                "нечем подготовить кадр для сети: нет ни cv2, ни PIL "
+                f"(или незнакомая кодировка {getattr(пришло, 'encoding', '')}). "
+                "Поиск вещей работать не будет")
             return
         высота, ширина = кадр.shape[:2]
         сообщение = Image()
-        сообщение.header = сжатый.header
+        сообщение.header = пришло.header
         сообщение.height = высота
         сообщение.width = ширина
         сообщение.encoding = "bgr8"
