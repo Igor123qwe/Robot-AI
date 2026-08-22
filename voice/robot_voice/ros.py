@@ -39,6 +39,11 @@ ODOM = "/odom"
 # BPU у детектора людей, на котором держатся следование, падения и стоп-ладонь.
 ВЕЩИ = "/perception/detection/dosod"
 ВЗГЛЯД = "/robot_ai/look"
+# То же, но на ОДИН кадр вместо трёх. Три — верное число для обхода: встал,
+# попросил один раз, второй попытки не будет. Для слежения за собакой просят
+# постоянно, и каждый лишний кадр — это 130 мс платы, отнятые у детектора
+# людей. Подробнее — в шапке scripts/look_relay.py.
+ВЗГЛЯД_ОДИН = "/robot_ai/look_once"
 # Дальше этого одометрию считаем протухшей: шасси молчит или узел упал.
 ODOM_TTL = 2.0
 # Сколько ждать, пока доедет прежняя команда, прежде чем начать новую. Больше
@@ -243,6 +248,8 @@ class Ros:
                     "type": "ai_msgs/msg/PerceptionTargets"})
         self._send({"op": "advertise", "topic": ВЗГЛЯД,
                     "type": "std_msgs/msg/Empty"})
+        self._send({"op": "advertise", "topic": ВЗГЛЯД_ОДИН,
+                    "type": "std_msgs/msg/Empty"})
 
     def _on_close(self, ws, *_a) -> None:
         log.warning("rosbridge: соединение закрыто")
@@ -402,6 +409,10 @@ class Ros:
         сейчас». Возвращает, ушёл ли запрос; ответ придёт отдельно, в ВЕЩИ.
         """
         return self._send({"op": "publish", "topic": ВЗГЛЯД, "msg": {}})
+
+    def посмотреть_разок(self) -> bool:
+        """То же, но один кадр вместо трёх. Для того, кто просит часто."""
+        return self._send({"op": "publish", "topic": ВЗГЛЯД_ОДИН, "msg": {}})
 
     def publish_twist(self, x: float = 0.0, y: float = 0.0, wz: float = 0.0) -> None:
         ноль = abs(x) + abs(y) + abs(wz) <= 1e-3
