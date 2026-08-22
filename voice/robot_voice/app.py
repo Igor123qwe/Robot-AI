@@ -22,7 +22,8 @@ from . import (atlas as atlas_mod, compass as compass_mod, diary, falldown,
                gestures, intents,
                landmarks, mapping,
                nightly, skills,
-               survey, things, turn_end, vision_track)
+               search, survey, things, turn_end, vision_track)
+from . import dog as dog_mod
 from .audio import Listener, make_source
 from .brain import Brain
 from .busyflag import BusyFlag
@@ -1063,6 +1064,26 @@ def main() -> None:
             "обход квартиры",
             lambda: обходчик.идёт,
             lambda почему: обходчик.хватит(почему, ждать=False))
+    # Спутник и поиск по квартире. Заводим по тем же правилам, что обход:
+    # оба ездят, значит оба обязаны быть заявлены движителями — иначе кнопка
+    # СТОП в пульте и ладонь их не остановят.
+    # Где робот находил собаку и людей. Рядом с пометками: координаты у них
+    # одни и те же, и привязывается к вчерашней карте тоже одно и то же.
+    места = search.Места(
+        файл=Path(landmarks.ФАЙЛ).expanduser().with_name("места.json"))
+    спутник = (dog_mod.Спутник(ros, дальномер, план=план, карта=карта,
+                           пометки=пометки, компас=компас, места=места,
+                           говорить=voice.say)
+               if дальномер is not None and ros is not None else None)
+    ищущий = (search.Поиск(ros, дальномер, план=план, карта=карта,
+                           пометки=пометки, компас=компас, места=места,
+                           говорить=voice.say)
+              if дальномер is not None and ros is not None else None)
+    for имя, кто in (("спутник", спутник), ("поиск по квартире", ищущий)):
+        if кто is not None:
+            ros.завести_движитель(
+                имя, (lambda к=кто: к.идёт),
+                (lambda почему, к=кто: к.хватит(почему, ждать=False)))
     if ведомый is not None and ros is not None:
         # Заявляем следование как источник движения. Без этой строки Ros про
         # него не знал, и кнопка СТОП в пульте во время следования не работала
@@ -1197,6 +1218,9 @@ def main() -> None:
         ведомый.пометки = пометки
     if обходчик is not None:
         обходчик.вещи = вещи
+    for кто in (спутник, ищущий):
+        if кто is not None:
+            кто.вещи = вещи
 
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
@@ -1206,6 +1230,7 @@ def main() -> None:
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
                         player=player, eyes=глаза, tof=дальномер,
                         follower=ведомый, обходчик=обходчик,
+                        спутник=спутник, ищущий=ищущий,
                         навыки=навыки, вещи=вещи,
                         дневник=дневник,
                         разбор=разбор, пометки=пометки)
