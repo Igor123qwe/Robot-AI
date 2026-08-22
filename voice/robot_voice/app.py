@@ -1200,6 +1200,8 @@ def main() -> None:
 
     tools = build_tools(ros, timers, speaker=speaker, notes=notes,
                         people=people, who=lambda: getattr(recognizer, "speaker", ""),
+                        уверенность=lambda: float(
+                            getattr(recognizer, "similarity", 0.0) or 0.0),
                         place=(cfg.lat, cfg.lon), addressed=addressed,
                         home=дом, set_place=запомнить_дом, news_url=cfg.news_url,
                         player=player, eyes=глаза, tof=дальномер,
