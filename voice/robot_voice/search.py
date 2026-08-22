@@ -241,7 +241,6 @@ class Поиск(ride.Переезд):
         self.сказать_ему = ""
         self.молча = False
         self.нашёл = False
-        self.где_нашёл = None
         self.осмотрено = 0
         self.почему_кончилось = ""
         self._неудачные: list[tuple[float, float, float]] = []
@@ -286,7 +285,6 @@ class Поиск(ride.Переезд):
         self.кого = класс
         self.сказать_ему = сказать
         self.нашёл = False
-        self.где_нашёл = None
         self.осмотрено = 0
         self.почему_кончилось = ""
         self._неудачные.clear()
@@ -392,7 +390,6 @@ class Поиск(ride.Переезд):
         self._встать()
         поза = self._поза()
         if поза is not None:
-            self.где_нашёл = (поза[0], поза[1])
             if self.места is not None:
                 try:
                     self.места.заметить(self.кого, поза[0], поза[1])
