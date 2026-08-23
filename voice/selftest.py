@@ -5310,6 +5310,74 @@ def test_соседние_модули_зовут_существующее() -> 
     check("все обращения к соседним модулям ведут к существующему",
           промахи, [])
 
+    # --- И ВЫЗЫВАЮТСЯ ОНИ С ТЕМ ЧИСЛОМ ДОВОДОВ, КАКОЕ ПРИНИМАЮТ ----------
+    #
+    # Выше проверено, что ИМЯ существует. Этого мало: `вещи.найти("dog", 1, 2)`
+    # тоже имя существующее, а на роботе это TypeError. Тот же день, тот же
+    # класс ошибок — просто другая его половина.
+    #
+    # Распаковку (`ru.plural(n, *слова)`) пропускаем честно: сколько там
+    # доводов, знает только жизнь, и делать вид, что мы посчитали, нельзя.
+    import inspect as _подписи
+
+    криво: list[str] = []
+    посчитано = распаковок = 0
+    for файл in sorted(корень.glob("*.py")):
+        дерево = ast.parse(файл.read_text(encoding="utf-8"))
+        псевдонимы = {}
+        for узел in ast.walk(дерево):
+            if (isinstance(узел, ast.ImportFrom) and узел.module is None
+                    and узел.level == 1):
+                for имя in узел.names:
+                    псевдонимы[имя.asname or имя.name] = имя.name
+        if not псевдонимы:
+            continue
+        for узел in ast.walk(дерево):
+            if not (isinstance(узел, ast.Call)
+                    and isinstance(узел.func, ast.Attribute)
+                    and isinstance(узел.func.value, ast.Name)
+                    and узел.func.value.id in псевдонимы):
+                continue
+            if (any(isinstance(а, ast.Starred) for а in узел.args)
+                    or any(к.arg is None for к in узел.keywords)):
+                распаковок += 1
+                continue
+            модуль = псевдонимы[узел.func.value.id]
+            try:
+                живой = importlib.import_module(f"robot_voice.{модуль}")
+            except Exception:                       # noqa: BLE001
+                continue
+            что = getattr(живой, узел.func.attr, None)
+            if что is None or not callable(что) or _подписи.isclass(что):
+                continue
+            try:
+                подпись = _подписи.signature(что)
+            except (TypeError, ValueError):
+                continue
+            посчитано += 1
+            места = [п for п in подпись.parameters.values()
+                     if п.kind in (п.POSITIONAL_ONLY, п.POSITIONAL_OR_KEYWORD)]
+            звёздочка = any(п.kind == п.VAR_POSITIONAL
+                            for п in подпись.parameters.values())
+            кв_звёздочка = any(п.kind == п.VAR_KEYWORD
+                               for п in подпись.parameters.values())
+            где = (f"{файл.name}:{узел.lineno}  "
+                   f"{узел.func.value.id}.{узел.func.attr}")
+            if len(узел.args) > len(места) and not звёздочка:
+                криво.append(f"{где}() — доводов {len(узел.args)}, "
+                             f"принимает {len(места)}")
+            обязательные = [п for п in места if п.default is п.empty]
+            по_имени = {к.arg for к in узел.keywords if к.arg}
+            не_хватает = [п.name for п in обязательные[len(узел.args):]
+                          if п.name not in по_имени]
+            if не_хватает:
+                криво.append(f"{где}() — не хватает: {', '.join(не_хватает)}")
+            for к in узел.keywords:
+                if к.arg and к.arg not in подпись.parameters and not кв_звёздочка:
+                    криво.append(f"{где}(..., {к.arg}=) — нет такого довода")
+    check("вызовов функций соседних модулей посчитано", посчитано >= 100, True)
+    check("и все они зовутся правильным числом доводов", криво, [])
+
 
 def test_внедрённые_объекты_зовут_существующее() -> None:
     """`self.вещи.видно()`, `self.ros.посмотреть_разок()` — всё это есть на самом деле.
