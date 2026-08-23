@@ -285,6 +285,17 @@ from pathlib import Path
      "voice/robot_voice/follow.py",
      "    if not видели or потерян >= ДОЕЗЖАЕМ_ДО_ПОСЛЕДНЕГО:",
      "    if not видели:"),
+
+    # Кронштейн, опущенный по совету самого робота, оставлял компас без
+    # единого ряда — и тот слепнул молча.
+    ("компас: рядов может не остаться вовсе",
+     "voice/robot_voice/rig.py",
+     "    if not годные:\n        return (max(range(8), key=угол_ряда),)\n", ""),
+
+    ("компас: молчит о том, что смотрит одним рядом",
+     "voice/robot_voice/compass.py",
+     '    if len(РЯДЫ_СТЕН) > 1:\n        return ""',
+     '    if True:\n        return ""'),
 ]
 
 
