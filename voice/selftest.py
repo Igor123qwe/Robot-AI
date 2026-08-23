@@ -6031,6 +6031,64 @@ def test_собаку_на_кровати_дальномер_не_видит() -
                     нашлись.append(f"{файл.name}: {чьё} — {с.strip()}")
     check("физических констант в двух местах больше нет", нашлись, [])
 
+    # ...И ОТДЕЛЬНО — ЗНАЧЕНИЯ ПО УМОЛЧАНИЮ. Они опаснее обычных копий:
+    # подпись читают редко, а зовут такие функции без довода — то есть
+    # работает именно зашитое число, и работает молча.
+    #
+    # Так и было с полем дальномера. `planner.препятствия(сетка, поле=60.0)` и
+    # `dogsight.пятно_в_секторе(сетка, куда, поле=60.0)` держали шестьдесят
+    # градусов своими числами, и оба зовутся без довода — из обхода,
+    # следования и спутника. Поменяй хозяин датчик, поправь rig — эти двое
+    # продолжили бы считать по-старому, а разошлись бы с остальными молча.
+    #
+    # Сверяем со ЗНАЧЕНИЯМИ ЧЕРТЕЖА и с их типом: без типа целая «12»
+    # (сколько мест объехать) совпала бы с наклоном датчика 12.0.
+    import ast as _a
+
+    чертёж: dict = {}
+    for узел in _a.parse((корень_кода / "rig.py")
+                         .read_text(encoding="utf-8")).body:
+        if (isinstance(узел, _a.Assign)
+                and isinstance(узел.value, _a.Constant)
+                and isinstance(узел.value.value, (int, float))
+                and not isinstance(узел.value.value, bool)):
+            for ц in узел.targets:
+                if isinstance(ц, _a.Name):
+                    чертёж.setdefault(
+                        (type(узел.value.value), узел.value.value),
+                        []).append(ц.id)
+    зашито = []
+    for файл in sorted(корень_кода.glob("*.py")):
+        if файл.name == "rig.py":
+            continue
+        for узел in _a.walk(_a.parse(файл.read_text(encoding="utf-8"))):
+            if not isinstance(узел, (_a.FunctionDef, _a.AsyncFunctionDef)):
+                continue
+            если = узел.args.defaults
+            имена = ([а.arg for а in узел.args.args][-len(если):]
+                     if если else [])
+            for имя, зн in zip(имена, если):
+                ключ = ((type(зн.value), зн.value)
+                        if isinstance(зн, _a.Constant) else None)
+                if ключ in чертёж:
+                    зашито.append(
+                        f"{файл.name}:{узел.lineno} {узел.name}({имя}={зн.value})"
+                        f" — в чертеже это {', '.join(чертёж[ключ])}")
+    check("числа чертежа не зашиты в значения по умолчанию", зашито, [])
+
+    # И поимённо для тех двух, из-за которых сито и появилось: пусть поедут
+    # вместе с чертежом, а не останутся на шестидесяти.
+    import inspect as _insp
+
+    from robot_voice import dogsight as _ds
+    from robot_voice import planner as _pl
+    check("поле дальномера у планировщика — из чертежа",
+          _insp.signature(_pl.препятствия).parameters["поле_градусов"].default,
+          rig.ТОФ_ПОЛЕ_ГОР)
+    check("и у взгляда на собаку тоже",
+          _insp.signature(_ds.пятно_в_секторе).parameters["поле"].default,
+          rig.ТОФ_ПОЛЕ_ГОР)
+
     # И обратное: rig действительно тот источник, из которого их берут.
     from robot_voice import dogsight as _dogsight
     from robot_voice import follow as _follow
