@@ -296,6 +296,18 @@ from pathlib import Path
      "voice/robot_voice/compass.py",
      '    if len(РЯДЫ_СТЕН) > 1:\n        return ""',
      '    if True:\n        return ""'),
+
+    # «Ветка, которая не наступает никогда» — самая частая беда проекта.
+    # Перебор решателя ловит её, не читая код.
+    ("спутник: из наблюдения нет выхода",
+     "voice/robot_voice/dog.py",
+     '        if not ф.поднята:\n            return ВЕДУ, "спрыгнула"',
+     '        if False:\n            return ВЕДУ, "спрыгнула"'),
+
+    ("спутник: отступление недостижимо",
+     "voice/robot_voice/dog.py",
+     '        if ф.уходит:\n            return ОТСТУПАЮ, "уходит от меня"',
+     '        if False:\n            return ОТСТУПАЮ, "уходит от меня"'),
 ]
 
 
