@@ -245,6 +245,15 @@ from pathlib import Path
      "voice/robot_voice/app.py",
      "    return н in _NOT_A_NAME or н in _NOT_A_WORD or н in _НЕ_ЗОВУТ_ЧЕЛОВЕКА",
      "    return н in _NOT_A_NAME or н in _NOT_A_WORD"),
+
+    # Полтора часа живого журнала были одним этим циклом.
+    ("дальномер: норма пола отменяется без всякого обрыва",
+     "voice/robot_voice/tof.py",
+     "        if not self._обрыв_подряд:", "        if False:"),
+
+    ("дальномер: жалобы обучения без узды",
+     "voice/robot_voice/tof.py",
+     "        if было and сейчас - было < ПРО_УЧЁБУ_РАЗ_В:", "        if False:"),
 ]
 
 

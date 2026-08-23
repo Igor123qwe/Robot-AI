@@ -1005,9 +1005,6 @@ class Выбираюсь:
     def выбираюсь(self) -> bool:
         return bool(self.что)
 
-    def сколько_уже(self) -> float:
-        return self._часы() - self.начал if self.начал else 0.0
-
     def решить(self, точки, цель_угол: float, было_поворот: float = 0.0,
                отступ: float = 0.0):
         """Что делать сейчас: (вперёд, поворот, что_делаю, вслух).
