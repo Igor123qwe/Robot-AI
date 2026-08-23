@@ -262,8 +262,21 @@ _clean_token = clean_token
 _sounds_like_wake = sounds_like_wake
 
 
+def _канон(cfg) -> tuple[str, ...]:
+    """Настоящие имена робота — те, с которыми можно сравнивать нестрого.
+
+    Отбрасываем всё, чего нет в самом списке имён: настройки правят порознь, и
+    канон, разошедшийся со списком, сделал бы робота глухим молча. Не осталось
+    ничего — отдаём пустоту, а она значит «сравнивай со всем списком», как
+    было до этой правки. Оглохнуть от невнимательности робот не должен.
+    """
+    свои = tuple(и for и in getattr(cfg, "wake_canon", ()) if и in cfg.wake_words)
+    return свои
+
+
 def _strip_wake_word(text: str, wake_words: tuple[str, ...],
-                     ratio: float = 0.8, anywhere: bool = False) -> str | None:
+                     ratio: float = 0.8, anywhere: bool = False,
+                     канон: tuple[str, ...] = ()) -> str | None:
     """Возвращает текст без имени, либо None, если робота не звали.
 
     Имя ищется не только в начале: «Кузя, вперёд» и «а ну-ка Кузя вперёд»
@@ -296,7 +309,7 @@ def _strip_wake_word(text: str, wake_words: tuple[str, ...],
     for н in range(len(предложения) - 1, -1, -1):
         tokens = предложения[н].split()
         for i, token in enumerate(tokens[:3]):
-            if _sounds_like_wake(_clean_token(token), wake_words, ratio):
+            if _sounds_like_wake(_clean_token(token), wake_words, ratio, канон):
                 rest = tokens[:i] + tokens[i + 1:]
                 # Слова перед именем — обращение («эй», «слушай»), а не команда.
                 if all(_clean_token(t) in _FILLERS for t in tokens[:i]):
@@ -334,7 +347,8 @@ def _strip_wake_word(text: str, wake_words: tuple[str, ...],
     if anywhere:
         tokens = text.split()
         for i in range(len(tokens) - 1, -1, -1):
-            if _sounds_like_wake(_clean_token(tokens[i]), wake_words, ratio):
+            if _sounds_like_wake(_clean_token(tokens[i]), wake_words, ratio,
+                                 канон):
                 return " ".join(tokens[i + 1:]).strip(" ,.!?…—-")
     return None
 
@@ -1879,11 +1893,13 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                 # никак, а робота при этом звали. Имя из расшифровки всё-таки
                 # снимаем, если оно туда попало целиком, — чтобы не уехало в
                 # команду.
-                снятое = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio)
+                снятое = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio,
+                                          канон=_канон(cfg))
                 command = снятое if снятое is not None else _без_обращения(text)
                 по_имени = True
             else:
                 command = _strip_wake_word(text, cfg.wake_words, cfg.wake_ratio,
+                                           канон=_канон(cfg),
                                            anywhere=срез_комнаты)
                 по_имени = command is not None
             if срез_комнаты:

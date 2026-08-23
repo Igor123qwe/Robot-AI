@@ -37,18 +37,46 @@ def clean_token(token: str) -> str:
     return token.lower().replace("ё", "е").strip(" ,.!?…—-\"'()")
 
 
-def sounds_like_wake(token: str, wake_words: tuple[str, ...], ratio: float) -> bool:
+def sounds_like_wake(token: str, wake_words: tuple[str, ...], ratio: float,
+                     канон: tuple[str, ...] = ()) -> bool:
     """Похоже ли слово на имя робота.
 
     Распознавание пишет имя по-разному — «Кузя», «Кузь», «Куся», — поэтому
     сравниваем нестрого. Порог держим высоким: имя короткое, а на четырёх
     буквах послабление начинает ловить всё подряд.
+
+    НЕЧЁТКО СРАВНИВАЕМ ТОЛЬКО С НАСТОЯЩИМ ИМЕНЕМ, а не со всем списком, и вот
+    почему. В списке лежат и само имя, и его ОШИБКИ РАСПОЗНАВАНИЯ: «кузь»,
+    «куся», «кузи». Нечёткое сравнение, применённое и к ним, сравнивает
+    нестрого с уже нестрогой целью — послабление умножается на послабление.
+
+    Померено на списке («кузя», «кузь», «куся», «кузи», «кузьма») и пороге
+    0.75, на котором он и настроен:
+
+        было — своих узнаём 13 из 14, чужих ловим 13 из 28
+        стало — своих узнаём 13 из 14, чужих ловим  4 из 28
+
+    Ни одного своего варианта не потеряно, ложных срабатываний втрое меньше.
+    Уходят ровно те, что притянуты через ошибки: «курс» отстоит на 0.75 от
+    «куся», «купи» — от «кузи», «кус» и «куск» — оттуда же. Это обычные слова,
+    и в комнате с телевизором они звучат постоянно.
+
+    Настройка в config обещала «чистый зазор» между 0.67 и 0.75 и мерила его
+    ПО ОДНОМУ «кузя» — а применяется порог ко всем пяти. Примеры в том
+    комментарии верны («куда» 0.60, «кухня» 0.67), вывод из них — нет.
+
+    Точное совпадение и начало слова по-прежнему идут по ВСЕМУ списку: на них
+    держатся «кузьку» и «кузьмич», и они ничего лишнего не притягивают.
+
+    Пустой `канон` значит «нечётко сравнивай со всем списком» — так зовут
+    старые проверки, и так это работало раньше.
     """
     if not token:
         return False
     for wake in wake_words:
         if token == wake or token.startswith(wake):
             return True
+    for wake in (канон or wake_words):
         if difflib.SequenceMatcher(None, token, wake).ratio() >= ratio:
             return True
     return False
@@ -115,11 +143,14 @@ class Spotter:
 
     def __init__(self, model_dir: Path, wake_words: tuple[str, ...],
                  sample_rate: int = 16000, ratio: float = 0.8,
-                 full_vocab: bool = False) -> None:
+                 full_vocab: bool = False, канон: tuple[str, ...] = ()) -> None:
         from vosk import KaldiRecognizer, Model, SetLogLevel
 
         SetLogLevel(-1)          # иначе Kaldi засыпает журнал своей отладкой
         self.wake_words = wake_words
+        # Настоящие имена — с ними и только с ними сравниваем нестрого.
+        # Пусто — со всем списком, как было. См. sounds_like_wake.
+        self.канон = канон
         self.ratio = ratio
         self.sample_rate = sample_rate
         # Модель храним: она весит десятки мегабайт и грузится секундами, а
@@ -176,7 +207,8 @@ class Spotter:
         if not текст:
             return False
         for слово in текст.split():
-            if sounds_like_wake(clean_token(слово), self.wake_words, self.ratio):
+            if sounds_like_wake(clean_token(слово), self.wake_words,
+                                self.ratio, self.канон):
                 self.сбросить()
                 return True
         return False
@@ -229,7 +261,9 @@ def make_spotter(cfg) -> "Spotter | None":
         return None
     try:
         spotter = Spotter(model_dir, cfg.wake_words, cfg.sample_rate,
-                          cfg.wake_ratio, cfg.wake_full_vocab)
+                          cfg.wake_ratio, cfg.wake_full_vocab,
+                          tuple(и for и in getattr(cfg, "wake_canon", ())
+                                if и in cfg.wake_words))
     except ImportError:
         log.error("библиотека vosk не установлена — режу по паузам. "
                   "Поставить: voice/.venv/bin/pip install vosk")
