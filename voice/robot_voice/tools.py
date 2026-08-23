@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import counting, diary, landmarks, nightly, ru, skills, things, when
+from . import counting, diary, landmarks, nightly, rig, ru, skills, things, when
 from . import weather as weather_api
 
 log = logging.getLogger(__name__)
@@ -101,8 +101,9 @@ MAX_DISTANCE = 3.0   # м за одну команду
 # меньше просимого и об усечении не говорил ни слова.
 MAX_ANGLE = 1080.0   # градусов
 
-# Ниже этого напряжения не едем вообще: 3S li-ion уже на грани.
-CUTOFF_VOLT = 10.2
+# Ниже этого напряжения не едем вообще: 3S li-ion уже на грани. Число
+# железное и лежит в rig — его же берёт следование (follow.БАТАРЕЯ_МИНИМУМ).
+CUTOFF_VOLT = rig.БАТАРЕЯ_ПУСТА
 
 # --- маршрут: фигуры, которых нет в правилах ---------------------------------
 # Готовых сценариев на все случаи не напасёшься: «проедь кругом», «зигзагом»,
