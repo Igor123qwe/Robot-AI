@@ -319,6 +319,7 @@ class Поиск(ride.Переезд):
         self._прервали = False
         self._неудачные.clear()
         self._осмотренные.clear()
+        self._кругом_вышло = True
         self._стоп.clear()
         self.выбираюсь.сбросить()
         self._поток = threading.Thread(target=self._искать, daemon=True)
