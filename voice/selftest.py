@@ -6130,6 +6130,59 @@ def test_собаку_на_кровати_дальномер_не_видит() -
                         + "; ".join(f"строка {с}: {з}" for с, з in где))
     check("ни одно имя модуля не присвоено дважды разным", двойные, [])
 
+    # ТО ЖЕ САМОЕ ЕЩЁ В ДВУХ МЕСТАХ, где второе молча съедает первое.
+    #
+    # В теле класса: метод, объявленный дважды, — это первый, которого нет.
+    # В словаре: повторённый ключ — это потерянное значение, и потерянное
+    # молча. У множеств цены нет (оно само схлопывает), но небрежность там
+    # та же самая, а списки слов у нас длинные и правятся часто: в `_NOT_A_NAME`
+    # разбора команд лежало два лишних повтора.
+    в_классах, в_словарях = [], []
+    for каталог in (корень_кода, Path(__file__).resolve().parent,
+                    Path(__file__).resolve().parent.parent / "pc",
+                    Path(__file__).resolve().parent.parent / "scripts"):
+        for файл in sorted(каталог.glob("*.py")):
+            дерево = _ast.parse(файл.read_text(encoding="utf-8"))
+            for класс in [н for н in _ast.walk(дерево)
+                          if isinstance(н, _ast.ClassDef)]:
+                видели: dict = {}
+                for узел in класс.body:
+                    имена = []
+                    if isinstance(узел, (_ast.FunctionDef,
+                                         _ast.AsyncFunctionDef)):
+                        # setter/deleter/overload — законные повторы имени
+                        метки = {_ast.unparse(д) for д in узел.decorator_list}
+                        if any(с in м for м in метки
+                               for с in ("setter", "deleter", "overload")):
+                            continue
+                        имена = [узел.name]
+                    elif isinstance(узел, _ast.Assign):
+                        имена = [ц.id for ц in узел.targets
+                                 if isinstance(ц, _ast.Name)]
+                    elif (isinstance(узел, _ast.AnnAssign)
+                          and isinstance(узел.target, _ast.Name)):
+                        имена = [узел.target.id]
+                    for имя in имена:
+                        if имя in видели:
+                            в_классах.append(
+                                f"{файл.name}:{узел.lineno} "
+                                f"{класс.name}.{имя} (первый — строка "
+                                f"{видели[имя]})")
+                        видели[имя] = узел.lineno
+            for узел in _ast.walk(дерево):
+                ключи = ([к for к in узел.keys if isinstance(к, _ast.Constant)]
+                         if isinstance(узел, _ast.Dict) else
+                         [э for э in узел.elts if isinstance(э, _ast.Constant)]
+                         if isinstance(узел, _ast.Set) else [])
+                было = set()
+                for к in ключи:
+                    if к.value in было:
+                        в_словарях.append(
+                            f"{файл.name}:{узел.lineno} — {к.value!r}")
+                    было.add(к.value)
+    check("в классах ничего не объявлено дважды", в_классах, [])
+    check("и в словарях с множествами нет повторов", в_словарях, [])
+
     # И само число, из-за которого всё вскрылось: оно считается из чертежа, а
     # не набирается. Стояло 0.9 с пояснением «датчик на высоте 13 см», при том
     # что в rig записано 15 — одна величина, два хозяина, разошлись на пятую
