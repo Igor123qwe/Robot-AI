@@ -498,6 +498,68 @@ def test_voiceprints() -> None:
     check("чужого забыть нельзя", who.forget("Никто"), False)
 
 
+def test_жилец_по_имени_что() -> None:
+    """Слепок нельзя завести под словом, которым человека не зовут.
+
+    С живого ПК, прогрев узнавания:
+
+        узнаю по голосу 7: Игорь, голос 1, голос 3, Рома, голос 2, голос 4, Что
+
+    Жильца «Что» завёл телевизор: робот спросил «как тебя зовут?», в комнате
+    прозвучало «Что он сказал?», и слово ушло на ПК как имя. Дальше этот слепок
+    участвует в КАЖДОМ сравнении и тянет на себя чужие фразы.
+
+    Робот такую проверку уже делает у себя, и это не повод не делать её здесь.
+    Имя приходит по сети, от сборки, которую ПК не выбирает: на роботе стоял
+    старый образ. А главное — слепки лежат на ПК и переживают любое обновление
+    робота, поэтому только отсюда можно убрать УЖЕ заведённого жильца.
+    """
+    section("жилец по имени «Что»")
+    import json
+
+    from kuzya_pc import Voiceprints, годится_в_имя
+
+    check("вопросительное именем не будет", годится_в_имя("Что"), False)
+    check("и в любом регистре", годится_в_имя("ЧТО"), False)
+    for слово in ("Кто", "Где", "Как", "Я", "Ты", "Это", "Да", "Нет", "Ладно"):
+        check(f"«{слово}» — не имя", годится_в_имя(слово), False)
+    for имя in ("Игорь", "Рома", "Анна-Мария", "Igor"):
+        check(f"«{имя}» — имя", годится_в_имя(имя), True)
+    check("кличка безымянного проходит", годится_в_имя("голос 4"), True)
+    check("мусор распознавания — нет", годится_в_имя("две2"), False)
+    check("одна буква — нет", годится_в_имя("А"), False)
+    check("пусто — нет", годится_в_имя(""), False)
+
+    # Уже заведённого жильца выносим при чтении файла: слепки переживают
+    # обновление робота, и чинить только будущее тут мало.
+    store = Path(tempfile.mkdtemp()) / "голоса.json"
+    store.write_text(json.dumps({
+        "Игорь": {"вектор": [1.0, 0.0], "фраз": 400},
+        "голос 4": {"вектор": [0.0, 1.0], "фраз": 3},
+        "Что": {"вектор": [0.7, 0.7], "фраз": 1},
+    }, ensure_ascii=False), "utf-8")
+    who = Voiceprints(store)
+    check("жилец «Что» вынесен", "Что" in who.people, False)
+    check("Игорь на месте", who.people["Игорь"]["фраз"], 400)
+    check("безымянного не тронули", "голос 4" in who.people, True)
+    # И на диске тоже: иначе он вернётся при следующем запуске.
+    check("и на диске его больше нет",
+          "Что" in json.loads(store.read_text("utf-8")), False)
+
+    # Имя, пришедшее по сети от старого робота, слепок не заводит. Голос при
+    # этом обрабатывается дальше как безымянный — человек-то говорил.
+    def fake(wav, *a, **kw):
+        import numpy as np
+        v = np.asarray([1.0, 0.0], dtype="float32")
+        return v / float(np.linalg.norm(v))
+
+    who._vector = fake
+    имя, _, метка = who.identify(b"wav", seconds=3.0)
+    check("узнали Игоря", имя, "Игорь")
+    check("но именем «Что» не переименовали", who.confirm(метка, "Что"), "Игорь")
+    check("и такого слепка не завелось", "Что" in who.people, False)
+
+
 def test_warming() -> None:
     """Пока модель едет в видеопамять, мост отвечает сам — и бесплатно.
 
@@ -947,7 +1009,7 @@ def test_health() -> None:
 
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
-    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_warming, test_think_switch, test_model_choice,
+    for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_жилец_по_имени_что, test_warming, test_think_switch, test_model_choice,
                  test_tool_call, test_broken,
                  test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health):
         test()
