@@ -6251,10 +6251,22 @@ def test_собаку_на_кровати_дальномер_не_видит() -
     # молча. У множеств цены нет (оно само схлопывает), но небрежность там
     # та же самая, а списки слов у нас длинные и правятся часто: в `_NOT_A_NAME`
     # разбора команд лежало два лишних повтора.
+    # ОДИН СПИСОК НА ОБА СИТА НИЖЕ. Их было два, слово в слово, и это ровно
+    # тот случай «один факт — два хозяина», который мы ловим в боевом коде:
+    # добавили бы каталог в одно место, а второе сито продолжало бы его не
+    # видеть, ничем об этом не сообщая.
+    #
+    # web/ дописан сюда сейчас, и его не хватало: в режиме browser через
+    # веб-слой идут И микрофон, И динамик, то есть пропавшая там строка
+    # журнала прячет поломку, от которой робот разом глохнет и немеет. Сито
+    # забытых импортов web/ смотрит с самого начала, а эти два — не смотрели.
+    ГДЕ_ИСКАТЬ = (корень_кода, Path(__file__).resolve().parent,
+                  Path(__file__).resolve().parent.parent / "pc",
+                  Path(__file__).resolve().parent.parent / "scripts",
+                  Path(__file__).resolve().parent.parent / "web")
+
     в_классах, в_словарях = [], []
-    for каталог in (корень_кода, Path(__file__).resolve().parent,
-                    Path(__file__).resolve().parent.parent / "pc",
-                    Path(__file__).resolve().parent.parent / "scripts"):
+    for каталог in ГДЕ_ИСКАТЬ:
         for файл in sorted(каталог.glob("*.py")):
             дерево = _ast.parse(файл.read_text(encoding="utf-8"))
             for класс in [н for н in _ast.walk(дерево)
@@ -6333,9 +6345,7 @@ def test_собаку_на_кровати_дальномер_не_видит() -
         return None
 
     криво = []
-    for каталог in (корень_кода, Path(__file__).resolve().parent,
-                    Path(__file__).resolve().parent.parent / "pc",
-                    Path(__file__).resolve().parent.parent / "scripts"):
+    for каталог in ГДЕ_ИСКАТЬ:
         for файл in sorted(каталог.glob("*.py")):
             for узел in _ast.walk(_ast.parse(
                     файл.read_text(encoding="utf-8"))):
@@ -15477,6 +15487,7 @@ def test_names() -> None:
         for child in top.get_children():
             walk(child)
         check(f"{path.name}: всё импортировано", sorted(set(missing)), [])
+
 
 
 def test_dialogue() -> None:
