@@ -21,6 +21,15 @@
                       уточняется каждой.
   POST /voice/forget  забыть голос.
   GET  /health        что живо: Ollama, модель, Whisper, голос, кого узнаём.
+  GET  /avatar        аватар Кузи (Live2D) в браузере — видеокарта у ПК уже
+                      занята Ollama, ей не тяжело нарисовать и это. Экран
+                      робота рисует сам и в этом не нуждается — это ДОБАВКА
+                      для тех, кто хочет картинку богаче на большом мониторе,
+                      а не замена. См. pc/avatar/README.md.
+  POST /avatar/state  сюда голос робота шлёт то же самое, что пишет в
+                      face.json. Что с этим делать — решает не рисование
+                      (страница в браузере), а та же логика позы, что и на
+                      роботе (face/character.py), просто выполненная здесь.
 
 Почему не LiteLLM. Он умеет то же самое, но это полтысячи мегабайт
 зависимостей и отдельное окно, которое надо не закрыть. Здесь один файл,
@@ -1679,6 +1688,62 @@ def _wav(raw: bytes, rate: int) -> bytes:
 
 
 # --------------------------------------------------------------------------
+# Аватар: та же логика позы, что и на роботе, — просто выполненная здесь
+# --------------------------------------------------------------------------
+# face/character.py ничего не знает про pygame (сама Кисть — в face/face.py),
+# поэтому его можно позвать и отсюда, без единой лишней зависимости. Решение
+# «что делать» остаётся ОДНО на двоих: и у робота на экране, и в браузере на
+# ПК танец начинается от одного и того же условия, посчитанного один раз.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "face"))
+import character  # noqa: E402
+
+
+class Аватар:
+    """Держит последнее состояние робота и позу, посчитанную по нему.
+
+    Раздельно намеренно: `_raw` — то, что прислал робот (эмоция, погода,
+    название трека — то, что странице может пригодиться как есть), `_поза`
+    — то, что решил Питомец (рот, наклон, метка). Страница в браузере не
+    обязана знать про приоритет состояний и таймеры блуждания: это уже
+    решено здесь, ей остаётся только нарисовать.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._raw: dict = {}
+        self._поза: dict = {}
+        # Числа для Питомца тут ничего не значат для портретной Live2D-модели
+        # (она не бродит по экрану) — они нужны только форме конструктора;
+        # умолчания в character.py рассчитаны на реальный экран, а не на это.
+        self._питомец = character.Питомец(1280, 800, тело_ширина=0.34,
+                                          шаг_длина=0.05)
+        self._начало = time.monotonic()
+
+    def принять(self, данные: dict) -> None:
+        with self._lock:
+            self._raw = данные if isinstance(данные, dict) else {}
+            try:
+                self._поза = self._питомец.кадр(
+                    self._raw, time.monotonic() - self._начало)
+            except Exception:                       # noqa: BLE001
+                log.exception("аватар: не разобрал состояние робота")
+
+    def состояние(self) -> dict:
+        with self._lock:
+            return {**self._raw, "поза": dict(self._поза)}
+
+
+# Типы того, что реально лежит в pc/avatar/: страница, настройка и файлы
+# Live2D-модели (.model3.json — по сути JSON, но расширение своё у Cubism).
+АВАТАР_ТИПЫ = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".png": "image/png",
+}
+
+
+# --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -1735,6 +1800,9 @@ class Handler(BaseHTTPRequestHandler):
                 "секунд": round(time.time()),
             })
             return
+        if path == "/avatar" or path.startswith("/avatar/"):
+            self._avatar_get(path[len("/avatar"):].lstrip("/"))
+            return
         self._json(404, {"error": "нет такого адреса"})
 
     def do_POST(self) -> None:
@@ -1751,8 +1819,47 @@ class Handler(BaseHTTPRequestHandler):
             self._confirm()
         elif path.endswith("/voice/forget"):
             self._forget()
+        elif path.endswith("/avatar/state"):
+            self._avatar_post()
         else:
             self._json(404, {"error": "нет такого адреса"})
+
+    # --- аватар: страница, настройка модели, приём состояния от робота -----
+    АВАТАР_ПАПКА = Path(__file__).resolve().parent / "avatar"
+
+    def _avatar_get(self, хвост: str) -> None:
+        if хвост == "state":
+            self._json(200, self.server.avatar.состояние())
+            return
+        файл = (self.АВАТАР_ПАПКА / (хвост or "index.html")).resolve()
+        # Не выйти за пределы папки: «..» в пути мог бы отдать любой файл ПК.
+        try:
+            файл.relative_to(self.АВАТАР_ПАПКА.resolve())
+        except ValueError:
+            self._json(404, {"error": "нет такого файла"})
+            return
+        if not файл.is_file():
+            self._json(404, {
+                "error": f"нет {хвост or 'index.html'} — см. pc/avatar/README.md: "
+                         "туда нужно положить страницу и модель самому, один раз"})
+            return
+        тело = файл.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         АВАТАР_ТИПЫ.get(файл.suffix.lower(), "application/octet-stream"))
+        self.send_header("Content-Length", str(len(тело)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(тело)
+
+    def _avatar_post(self) -> None:
+        try:
+            данные = json.loads(self._body().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            self._json(400, {"error": f"тело не JSON: {e}"})
+            return
+        self.server.avatar.принять(данные)
+        self._json(200, {"ok": True})
 
     # --- кто говорит ---
     def _who(self):
@@ -2253,6 +2360,7 @@ def main() -> int:
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.cfg = cfg
+    srv.avatar = Аватар()
     srv.daemon_threads = True
     log.info("мозг на %s:%d | модель %s | распознавание %s | голос %s | "
              "сборка %s", args.host, args.port, args.model,

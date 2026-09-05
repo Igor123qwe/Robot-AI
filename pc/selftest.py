@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kuzya_pc                                          # noqa: E402
-from kuzya_pc import (Config, Handler, Whisper,          # noqa: E402
+from kuzya_pc import (Аватар, Config, Handler, Whisper,   # noqa: E402
                       to_ollama_messages, to_ollama_tools)
 
 FAILED: list[str] = []
@@ -131,6 +131,7 @@ def serve(ollama) -> tuple[ThreadingHTTPServer, str]:
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     # Whisper настоящий, но модель он грузит лениво — видеокарта не нужна.
     srv.cfg = Config("тест", whisper=Whisper("tiny"), ollama=ollama)
+    srv.avatar = Аватар()
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
@@ -1007,11 +1008,67 @@ def test_health() -> None:
         srv.shutdown()
 
 
+def test_avatar() -> None:
+    """/avatar/state — приём того же состояния, что и на роботе.
+
+    Отрисовка — дело браузера, но РЕШЕНИЕ (рот, наклон, метка) принимает
+    ровно та же логика, что рисует лицо на самом роботе (face/character.py),
+    просто вызванная отсюда. Здесь проверяем, что она вообще позвана и не
+    подменена своей — а заодно что чужой файл с диска через «..» не отдать.
+    """
+    section("аватар на ПК")
+    import json
+    import urllib.error
+    import urllib.request
+
+    srv, url = serve(FakeOllama([]))
+    try:
+        тело = json.dumps({"эмоция": "рад", "говорит": "привет",
+                           "музыка": {"играет": False}}).encode("utf-8")
+        запрос = urllib.request.Request(url + "/avatar/state", data=тело,
+                                        method="POST")
+        with urllib.request.urlopen(запрос, timeout=5) as r:
+            check("POST принят", json.loads(r.read())["ok"], True)
+
+        with urllib.request.urlopen(url + "/avatar/state", timeout=5) as r:
+            данные = json.loads(r.read().decode("utf-8"))
+        check("сырое состояние вернулось как было", данные["эмоция"], "рад")
+        check("а поза — уже посчитана той же логикой, что и на экране "
+              "робота (говорит → рот приоткрыт хоть иногда)",
+              "рот" in данные.get("поза", {}), True)
+
+        # Модель (.model3.json) каждый кладёт сам — см. pc/avatar/README.md;
+        # пока её нет, отсутствующий файл обязан дать понятную ошибку, а не
+        # тихо промолчать пустым экраном без единого объяснения.
+        try:
+            urllib.request.urlopen(url + "/avatar/model/nonexistent.model3.json",
+                                   timeout=5)
+            check("нет файла модели — сервер должен был отказать", False, True)
+        except urllib.error.HTTPError as e:
+            check("нет файла — понятная ошибка, а не пустой экран",
+                  e.code, 404)
+
+        # «..» не должен вывести за пределы папки аватара — иначе через этот
+        # путь можно попросить любой файл с диска ПК. Проверяем на РЕАЛЬНО
+        # существующем файле снаружи (pc/kuzya_pc.py, один уровень вверх от
+        # pc/avatar/): если защиту сломать, здесь будет 200 с его текстом, а
+        # не 404 — 404 сам по себе ничего не доказывает, файла могло просто
+        # не быть по неверно посчитанному пути.
+        try:
+            urllib.request.urlopen(url + "/avatar/../kuzya_pc.py", timeout=5)
+            check("побег из папки аватара через «..» должен быть отвергнут",
+                  False, True)
+        except urllib.error.HTTPError as e:
+            check("«..» не выпускает из папки аватара", e.code, 404)
+    finally:
+        srv.shutdown()
+
+
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
     for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_жилец_по_имени_что, test_warming, test_think_switch, test_model_choice,
                  test_tool_call, test_broken,
-                 test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health):
+                 test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health, test_avatar):
         test()
         print("   ...")
     if FAILED:

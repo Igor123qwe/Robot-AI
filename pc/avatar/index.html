@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Кузя</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f14; overflow: hidden; }
+  canvas { display: block; }
+  #беда {
+    position: fixed; left: 10px; top: 10px; right: 10px;
+    color: #ffb020; font: 14px/1.4 sans-serif; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<div id="беда"></div>
+
+<!--
+  Три чужих файла. Их порядок важен: Cubism Core — низкоуровневый движок
+  формата модели, pixi.js — то, чем это рисуется на экране, pixi-live2d-
+  display — мост между ними. Свой код — весь ниже, одним куском.
+-->
+<script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.9/dist/browser/pixi.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+
+<script>
+"use strict";
+/*
+ * ЧТО ЭТА СТРАНИЦА ЗНАЕТ. Ничего про робота — ровно как face/face.py на
+ * самом роботе. Она спрашивает /state десять раз в секунду (тот же темп,
+ * каким голос пишет face.json) и красит модель по тому, что придёт. Решение
+ * «что сейчас делать» уже принято на ПК, в Аватар.принять() (kuzya_pc.py) —
+ * той же логикой character.Питомец, что рисует лицо и на самом роботе.
+ * Здесь только отображение: если что-то в модели не совпало (нет такого
+ * параметра, нет такого выражения) — молча пропускаем, а не падаем.
+ */
+const беда = document.getElementById("беда");
+function показать(текст) {
+  беда.textContent = текст;
+  if (текст) console.error(текст);
+}
+
+async function главная() {
+  let настройки;
+  try {
+    настройки = await (await fetch("config.json", { cache: "no-store" })).json();
+  } catch (e) {
+    показать("Не нашёл config.json рядом со страницей: " + e);
+    return;
+  }
+
+  const app = new PIXI.Application({
+    resizeTo: window,
+    backgroundAlpha: 0,
+    autoDensity: true,
+    resolution: window.devicePixelRatio || 1,
+  });
+  document.body.appendChild(app.view);
+
+  let модель;
+  try {
+    модель = await PIXI.live2d.Live2DModel.from(настройки.модель);
+  } catch (e) {
+    показать("Не загрузил модель «" + настройки.модель + "»: " + e +
+             "\nПроверь путь \"модель\" в config.json — .model3.json должен " +
+             "лежать по этому пути внутри pc/avatar/.");
+    return;
+  }
+  app.stage.addChild(модель);
+
+  const базовый_y = () => app.renderer.height * 0.95;
+  function вписать() {
+    const масштаб = Math.min(app.renderer.width / модель.width,
+                             app.renderer.height / модель.height) * 0.85;
+    модель.scale.set(масштаб);
+    модель.anchor.set(0.5, 1.0);
+    модель.position.set(app.renderer.width / 2, базовый_y());
+  }
+  вписать();
+  window.addEventListener("resize", вписать);
+
+  const ядро = модель.internalModel.coreModel;
+  const п = настройки.параметры || {};
+  function параметр(id, значение) {
+    // Не у каждой модели есть каждый параметр — молча пропускаем то, чего
+    // нет, а не роняем страницу из-за чужого файла модели.
+    if (!id) return;
+    try { ядро.setParameterValueById(id, значение); } catch (e) { /* нет такого */ }
+  }
+
+  let была_эмоция = "";
+  let была_метка = "";
+  const ЛЕАН_МАКС = 6.0;             // градусов — как в face/character.py
+
+  function применить(с) {
+    показать("");
+    const поза = с.поза || {};
+
+    // Рот и взгляд — числа, применяются каждый кадр без разбора причины:
+    // страница не решает, ПОЧЕМУ рот открыт, только рисует то, что сказано.
+    параметр(п.рот, Math.max(0, Math.min(1, поза.рот || 0)));
+    const доля_наклона = Math.max(-1, Math.min(1, (поза.наклон || 0) / ЛЕАН_МАКС));
+    параметр(п.взгляд_x, доля_наклона * 30);
+    параметр(п.глаза_x, доля_наклона);
+
+    // Подскок — не параметр модели (не у всех он вообще есть), а сдвиг всей
+    // картинки: так танец виден даже на модели без описанных под него
+    // движений.
+    модель.position.y = базовый_y() - (поза.подскок || 0) * (app.renderer.height / 800);
+
+    // Выражение — по эмоции, а не по метке позы: «рад»/«огорчён» это про
+    // лицо, а метка («говорит», «танцует») — про то, что делает тело.
+    if (с.эмоция !== была_эмоция) {
+      была_эмоция = с.эмоция;
+      const имя = (настройки.эмоции || {})[с.эмоция];
+      if (имя) { try { модель.expression(имя); } catch (e) { /* нет такого */ } }
+    }
+    // Танец — по смене метки, а не каждый кадр: иначе motion перезапускался
+    // бы на месте тридцать раз в секунду и не доигрывал ни одного такта.
+    if (поза.метка !== была_метка) {
+      была_метка = поза.метка;
+      if (поза.метка === "танцует" && настройки.танец) {
+        try { модель.motion(настройки.танец); } catch (e) { /* нет такой группы */ }
+      }
+    }
+  }
+
+  async function опросить() {
+    let с;
+    try {
+      с = await (await fetch("state", { cache: "no-store" })).json();
+    } catch (e) {
+      показать("Нет связи с сервером (" + e + ") — страница ждёт, робот жив?");
+      return;
+    }
+    try {
+      применить(с);
+    } catch (e) {
+      показать("Не применил состояние: " + e);
+    }
+  }
+  setInterval(опросить, 100);
+  опросить();
+}
+
+главная();
+</script>
+</body>
+</html>

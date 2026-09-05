@@ -53,6 +53,8 @@ import logging
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from . import weather as weather_api
@@ -99,8 +101,13 @@ class Лицо:
     def __init__(self, *, ros=None, глаза=None, player=None, где=None,
                  тихо=None, часы=time.monotonic, файл: str | None = None,
                  погода=weather_api.fetch,
-                 слушаю_секунд: float = 20.0) -> None:
+                 слушаю_секунд: float = 20.0, аватар_url: str = "") -> None:
         self.ros = ros
+        # Необязательная копия того же состояния — на ПК, если там поднят
+        # аватар (pc/avatar). Экран робота в этом не нуждается: как рисовал
+        # сам, так и рисует, ПК тут ДОБАВКА, а не замена.
+        self.аватар_url = (аватар_url or "").rstrip("/")
+        self._аватар_вниз_до = 0.0
         # «Слушаю» держится ровно столько, сколько открыто окно разговора, и
         # число это — то же, что у голосового цикла (cfg.session_seconds), а
         # не своё. Свои двадцать секунд разошлись бы с окном при первой же
@@ -326,12 +333,14 @@ class Лицо:
             self._погода_когда = сейчас
 
     # --- запись -----------------------------------------------------------
-    def выложить(self) -> bool:
+    def выложить(self, состояние: dict | None = None) -> bool:
         """Записать файл. True — записали. Атомарно: читатель не увидит половину."""
+        if состояние is None:
+            состояние = self.состояние()
         try:
             self._файл.parent.mkdir(parents=True, exist_ok=True)
             временный = self._файл.with_suffix(".tmp")
-            временный.write_text(json.dumps(self.состояние(), ensure_ascii=False),
+            временный.write_text(json.dumps(состояние, ensure_ascii=False),
                                  encoding="utf-8")
             os.replace(временный, self._файл)
             self._записей += 1
@@ -343,6 +352,25 @@ class Лицо:
                             "спящим", self._файл, e)
             return False
 
+    def _отправить_на_пк(self, состояние: dict) -> None:
+        """То же состояние — ещё и аватару на ПК, если он настроен и жив.
+
+        Не должно мешать основному делу. Короткий тайм-аут и остывание после
+        сбоя — без них недоступный ПК тормозил бы запись файла на экран
+        каждые сто миллисекунд, а лицо на роботе от аватара не зависит.
+        """
+        if not self.аватар_url or self._часы() < self._аватар_вниз_до:
+            return
+        try:
+            тело = json.dumps(состояние, ensure_ascii=False).encode("utf-8")
+            запрос = urllib.request.Request(
+                self.аватар_url + "/avatar/state", data=тело, method="POST",
+                headers={"Content-Type": "application/json; charset=utf-8"})
+            urllib.request.urlopen(запрос, timeout=1.0).close()
+        except Exception as e:                       # noqa: BLE001
+            self._аватар_вниз_до = self._часы() + 5.0
+            log.debug("лицо: аватар на ПК не принял состояние (%s)", e)
+
     @property
     def записей(self) -> int:
         return self._записей
@@ -351,7 +379,9 @@ class Лицо:
         while not self._стоп.wait(ПИШЕМ_РАЗ_В):
             try:
                 self._обновить_погоду()
-                self.выложить()
+                состояние = self.состояние()
+                self.выложить(состояние)
+                self._отправить_на_пк(состояние)
             except Exception:                   # noqa: BLE001
                 log.exception("лицо: сбой при записи состояния")
 
