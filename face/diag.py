@@ -92,7 +92,18 @@ def главный() -> int:
         print("  ИТОГ: ни одна карта не годится для KMS — SDL честно говорит «недоступно».")
         return 1
     print(f"  ИТОГ: годится {карты[годная]} → SDL_KMSDRM_DEVICE_INDEX={годная}")
-    # 3. сам SDL
+    # 3. DRM напрямую — путь, которым служба и рисует на этой плате
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import drmout
+        э = drmout.ЭкранDRM(карты[годная])
+        print(f"  ok   DRM dumb-буферы: {э.width}×{э.height}, {э.mm[0]}×{э.mm[1]} мм, "
+              f"{э.mode.vrefresh} Гц, CRTC {э.crtc_id}, коннектор {э.connector_id}")
+        э.закрыть()
+    except Exception as e:                      # noqa: BLE001
+        print(f"  НЕТ  DRM dumb-буферы: {e}")
+        беда = True
+    # 4. сам SDL (на RDK X5 ждём «не доступен»: у Mesa нет модуля для vs-drm)
     os.environ["SDL_VIDEODRIVER"] = "kmsdrm"
     os.environ["SDL_KMSDRM_DEVICE_INDEX"] = str(годная)
     os.environ["SDL_AUDIODRIVER"] = "dummy"

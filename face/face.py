@@ -50,6 +50,13 @@ os.environ.setdefault("SDL_VIDEODRIVER", "kmsdrm")
 
 import pygame  # noqa: E402
 
+# Свой модуль рядом с этим файлом — а не «что найдётся в sys.path». Запуск не
+# всегда идёт с рабочим каталогом face/ (самопроверка грузит этот файл по
+# прямому пути), и полагаться на CWD значило бы однажды не найти drmout там,
+# где он на самом деле лежит.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import drmout  # noqa: E402
+
 ФАЙЛ = os.environ.get("ROBOT_FACE_FILE", "/run/robot-ai/face.json")
 ЗАПАСНОЙ_ФАЙЛ = "~/.robot-ai/face.json"
 # Старше этого — лицо спит. Требование ТЗ: одна секунда.
@@ -484,19 +491,56 @@ class Яркость:
 
 
 # --- главный цикл -------------------------------------------------------------
-def _открыть_экран() -> pygame.Surface:
-    """kmsdrm по каждой карте → fbcon → любой. Ошибка каждого пишется.
+class _ЧерезSDL:
+    """Экран, который открыл SDL: рисуем прямо в него."""
 
-    ОШИБКА, КОТОРАЯ ТУТ БЫЛА: первый `display.init()` стоял ДО цикла, и на
-    роботе он и падал — до запасных вариантов дело не доходило вовсе, а в
-    журнале было одно «kmsdrm not available» без перебора. Теперь init —
-    внутри каждой попытки.
+    def __init__(self, экран, имя: str) -> None:
+        self.поверхность = экран
+        self.имя = имя
 
-    Карт может быть несколько (/dev/dri/card0, card1…), и SDL по умолчанию
-    берёт нулевую. На плате с двумя DRM-устройствами панель может висеть на
-    второй — перебираем индексы. Честно: что не открылось и почему, — в
-    журнал, по строке на попытку; общий вердикт SDL «недоступно» ничего не
-    объясняет, подробнее — python3 face/diag.py.
+    def показать(self) -> None:
+        pygame.display.flip()
+
+    def закрыть(self) -> None:
+        pygame.display.quit()
+
+
+class _ЧерезDRM:
+    """Экран через dumb-буферы DRM: рисуем в память, копируем в ядро."""
+
+    def __init__(self, экран: drmout.ЭкранDRM) -> None:
+        self._экран = экран
+        self.поверхность = pygame.Surface((экран.width, экран.height), 0, 32,
+                                          masks=drmout.МАСКИ)
+        self.имя = "DRM dumb-буферы"
+
+    def показать(self) -> None:
+        self._экран.показать(self.поверхность)
+
+    def закрыть(self) -> None:
+        self._экран.закрыть()
+
+
+# Драйверы SDL, которые открываются всегда и рисуют в никуда. Принять такой за
+# экран — значит тридцать кадров в секунду в память и «30 к/с» в журнале при
+# тёмной панели. Ровно так и было на роботе: «1024×768 через SDL по
+# умолчанию» — а такого разрешения нет ни у одной из наших панелей.
+ЗАГЛУШКИ = {"dummy", "offscreen"}
+
+
+def _открыть_экран():
+    """SDL (kmsdrm по каждой карте → fbcon → любой настоящий) → DRM напрямую.
+
+    ОШИБКА, КОТОРАЯ ТУТ БЫЛА, ДВАЖДЫ. Первый `display.init()` стоял ДО цикла с
+    запасными вариантами — он и падал, до перебора не доходило. А потом SDL
+    «по умолчанию» открыл заглушку, и код объявил это экраном, не спросив у
+    SDL, какой драйвер тот выбрал. Теперь спрашивает, и заглушки не считает.
+
+    ПОЧЕМУ НУЖЕН DRM НАПРЯМУЮ. На RDK X5 DRM-драйвер — VeriSilicon vs-drm, и у
+    Mesa для него нет модуля. SDL-овский kmsdrm без Mesa/GBM работать не
+    может в принципе, /dev/fb* на этом ядре нет. Dumb-буферы DRM не нуждаются
+    ни в том, ни в другом — так на этой панели рисовал X, пока мы его не
+    выключили. См. drmout.py.
     """
     pygame.font.init()
     попытки: list[tuple[str, str | None]] = []
@@ -507,7 +551,6 @@ def _открыть_экран() -> pygame.Surface:
     else:
         попытки.append((хотели, None))
     попытки += [("fbcon", None), ("", None)]
-    последняя = None
     for драйвер, карта in попытки:
         try:
             if драйвер:
@@ -520,27 +563,41 @@ def _открыть_экран() -> pygame.Surface:
                 os.environ.pop("SDL_KMSDRM_DEVICE_INDEX", None)
             pygame.display.quit()
             pygame.display.init()
-            флаги = pygame.FULLSCREEN if драйвер != "dummy" else 0
-            экран = pygame.display.set_mode((0, 0), флаги)
+            выбрал = pygame.display.get_driver()
+            if выбрал in ЗАГЛУШКИ:
+                print(f"лицо: SDL выбрал «{выбрал}» — это не экран, а память",
+                      flush=True)
+                continue
+            экран = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
             print(f"лицо: экран {экран.get_width()}×{экран.get_height()} через "
-                  f"{драйвер or 'SDL по умолчанию'}"
+                  f"SDL/{выбрал}"
                   f"{f' (card{карта})' if карта is not None else ''}", flush=True)
-            return экран
+            return _ЧерезSDL(экран, f"SDL/{выбрал}")
         except pygame.error as e:
-            последняя = e
             print(f"лицо: {драйвер or 'драйвер по умолчанию'}"
                   f"{f' card{карта}' if карта is not None else ''} не открылся: {e}",
                   flush=True)
-    raise SystemExit(f"лицо: экран не открылся ({последняя}). "
-                     f"Разобраться: python3 face/diag.py")
+    pygame.display.quit()
+    try:
+        экран = drmout.ЭкранDRM()
+    except Exception as e:                      # noqa: BLE001
+        raise SystemExit(f"лицо: экран не открылся ни через SDL, ни через DRM "
+                         f"({e}). Разобраться: python3 face/diag.py")
+    print(f"лицо: экран {экран.width}×{экран.height} ({экран.mm[0]}×{экран.mm[1]} мм, "
+          f"{экран.mode.vrefresh} Гц) через DRM dumb-буферы, без SDL", flush=True)
+    return _ЧерезDRM(экран)
 
 
 def главный() -> int:
     файл = Path(ФАЙЛ)
     if not файл.parent.exists():
         файл = Path(ЗАПАСНОЙ_ФАЙЛ).expanduser()
-    экран = _открыть_экран()
-    pygame.mouse.set_visible(False)
+    вывод = _открыть_экран()
+    экран = вывод.поверхность
+    try:
+        pygame.mouse.set_visible(False)
+    except pygame.error:
+        pass                                    # без SDL-экрана мыши и нет
     кисть = Кисть(экран.get_width(), экран.get_height())
     яркость = Яркость()
     такт = pygame.time.Clock()
@@ -560,7 +617,7 @@ def главный() -> int:
             t = time.monotonic() - начало
             доля = яркость.применить(яркость.доля(состояние))
             кисть.кадр(экран, состояние, t, доля)
-            pygame.display.flip()
+            вывод.показать()
             кадров_за_отчёт += 1
             if time.monotonic() - последний_отчёт >= 60.0:
                 # Счётчик кадров — это проверка №1 из ТЗ §8, а не украшение.
@@ -574,7 +631,11 @@ def главный() -> int:
         # честный кадр отказа. От SIGKILL это не спасает, и это записано.
         try:
             кисть.кадр_отказа(экран)
-            pygame.display.flip()
+            вывод.показать()
+        except Exception:                       # noqa: BLE001
+            pass
+        try:
+            вывод.закрыть()
         except Exception:                       # noqa: BLE001
             pass
 
