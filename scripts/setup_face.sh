@@ -12,8 +12,24 @@ echo "==> лицо робота: ставлю зависимости"
 # pygame из apt, а не из pip: колесо под aarch64 тянет сборку SDL, а системный
 # pygame 2.1 уже собран с SDL2 и умеет kmsdrm. Шрифт — DejaVu, у него есть
 # кириллица; без него подпись «слушаю» превратится в квадратики.
-sudo apt-get update -qq
-sudo apt-get install -y python3-pygame fonts-dejavu-core
+#
+# `apt-get update` НЕ ЗОВЁМ ПЕРВЫМ ДЕЛОМ, и это урок с живого робота. В
+# источниках образа WHEELTEC стоят зеркала D-Robotics, которые из России
+# отвечают минутами или никак, а с `-qq` это выглядело как повисший скрипт.
+# Порядок: если всё уже стоит — не трогаем apt вовсе; иначе ставим из тех
+# списков, что есть; и только если пакета в них нет — обновляем, с пределом
+# по времени и с выводом на экран, чтобы было видно, на каком зеркале стоим.
+FONT=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+if python3 -c "import pygame" 2>/dev/null && [ -f "$FONT" ]; then
+  echo "==> pygame и шрифт уже стоят, apt не трогаю"
+elif sudo apt-get install -y python3-pygame fonts-dejavu-core; then
+  echo "==> поставил из имеющихся списков"
+else
+  echo "==> в списках пакета нет — обновляю их (до трёх минут; ниже видно, где стоим)"
+  sudo timeout 180 apt-get update \
+    || echo "!! apt-get update не дождался ответа зеркала — пробую ставить так"
+  sudo apt-get install -y python3-pygame fonts-dejavu-core
+fi
 
 echo "==> права на экран"
 # DRM (/dev/dri/*) и фреймбуфер выдаются группами video и render. Служба
