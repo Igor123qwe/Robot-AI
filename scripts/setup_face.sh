@@ -20,15 +20,44 @@ echo "==> лицо робота: ставлю зависимости"
 # списков, что есть; и только если пакета в них нет — обновляем, с пределом
 # по времени и с выводом на экран, чтобы было видно, на каком зеркале стоим.
 FONT=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
-if python3 -c "import pygame" 2>/dev/null && [ -f "$FONT" ]; then
+have_pygame() { python3 -c "import pygame" 2>/dev/null; }
+
+# --no-install-recommends — не экономия, а необходимость. Без него apt тянет
+# libsdl2-mixer, а с ним timgm6mb-soundfont на пять мегабайт из семи: звуковой
+# шрифт для микшера, который лицу не нужен вовсе (звук у службы выключен).
+# На зеркале Tsinghua из России это 1.4 КБ/с и обрыв по таймауту — проверено.
+# Retries — потому что обрывается оно не всегда, и второй раз докачивает.
+APT_INSTALL="sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3"
+
+if have_pygame && [ -f "$FONT" ]; then
   echo "==> pygame и шрифт уже стоят, apt не трогаю"
-elif sudo apt-get install -y python3-pygame fonts-dejavu-core; then
+elif $APT_INSTALL python3-pygame fonts-dejavu-core; then
   echo "==> поставил из имеющихся списков"
 else
-  echo "==> в списках пакета нет — обновляю их (до трёх минут; ниже видно, где стоим)"
-  sudo timeout 180 apt-get update \
-    || echo "!! apt-get update не дождался ответа зеркала — пробую ставить так"
-  sudo apt-get install -y python3-pygame fonts-dejavu-core
+  echo "==> apt не смог (зеркало не отвечает или пакета нет в списках)"
+  # Шрифт почти наверняка уже есть — он в базовом образе. Проверяем, а не
+  # предполагаем: без него подпись превратится в квадратики.
+  [ -f "$FONT" ] || $APT_INSTALL fonts-dejavu-core || true
+  # Колесо pygame с PyPI: у него свой CDN, из России он обычно отвечает, и в
+  # колесе 2.6 SDL2 собран с kmsdrm. Ставим в пользователя — служба идёт от
+  # /usr/bin/python3 под wheeltec и пользовательские пакеты видит.
+  echo "==> пробую колесо с PyPI: pip3 install --user pygame"
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    $APT_INSTALL python3-pip || true
+  fi
+  python3 -m pip install --user --disable-pip-version-check pygame
+fi
+
+if ! have_pygame; then
+  echo "!! pygame так и не встал. Варианты:"
+  echo "   1) повторить скрипт — зеркало могло просто отвалиться на минуту;"
+  echo "   2) сменить зеркало apt на ближнее (mirror.yandex.ru/ubuntu-ports) —"
+  echo "      это правка /etc/apt/sources.list, скажи, и я подготовлю."
+  exit 1
+fi
+if [ ! -f "$FONT" ]; then
+  echo "!! шрифта DejaVu нет — кириллица на экране не отрисуется"
+  exit 1
 fi
 
 echo "==> права на экран"
