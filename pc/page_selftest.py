@@ -30,6 +30,12 @@ class FakeOllama:
     def alive(self): return False
 srv.cfg = k.Config("тест", whisper=k.Whisper("tiny"), ollama=FakeOllama())
 srv.avatar = k.Аватар()
+# Сценки (face/scenes.py) — случайные и складываются с эмоциями; для точных
+# проверок ниже их выключаем, а для проверки самих сценок включаем обратно.
+class _БезСценок:
+    def кадр(self, *a, **kw): return {"имя": "", "текст": "", "параметры": {}}
+настоящий_сценарист = srv.avatar.сценарист
+srv.avatar.сценарист = _БезСценок()
 srv.daemon_threads = True
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 url = f"http://127.0.0.1:{srv.server_address[1]}"
@@ -39,8 +45,14 @@ def post(state):
     urllib.request.urlopen(r, timeout=5).read()
 
 PIXI_STUB = """
+window.__texts = [];
 window.PIXI = {
   UPDATE_PRIORITY: {LOW: -25},
+  Container: class { constructor(){ this.children=[]; this.position={x:0,y:0,set(x,y){this.x=x;this.y=y;}}; this.visible=true; }
+    addChild(c){ this.children.push(c); } },
+  Graphics: class { clear(){return this;} beginFill(){return this;} drawRoundedRect(){return this;} endFill(){return this;} },
+  Text: class { constructor(t, st){ this.text=t; this.style=st; this.width=100; this.height=30;
+    this.anchor={set(){}}; this.position={set(){}}; window.__texts.push(this); } },
   Application: class { constructor(o){ this.renderer={width:1280,height:800};
     this.view=document.createElement('canvas'); this.stage={addChild(){}};
     this.ticker={add(fn){ window.__tick=fn; }}; } },
@@ -138,13 +150,14 @@ with sync_playwright() as p:
     # 4. Музыка → танец: покачивание всего тела и наклон корпуса.
     post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": True, "название": "x"}})
     page.wait_for_timeout(300)
-    повороты = []
+    повороты, наклоны = [], []
     for _ in range(20):
         page.evaluate("window.__listeners.afterMotionUpdate()")
         повороты.append(page.evaluate("window.__model.rotation"))
+        наклоны.append(парам("ParamBodyAngleX"))
         page.wait_for_timeout(50)
     check("танец → тело качается (поворот ≠ 0)", max(abs(x) for x in повороты) > 0.02, True)
-    check("танец → корпус наклоняется (ParamBodyAngleX)", abs(парам("ParamBodyAngleX")) > 0.5, True)
+    check("танец → корпус наклоняется (ParamBodyAngleX)", max(abs(x) for x in наклоны) > 0.5, True)
     check("метка танца дошла", page.evaluate("window.__model.__motion || ''"), "")  # танец в config пуст — motion не зовётся
     check("карточка музыки слева — персонаж отошёл вправо (как домовёнок на роботе)",
           page.evaluate("window.__model.position.x") > 1280 * 0.58, True)
@@ -156,6 +169,25 @@ with sync_playwright() as p:
     check("сплю → рот закрыт", парам("ParamMouthOpenY"), 0)
     check("карточки нет — персонаж вернулся к середине",
           abs(page.evaluate("window.__model.position.x") - 640) < 40, True)
+
+    # 6а. Сценка: человек появился — событие, у всех его сценок есть движение
+    # и почти у всех реплика; проверяем, что сценка доехала до модели.
+    srv.avatar.сценарист = настоящий_сценарист
+    post({"эмоция": "спокоен", "человек": False, "музыка": {"играет": False}})
+    page.wait_for_timeout(300); кадры(3)
+    post({"эмоция": "спокоен", "человек": True, "взгляд": 0.0, "музыка": {"играет": False}})
+    page.wait_for_timeout(300)
+    сдвиги = set(); пузыри = set()
+    for _ in range(15):
+        page.evaluate("window.__listeners.afterMotionUpdate()")
+        сдвиги.add(round(парам("ParamAngleY") + парам("ParamAngleZ") + парам("ParamBodyAngleZ"), 1))
+        пузыри.add(page.evaluate("(window.__texts[0] || {}).text || ''"))
+        page.wait_for_timeout(50)
+        post({"эмоция": "спокоен", "человек": True, "взгляд": 0.0, "музыка": {"играет": False}})
+    check("человек появился → сценка двигает голову/тело", len(сдвиги) > 3, True)
+    check("…а пузырь над головой есть в PIXI (текст или пусто — смотря какая сценка выпала)",
+          page.evaluate("window.__texts.length") >= 1, True)
+    srv.avatar.сценарист = _БезСценок()
 
     # 6. Человек слева → голова и глаза влево.
     post({"эмоция": "спокоен", "человек": True, "взгляд": 0.5, "музыка": {"играет": False}})
