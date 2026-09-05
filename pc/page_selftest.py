@@ -146,12 +146,16 @@ with sync_playwright() as p:
     check("танец → тело качается (поворот ≠ 0)", max(abs(x) for x in повороты) > 0.02, True)
     check("танец → корпус наклоняется (ParamBodyAngleX)", abs(парам("ParamBodyAngleX")) > 0.5, True)
     check("метка танца дошла", page.evaluate("window.__model.__motion || ''"), "")  # танец в config пуст — motion не зовётся
+    check("карточка музыки слева — персонаж отошёл вправо (как домовёнок на роботе)",
+          page.evaluate("window.__model.position.x") > 1280 * 0.58, True)
 
     # 5. Сон: глаза закрыты, рот закрыт.
     post({"эмоция": "сплю"})
-    page.wait_for_timeout(300); кадры()
+    page.wait_for_timeout(300); кадры(45)      # шаг обратно к середине плавный — даём ему секунду с лишним
     check("сплю → глаза закрыты", (парам("ParamEyeLOpen"), парам("ParamEyeROpen")), (0, 0))
     check("сплю → рот закрыт", парам("ParamMouthOpenY"), 0)
+    check("карточки нет — персонаж вернулся к середине",
+          abs(page.evaluate("window.__model.position.x") - 640) < 40, True)
 
     # 6. Человек слева → голова и глаза влево.
     post({"эмоция": "спокоен", "человек": True, "взгляд": 0.5, "музыка": {"играет": False}})

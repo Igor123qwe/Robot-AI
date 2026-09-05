@@ -911,6 +911,7 @@ def main() -> None:
     # Взгляд ему отдаст глазомер ниже — он создаётся позже.
     лицо = face_mod.Лицо(ros=ros, player=player, где=дом,
                          тихо=cfg.is_quiet_now,
+                         таймеры=timers,
                          слушаю_секунд=cfg.session_seconds,
                          # Тот же ПК, что уже отвечает за разговор (ROBOT_PC_URL):
                          # если там поднят pc/avatar, состояние уйдёт и туда.
