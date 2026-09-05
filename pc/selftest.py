@@ -1017,12 +1017,29 @@ def test_avatar() -> None:
     подменена своей — а заодно что чужой файл с диска через «..» не отдать.
     """
     section("аватар на ПК")
+    import http.client
     import json
     import urllib.error
     import urllib.request
+    from urllib.parse import urlsplit
 
     srv, url = serve(FakeOllama([]))
     try:
+        # «/avatar» без хвостового «/» — редирект, а не страница напрямую:
+        # иначе все относительные пути внутри неё (config.json, state,
+        # сама модель) уезжают на уровень выше и тихо получают чужой JSON
+        # вместо настоящих настроек — так и было на живом ПК.
+        адрес = urlsplit(url)
+        соединение = http.client.HTTPConnection(адрес.hostname, адрес.port, timeout=5)
+        соединение.request("GET", "/avatar")
+        ответ = соединение.getresponse()
+        ответ.read()
+        check("«/avatar» без слэша — редирект, а не страница напрямую",
+              ответ.status, 301)
+        check("редирект ведёт на слэш на конце",
+              ответ.getheader("Location"), "/avatar/")
+        соединение.close()
+
         тело = json.dumps({"эмоция": "рад", "говорит": "привет",
                            "музыка": {"играет": False}}).encode("utf-8")
         запрос = urllib.request.Request(url + "/avatar/state", data=тело,

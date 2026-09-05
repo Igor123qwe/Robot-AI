@@ -1769,6 +1769,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- маршруты ---
     def do_GET(self) -> None:
+        # «/avatar» без хвостового «/» — не то же самое, что «/avatar/»: все
+        # относительные пути внутри страницы (config.json, state, сама
+        # модель) считаются от последнего, а без него браузер отрезает
+        # «avatar» и просит /config.json у корня сервера — там пусто, и
+        # оттуда приходит настоящая JSON-ошибка, которую fetch не отличает
+        # от настоящих настроек. Раз и навсегда — редиректом, как это делают
+        # обычные веб-сервера для каталогов.
+        if self.path.split("?", 1)[0] == "/avatar":
+            self.send_response(301)
+            self.send_header("Location", "/avatar/")
+            # HTTP/1.1 держит соединение живым и без длины тела не знает, где
+            # кончился ответ, — клиент виснет на чтении до тайм-аута вместо
+            # того, чтобы сразу увидеть редирект. Тело и так пустое.
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in ("/health", "/"):
             cfg = self.server.cfg

@@ -44,9 +44,23 @@ function показать(текст) {
 async function главная() {
   let настройки;
   try {
-    настройки = await (await fetch("config.json", { cache: "no-store" })).json();
+    const ответ = await fetch("config.json", { cache: "no-store" });
+    // fetch не бросает исключение на 404 — страница получила бы чужую JSON-
+    // ошибку сервера и приняла бы её за настоящие настройки молча (ровно
+    // так и вышло на живом ПК: адрес без хвостового «/» увёл config.json на
+    // чужой путь, а «нет такого адреса» — тоже валидный JSON).
+    if (!ответ.ok) {
+      показать(`config.json: сервер ответил ${ответ.status} ${ответ.statusText}. ` +
+               "Открыт ли адрес страницы со слэшем на конце — /avatar/, а не /avatar?");
+      return;
+    }
+    настройки = await ответ.json();
   } catch (e) {
     показать("Не нашёл config.json рядом со страницей: " + e);
+    return;
+  }
+  if (!настройки || !настройки.модель) {
+    показать("В config.json нет поля \"модель\" — проверь файл.");
     return;
   }
 
@@ -129,7 +143,12 @@ async function главная() {
   async function опросить() {
     let с;
     try {
-      с = await (await fetch("state", { cache: "no-store" })).json();
+      const ответ = await fetch("state", { cache: "no-store" });
+      if (!ответ.ok) {
+        показать(`state: сервер ответил ${ответ.status} ${ответ.statusText}`);
+        return;
+      }
+      с = await ответ.json();
     } catch (e) {
       показать("Нет связи с сервером (" + e + ") — страница ждёт, робот жив?");
       return;
