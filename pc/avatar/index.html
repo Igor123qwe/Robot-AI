@@ -275,6 +275,11 @@ async function главная() {
       if (id === "ParamEyeLOpen" || id === "ParamEyeROpen") веки_сцены[id] = сцена.параметры[id];
       else цель[id] = (цель[id] || 0) + сцена.параметры[id];
     }
+    // Движение было где-то — туда голова и глаза (сценки про движение).
+    if (typeof сцена.к === "number") {
+      цель.ParamAngleX = (цель.ParamAngleX || 0) + сцена.к * 25;
+      цель.ParamEyeBallX = (цель.ParamEyeBallX || 0) + сцена.к;
+    }
 
     // Сглаживание: эмоция меняется за десятые доли секунды, не рывком.
     const к = 1 - Math.exp(-dt / 0.15);

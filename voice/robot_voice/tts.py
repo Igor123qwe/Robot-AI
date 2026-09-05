@@ -458,6 +458,11 @@ class RemoteSpeech(ПервыйЗвук):
         self.remote = remote
         self.fallback_cmd = fallback_cmd
         self.volume = volume
+        # Кому отдать звук перед динамиком — лицу, под рот. Здесь звук
+        # проходит через Python целиком (и с ПК, и из кэша, и от своего
+        # piper на запасном пути), так что это единственное место на роботе,
+        # где рот можно вести по настоящей громкости.
+        self.on_pcm: Callable[[bytes, int], None] | None = None
         self._aplay = subprocess.Popen(
             aplay_cmd(remote.rate, device),
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -486,6 +491,11 @@ class RemoteSpeech(ПервыйЗвук):
                 pcm = self._own(sentence)
             if not pcm or self._cancelled:
                 continue
+            if self.on_pcm is not None:
+                try:
+                    self.on_pcm(pcm, self.remote.rate)
+                except Exception:               # noqa: BLE001
+                    log.debug("рот по звуку не взял фразу", exc_info=True)
             try:
                 self._aplay.stdin.write(scale(pcm, self.volume))
                 self._aplay.stdin.flush()
@@ -718,6 +728,9 @@ class Speaker:
         self.last_said = ""
         # Сколько раз реплику обрывали на полуслове. Растёт в hush.
         self.hushes = 0
+        # Кому отдавать звук под рот на экране (лицо). Только там, где звук
+        # проходит через Python: piper напрямую в aplay нам не виден.
+        self.on_pcm: Callable[[bytes, int], None] | None = None
 
         self.piper = _find_piper()
         if self.piper is None:
@@ -794,8 +807,10 @@ class Speaker:
             return speech
         try:
             if self.remote is not None and self.remote.alive():
-                return RemoteSpeech(self.remote, self._cmd(), volume,
-                                    self.spk_device)
+                speech = RemoteSpeech(self.remote, self._cmd(), volume,
+                                      self.spk_device)
+                speech.on_pcm = self.on_pcm
+                return speech
             return Speech(self._cmd(), self.sample_rate, volume,
                           self.spk_device)
         except OSError:
