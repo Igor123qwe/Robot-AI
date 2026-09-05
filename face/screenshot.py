@@ -13,11 +13,8 @@ drmModePageFlip, — и сохраняет его в PNG. Службу оста�
 не становится вовсе (открывает карту, не делает SetMaster) — он просто читает
 GEM-хендл активного FB через drmModeGetFB2 → PRIME-экспорт → mmap.
 
-Если по какой-то причине PRIME недоступен (старое ядро), делаем то, что
-умеет любое ядро: просим у ДРАЙВЕРА дамп текущего кадра через `getfb2`
-не выйдет без DUMB-совместимого хендла — тогда сообщаем об этом честно и
-предлагаем снять кадр из самой службы (см. --через-службу ниже), а не
-падаем молча с чёрным PNG.
+Если PRIME недоступен (старое ядро без GETFB2/PRIME_HANDLE_TO_FD) — скрипт
+честно называет отказавший шаг и причину, а не падает молча с чёрным PNG.
 """
 
 from __future__ import annotations
@@ -81,6 +78,21 @@ IOCTL_PRIME_HANDLE_TO_FD = _iowr(0x2D, ctypes.sizeof(_PrimeHandle))
 DRM_FORMAT_XRGB8888 = 0x34325258  # 'XR24' little-endian, см. drm_fourcc.h
 
 
+def _шаг(имя: str, вызов, *args):
+    """Позвать stdlib-функцию и, если она бросит OSError, назвать ШАГ.
+
+    Голое str(OSError) не всегда содержит имя файла: у вызовов по файловому
+    дескриптору (mmap, os.close) его попросту нет, и получается текст вроде
+    «[Errno 2] No such file or directory» без единой зацепки, что именно
+    ломалось. Ровно на этом мы и стояли — гадать дальше бессмысленно, проще
+    называть шаг явно.
+    """
+    try:
+        return вызов(*args)
+    except OSError as e:
+        raise RuntimeError(f"{имя}: {type(e).__name__} {e}") from e
+
+
 def снять(карта: str) -> tuple[bytes, int, int]:
     """(сырые байты BGRX, ширина, высота) кадра, сейчас показанного на CRTC."""
     drm = открыть_libdrm()
@@ -88,7 +100,7 @@ def снять(карта: str) -> tuple[bytes, int, int]:
     drm.drmModeGetResources.argtypes = [ctypes.c_int]
     drm.drmModeFreeResources.argtypes = [ctypes.c_void_p]
 
-    fd = os.open(карта, os.O_RDWR | os.O_CLOEXEC)
+    fd = _шаг("открыть карту", os.open, карта, os.O_RDWR | os.O_CLOEXEC)
     try:
         рес = drm.drmModeGetResources(fd)
         if not рес:
@@ -100,7 +112,8 @@ def снять(карта: str) -> tuple[bytes, int, int]:
                 crtc_id = r.crtcs[i]
                 buf = ctypes.create_string_buffer(ctypes.sizeof(_Crtc))
                 struct.pack_into("I", buf, 0, crtc_id)
-                if fcntl.ioctl(fd, IOCTL_MODE_GETCRTC, buf, True) != 0:
+                итог = _шаг("GETCRTC", fcntl.ioctl, fd, IOCTL_MODE_GETCRTC, buf, True)
+                if итог != 0:
                     continue
                 crtc = _Crtc.from_buffer_copy(buf)
                 if crtc.mode_valid and crtc.buffer_id:
@@ -111,26 +124,33 @@ def снять(карта: str) -> tuple[bytes, int, int]:
                                    "robot-face запущена?")
 
             fb2 = _FB2(fb_id=активный_fb)
-            if fcntl.ioctl(fd, IOCTL_MODE_GETFB2, fb2, True) != 0:
-                raise RuntimeError(f"GETFB2 отказал: {os.strerror(ctypes.get_errno())} "
-                                   "(ядро старое? см. --через-службу)")
+            итог = _шаг("GETFB2", fcntl.ioctl, fd, IOCTL_MODE_GETFB2, fb2, True)
+            if итог != 0:
+                raise RuntimeError(f"GETFB2 вернул {итог} без исключения "
+                                   f"(errno {ctypes.get_errno()}: "
+                                   f"{os.strerror(ctypes.get_errno())}) — возможно, "
+                                   f"ядро старое и не умеет GETFB2/PRIME")
             if fb2.pixel_format != DRM_FORMAT_XRGB8888:
                 raise RuntimeError(f"неожиданный формат кадра 0x{fb2.pixel_format:08x} "
                                    "— ожидался XRGB8888")
 
             ph = _PrimeHandle(handle=fb2.handles[0], flags=0)
-            if fcntl.ioctl(fd, IOCTL_PRIME_HANDLE_TO_FD, ph, True) != 0:
-                raise RuntimeError(f"PRIME_HANDLE_TO_FD отказал: "
-                                   f"{os.strerror(ctypes.get_errno())}")
+            итог = _шаг("PRIME_HANDLE_TO_FD", fcntl.ioctl, fd,
+                       IOCTL_PRIME_HANDLE_TO_FD, ph, True)
+            if итог != 0:
+                raise RuntimeError(f"PRIME_HANDLE_TO_FD вернул {итог} без исключения "
+                                   f"(errno {ctypes.get_errno()}: "
+                                   f"{os.strerror(ctypes.get_errno())})")
             размер = fb2.pitches[0] * fb2.height
             try:
-                данные = mmap.mmap(ph.fd, размер, mmap.MAP_SHARED, mmap.PROT_READ)
+                данные = _шаг("mmap PRIME-fd", mmap.mmap, ph.fd, размер,
+                             mmap.MAP_SHARED, mmap.PROT_READ)
                 try:
                     сырое = bytes(данные[:размер])
                 finally:
                     данные.close()
             finally:
-                os.close(ph.fd)
+                _шаг("закрыть PRIME-fd", os.close, ph.fd)
             шаг = fb2.pitches[0]
             ширина_байт = fb2.width * 4
             if шаг != ширина_байт:
@@ -140,7 +160,7 @@ def снять(карта: str) -> tuple[bytes, int, int]:
         finally:
             drm.drmModeFreeResources(рес)
     finally:
-        os.close(fd)
+        _шаг("закрыть карту", os.close, fd)
 
 
 def _png(путь: str, bgrx: bytes, ширина: int, высота: int) -> None:
