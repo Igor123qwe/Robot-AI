@@ -44,6 +44,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# БЕЗ ЭТОГО Windows PowerShell 5.1 читает байты, которые вернул ssh.exe, как
+# консольную кодовую страницу (обычно OEM 866), а не как UTF-8 — и «сохранено»
+# с роботом превращается в «╤Б╨╛╤Е╤А╨░╨╜╨╡╨╜╨╛». Файл скрипта тут ни при чём:
+# это отдельная, третья по счёту кодировка — не та, в которой лежит .ps1
+# (для нею нужен BOM), и не та, в которой ssh шлёт байты (UTF-8 всегда).
+chcp 65001 > $null
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
 if ([string]::IsNullOrWhiteSpace($RobotHost)) {
     Write-Error ("Не знаю адрес робота. Запусти так: " +
         ".\скриншот_робота.ps1 -RobotHost 192.168.1.50`n" +
