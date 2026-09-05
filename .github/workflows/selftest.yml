@@ -31,7 +31,9 @@ jobs:
         # numpy нужен по-настоящему: на нём считается громкость и уровень
         # сигнала. anthropic — ради настоящих классов ошибок: заглушка не
         # поймает, если мы перепутаем тип исключения при обрыве связи.
-        run: pip install numpy anthropic websocket-client requests
+        # pygame — ради лица робота: его кадры проверяются по пикселям на
+        # заглушке экрана, без железа. Колесо готовое, ставится за секунды.
+        run: pip install numpy anthropic websocket-client requests pygame
 
       - name: Самопроверка
         run: python voice/selftest.py
@@ -45,8 +47,8 @@ jobs:
       - name: Синтаксис остальных файлов
         # selftest импортирует не всё: сломанный отступ в модуле, который он не
         # трогает, иначе доедет до робота незамеченным.
-        run: python -m compileall -q voice web pc
+        run: python -m compileall -q voice web pc face
 
       - name: Скрипты установки
         # Опечатка в них выясняется только на живом роботе, посреди установки.
-        run: bash -n scripts/install.sh scripts/setup_voice.sh scripts/update.sh
+        run: bash -n scripts/install.sh scripts/setup_voice.sh scripts/setup_face.sh scripts/update.sh

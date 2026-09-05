@@ -18,11 +18,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import (atlas as atlas_mod, compass as compass_mod, diary, falldown,
-               gestures, intents,
-               landmarks, mapping,
-               nightly, skills,
-               search, survey, things, turn_end, vision_track)
+from . import (atlas as atlas_mod, compass as compass_mod, diary,
+               face as face_mod, falldown, gestures, intents, landmarks,
+               mapping, nightly, skills, search, survey, things, turn_end,
+               vision_track)
 from . import dog as dog_mod
 from .audio import Listener, make_source
 from .brain import Brain
@@ -166,6 +165,22 @@ GARBAGE_BELOW = -1.15
 UNSURE_BELOW = -0.85
 
 
+def _лицо(voice, что: str, *доводы) -> None:
+    """Сказать лицу, если оно есть. Нет экрана — нет и ошибки.
+
+    Лицо — необязательная часть: робот без экрана обязан работать точно так
+    же. Поэтому каждое обращение идёт через эту прокладку, а не через прямой
+    вызов, и любой сбой в лице пишется в журнал, но не роняет голос.
+    """
+    лицо = getattr(voice, "лицо", None)
+    if лицо is None:
+        return
+    try:
+        getattr(лицо, что)(*доводы)
+    except Exception:                           # noqa: BLE001
+        log.debug("лицо: не смог «%s»", что, exc_info=True)
+
+
 class Voice:
     """Речь робота: одна реплика за раз, и микрофон молчит, пока она звучит.
 
@@ -183,6 +198,8 @@ class Voice:
         # Куда показать услышанное. Пульт рисует это субтитрами: без экрана и
         # без SSH иначе не понять, расслышал робот или нет.
         self.on_heard: Callable[[str, str], None] | None = None
+        # Лицо на экране. None — экрана нет; все обращения через _лицо().
+        self.лицо = None
 
     @contextlib.contextmanager
     def quiet(self, говорю: str = ""):
@@ -224,10 +241,18 @@ class Voice:
         if not text:
             return 0
         with self._lock, self.quiet(text):
-            return self.speaker.say(text, loud=loud, on_sound=on_sound)
+            # Лицу — что произносим: строка «говорю» и текст под ней. И
+            # обязательно снять по выходу, иначе на экране повиснет реплика,
+            # которая давно отзвучала, — а это и есть замершее лицо.
+            _лицо(self, "говорю", text)
+            try:
+                return self.speaker.say(text, loud=loud, on_sound=on_sound)
+            finally:
+                _лицо(self, "сказал")
 
     def heard(self, text: str) -> None:
         self._show("heard", text)
+        _лицо(self, "услышал", text)
 
     def status(self, text: str) -> None:
         """Состояние робота, а не реплика человека: рисуется иначе."""
@@ -881,6 +906,14 @@ def main() -> None:
     глаза = Глаза(pc_url=cfg.pc_url, api_key=cfg.api_key,
                   api_base=cfg.api_base, model=cfg.model,
                   vision_model=cfg.vision_model, tof=дальномер)
+    # Лицо на экране. Собирается здесь, потому что ему нужны все, у кого оно
+    # спрашивает: колёса и батарея (ros), музыка (player), где дом (погода).
+    # Взгляд ему отдаст глазомер ниже — он создаётся позже.
+    лицо = face_mod.Лицо(ros=ros, player=player, где=дом,
+                         тихо=cfg.is_quiet_now,
+                         слушаю_секунд=cfg.session_seconds)
+    voice.лицо = лицо
+    лицо.start()
     # Пеленг человека с камеры: детектор людей на BPU. Подписку оформляем
     # всегда — узел могут поднять и после робота, тогда детекции просто
     # начнут приходить. Нет узла — следование идёт по одному дальномеру.
@@ -894,6 +927,8 @@ def main() -> None:
     # бесплатными. Ни одной ошибки при этом не возникало: два разных предмета
     # звались одним словом, и питон честно оставил последний.
     пеленг = vision_track.Глазомер()
+    # Взгляд лица следует за человеком по пеленгу с камеры.
+    лицо.глаза = пеленг
 
     # Сторож падений. Считает по тому же сообщению детектора, что и пеленг:
     # скелет в нём уже есть, второй раз ничего распознавать не нужно.
@@ -1377,6 +1412,7 @@ def main() -> None:
         if player is not None:
             player.stop()
         busy.stop()
+        лицо.stop()
         watch.stop()
         ros.stop()
         sys.exit(0)
@@ -2109,6 +2145,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                 # Позвали и замолчали — откликаемся и ждём продолжения.
                 voice.say("Да?")
                 awake_until = time.monotonic() + cfg.session_seconds
+                _лицо(voice, "слушаю")
                 last_talk = brain.last_talk = time.monotonic()
                 continue
 
@@ -2230,6 +2267,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                 log.info("правилами не разобрал, спрашиваю модель")
                 if turn is not None:
                     turn.про_что(разобрал="модель")
+                _лицо(voice, "думаю")
                 _respond(command, brain, voice, recognizer, ros, turn, addressed,
                          cfg.max_sentences)
 
@@ -2245,6 +2283,8 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # реплика робота съедала бы всё время, отведённое на продолжение.
             awake_until = time.monotonic() + cfg.session_seconds
             last_talk = brain.last_talk = time.monotonic()
+            # Окно открыто — лицо слушает. Гаснет само по длине окна.
+            _лицо(voice, "слушаю")
         finally:
             _вернуть_музыку(player)
 
@@ -2686,6 +2726,7 @@ def _respond(command: str, brain: Brain, voice: Voice,
                     мимо[0] = False
                     addressed.переспросил = True
                     sentence = "Не разобрал. Повтори, пожалуйста."
+                    _лицо(voice, "не_понял")
                 else:
                     мимо[0] = True
                     log.info("модель говорит, что фраза не мне — молчу%s",
@@ -2716,6 +2757,7 @@ def _respond(command: str, brain: Brain, voice: Voice,
             # сравнивало услышанное с пустотой.
             start_speaking()
             говорю(sentence)
+            _лицо(voice, "говорю", sentence)
             if turn is not None and not первая_фраза[0]:
                 первая_фраза[0] = True
                 # Отдельно от «первого токена» и отдельно от «синтеза».
@@ -2895,6 +2937,7 @@ def _respond(command: str, brain: Brain, voice: Voice,
             if speech:
                 speech.feed(_failure_phrase(e))
         finally:
+            _лицо(voice, "сказал")
             if speech:
                 try:
                     speech.close()

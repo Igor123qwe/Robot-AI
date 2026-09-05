@@ -74,6 +74,10 @@ report_unit robot-voice "bash $REPO/scripts/setup_voice.sh" ""
 report_unit robot-body "bash $REPO/scripts/setup_body.sh" "детектор людей на BPU"
 report_unit robot-autopull.timer \
   "sudo systemctl enable --now robot-autopull.timer" ""
+# Лицо на экране — отдельная служба, и выключенная она не мешает ничему:
+# без неё экран просто тёмный. Включается своим скриптом: ему нужны pygame
+# из apt, группы video/render и включённая в srpi-config панель.
+report_unit robot-face "bash $REPO/scripts/setup_face.sh" "лицо на экране"
 
 # --- отключаем вредное наследие WHEELTEC -----------------------------------
 # apstart1 поднимал точку доступа на 192.168.0.100 и ломал домашнюю сеть
