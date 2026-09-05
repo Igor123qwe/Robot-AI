@@ -22,14 +22,19 @@
   POST /voice/forget  забыть голос.
   GET  /health        что живо: Ollama, модель, Whisper, голос, кого узнаём.
   GET  /avatar        аватар Кузи (Live2D) в браузере — видеокарта у ПК уже
-                      занята Ollama, ей не тяжело нарисовать и это. Экран
-                      робота рисует сам и в этом не нуждается — это ДОБАВКА
-                      для тех, кто хочет картинку богаче на большом мониторе,
-                      а не замена. См. pc/avatar/README.md.
+                      занята Ollama, ей не тяжело нарисовать и это.
+                      См. pc/avatar/README.md.
   POST /avatar/state  сюда голос робота шлёт то же самое, что пишет в
                       face.json. Что с этим делать — решает не рисование
                       (страница в браузере), а та же логика позы, что и на
                       роботе (face/character.py), просто выполненная здесь.
+  GET  /avatar/stream та же страница, снятая здесь же headless-браузером и
+                      отданная роботу потоком JPEG-кадров (MJPEG). Экран
+                      робота показывает ЭТО, а своего домовёнка рисует лишь
+                      когда ПК недоступен: у робота нет видеокарты, и Live2D
+                      на нём не нарисовать — зато картинку с ПК он покажет.
+  GET  /avatar/frame.jpg  один последний кадр — глянуть в браузере, что робот
+                      видит на самом деле.
 
 Почему не LiteLLM. Он умеет то же самое, но это полтысячи мегабайт
 зависимостей и отдельное окно, которое надо не закрыть. Здесь один файл,
@@ -40,6 +45,11 @@
     python kuzya_pc.py --model qwen3:4b --whisper small
 
 Робот на своей стороне: ROBOT_PC_URL=http://адрес-этого-ПК:4000
+
+Для потока аватара на экран робота нужен ещё Playwright (pip install
+playwright): он поднимает headless-браузер — системный Edge или Chrome, если
+есть, — и снимает с него кадры. Без него всё остальное работает как прежде,
+а робот рисует лицо сам.
 """
 
 from __future__ import annotations
@@ -1708,29 +1718,251 @@ class Аватар:
     решено здесь, ей остаётся только нарисовать.
     """
 
-    def __init__(self) -> None:
+    # Старше этого — робот молчит, и аватар обязан уснуть, а не застыть с
+    # последним живым лицом. То же правило, что у face.json на роботе (там
+    # секунда); здесь длиннее, потому что между ними сеть, и одна потерянная
+    # посылка из десяти в секунду — не повод хлопать глазами.
+    СТАРЕЕТ = 3.0
+
+    def __init__(self, часы=time.monotonic) -> None:
         self._lock = threading.Lock()
+        self._часы = часы
         self._raw: dict = {}
         self._поза: dict = {}
+        self._когда = float("-inf")
         # Числа для Питомца тут ничего не значат для портретной Live2D-модели
         # (она не бродит по экрану) — они нужны только форме конструктора;
         # умолчания в character.py рассчитаны на реальный экран, а не на это.
         self._питомец = character.Питомец(1280, 800, тело_ширина=0.34,
                                           шаг_длина=0.05)
-        self._начало = time.monotonic()
+        self._начало = часы()
+        # Съёмка страницы для экрана робота. None — не поднята (нет
+        # Playwright или выключена ключом), тогда /avatar/stream честно
+        # отвечает 503, а робот рисует лицо сам.
+        self.съёмка: Съёмка | None = None
 
     def принять(self, данные: dict) -> None:
         with self._lock:
             self._raw = данные if isinstance(данные, dict) else {}
+            self._когда = self._часы()
             try:
                 self._поза = self._питомец.кадр(
-                    self._raw, time.monotonic() - self._начало)
+                    self._raw, self._часы() - self._начало)
             except Exception:                       # noqa: BLE001
                 log.exception("аватар: не разобрал состояние робота")
 
     def состояние(self) -> dict:
         with self._lock:
+            if self._часы() - self._когда > self.СТАРЕЕТ:
+                # Батарею оставляем: она и на роботе переживает сон.
+                return {"эмоция": "сплю", "батарея": self._raw.get("батарея"),
+                        "поза": {**self._поза, "метка": "спит", "рот": 0.0}}
             return {**self._raw, "поза": dict(self._поза)}
+
+
+class Съёмка:
+    """Кадры страницы аватара — для экрана робота.
+
+    Робот показать Live2D сам не может: у него нет видеокарты, а модель
+    рисуется WebGL. Зато ПК может нарисовать её у себя — в headless-браузере,
+    которого никто не видит, — и отдать роботу уже готовые картинки. Это
+    единственный путь, которым та картинка вообще попадает на экран робота.
+
+    Снимаем не скриншотами по таймеру (каждый — отдельная просьба к браузеру,
+    сотня миллисекунд, и кадры выходят рваные), а штатным скринкастом
+    Chrome (CDP Page.startScreencast): браузер сам отдаёт JPEG на каждый
+    свой кадр, а мы только складываем последний.
+
+    Браузер живёт ТОЛЬКО ПОКА ЕСТЬ СПРОС: робот тянет /avatar/stream —
+    снимаем; отключился — через ПРОСТОЙ закрываем всё. Держать headless-
+    браузер ради выключенного робота — это ядро процессора впустую.
+
+    Хранилище кадров отделено от браузера намеренно: `положить()` умеет
+    звать кто угодно, и самопроверка кладёт сюда свои картинки без единого
+    браузера — проверяя поток по HTTP, а не сам Chrome.
+    """
+
+    ПРОСТОЙ = 20.0          # секунд без спроса — браузер закрываем
+    ПОВТОР = 60.0           # секунд до новой попытки после неудачи с браузером
+    КАЧЕСТВО = 75           # JPEG; при 1280×800 это ~40–80 КБ на кадр
+    ТИШИНА = 1.0            # секунд без кадра от скринкаста — снимаем скриншотом
+
+    def __init__(self, адрес: str = "", размер: tuple[int, int] = (1280, 800),
+                 кадров_в_секунду: int = 15, часы=time.monotonic) -> None:
+        self.адрес = адрес
+        self.размер = размер
+        self.кадров_в_секунду = max(1, int(кадров_в_секунду))
+        self._часы = часы
+        self._lock = threading.Lock()
+        self._есть = threading.Condition(self._lock)
+        self._кадр = b""
+        self.номер = 0
+        self.когда = float("-inf")
+        self._спрос = float("-inf")
+        self._перезапуск = False
+        self.беда = ""              # почему кадров нет, словами для человека
+        self.браузер = ""           # какой в итоге открылся
+
+    # --- хранилище: сюда кладёт браузер, отсюда берёт HTTP -----------------
+    def положить(self, jpeg: bytes) -> None:
+        with self._есть:
+            self._кадр = jpeg
+            self.номер += 1
+            self.когда = self._часы()
+            self._есть.notify_all()
+
+    def кадр(self, после: int = 0, ждать: float = 0.0) -> tuple[bytes, int]:
+        """Кадр новее номера `после` — или (b"", после), если не дождались."""
+        срок = self._часы() + ждать
+        with self._есть:
+            while self.номер <= после:
+                осталось = срок - self._часы()
+                if осталось <= 0:
+                    return b"", после
+                self._есть.wait(min(осталось, 0.5))
+            return self._кадр, self.номер
+
+    def нужна(self, размер: tuple[int, int] | None = None) -> None:
+        """Кто-то смотрит — снимать. Робот зовёт это на каждом кадре."""
+        with self._lock:
+            self._спрос = self._часы()
+            if размер and tuple(размер) != tuple(self.размер):
+                self.размер = (int(размер[0]), int(размер[1]))
+                self._перезапуск = True
+
+    def спрос_есть(self) -> bool:
+        return self._часы() - self._спрос < self.ПРОСТОЙ
+
+    # --- браузер --------------------------------------------------------------
+    def запустить(self) -> None:
+        threading.Thread(target=self._крутиться, name="съёмка", daemon=True).start()
+
+    def _крутиться(self) -> None:
+        while True:
+            if not self.спрос_есть():
+                time.sleep(0.25)
+                continue
+            try:
+                self._снимать()
+            except Exception as e:                  # noqa: BLE001
+                self.беда = f"браузер не снялся: {e}"
+                log.warning("съёмка аватара: %s — следующая попытка через %.0f с",
+                            e, self.ПОВТОР)
+                срок = self._часы() + self.ПОВТОР
+                while self._часы() < срок:
+                    time.sleep(0.5)
+
+    def _открыть_браузер(self, p):
+        """Системный Edge или Chrome, если есть; иначе — тот, что у Playwright.
+
+        Свой Chromium Playwright скачивает отдельной командой
+        (playwright install chromium) — полторы сотни мегабайт, которые на
+        Windows чаще всего не нужны: Edge там уже стоит. Пробуем его первым.
+        """
+        # Без первого ключа Chrome прячет WebGL от программной отрисовки, а в
+        # headless видеокарты может и не быть; без второго свежие сборки
+        # вовсе отказывают WebGL без видеокарты — и Live2D молча не рисуется.
+        ключи = ["--ignore-gpu-blocklist", "--enable-unsafe-swiftshader"]
+        # Свой путь к браузеру — когда ни один из перечисленных не нашёлся
+        # или нужен именно этот (например, Chromium из другой папки).
+        свой = os.environ.get("KUZYA_BROWSER", "").strip()
+        if свой:
+            self.браузер = свой
+            return p.chromium.launch(executable_path=свой, headless=True, args=ключи)
+        последняя = None
+        for канал in ("msedge", "chrome", None):
+            try:
+                браузер = p.chromium.launch(channel=канал, headless=True, args=ключи)
+                self.браузер = канал or "chromium"
+                return браузер
+            except Exception as e:                  # noqa: BLE001
+                последняя = str(e).splitlines()[0]
+        raise RuntimeError(
+            f"ни Edge, ни Chrome, ни Chromium Playwright не открылись ({последняя}). "
+            f"Поставить свой: playwright install chromium — или указать путь к "
+            f"любому Chrome/Edge/Chromium в переменной KUZYA_BROWSER")
+
+    @staticmethod
+    def _жалоба_страницы(страница) -> str:
+        try:
+            return str(страница.evaluate(
+                "(document.getElementById('беда') || {}).textContent || ''")).strip()
+        except Exception as e:                      # noqa: BLE001
+            return f"страница не отвечает: {str(e).splitlines()[0]}"
+
+    def _снимать(self) -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.беда = "нет Playwright — pip install playwright"
+            raise RuntimeError(self.беда) from None
+        with sync_playwright() as p:
+            браузер = self._открыть_браузер(p)
+            try:
+                while self.спрос_есть():
+                    self._перезапуск = False
+                    ширина, высота = self.размер
+                    контекст = браузер.new_context(
+                        viewport={"width": ширина, "height": высота},
+                        device_scale_factor=1)
+                    страница = контекст.new_page()
+                    # «commit», а не «load»: страница тянет три скрипта с
+                    # чужих CDN, и без интернета «load» не наступит никогда —
+                    # а снимать надо всё, что она показывает, включая свою
+                    # же надпись о том, чего ей не хватает.
+                    страница.goto(self.адрес, wait_until="commit", timeout=15000)
+                    cdp = контекст.new_cdp_session(страница)
+
+                    def принять_кадр(п: dict) -> None:
+                        import base64
+                        self.положить(base64.b64decode(п["data"]))
+                        # Без подтверждения Chrome следующий кадр не пришлёт.
+                        cdp.send("Page.screencastFrameAck",
+                                 {"sessionId": п["sessionId"]})
+
+                    cdp.on("Page.screencastFrame", принять_кадр)
+                    # Страница рисует на каждый кадр монитора (60 Гц); роботу
+                    # столько не надо — и не потянет декодировать.
+                    cdp.send("Page.startScreencast", {
+                        "format": "jpeg", "quality": self.КАЧЕСТВО,
+                        "maxWidth": ширина, "maxHeight": высота,
+                        "everyNthFrame": max(1, round(60 / self.кадров_в_секунду)),
+                    })
+                    self.беда = ""
+                    log.info("съёмка аватара: %s, %d×%d, ~%d к/с",
+                             self.браузер, ширина, высота, self.кадров_в_секунду)
+                    жалоба_была = ""
+                    следующий_осмотр = 0.0
+                    while self.спрос_есть() and not self._перезапуск:
+                        # Обработчики событий у синхронного Playwright
+                        # срабатывают только пока мы внутри его вызова.
+                        страница.wait_for_timeout(200)
+                        if self._часы() - self.когда > self.ТИШИНА:
+                            # Скринкаст шлёт кадр только на ИЗМЕНЕНИЕ
+                            # картинки: страница, которая не двигается
+                            # (надпись об ошибке, застывшая модель), не даёт
+                            # ни одного — проверено. Тогда снимаем обычным
+                            # скриншотом: раз в секунду это ничего не стоит.
+                            self.положить(страница.screenshot(
+                                type="jpeg", quality=self.КАЧЕСТВО))
+                        if self._часы() < следующий_осмотр:
+                            continue
+                        следующий_осмотр = self._часы() + 5.0
+                        # Страницу здесь никто не видит — её жалобы (нет
+                        # модели, не тот путь в config.json) иначе не дошли
+                        # бы ни до кого, а робот показывал бы их как есть.
+                        жалоба = self._жалоба_страницы(страница)
+                        if жалоба != жалоба_была:
+                            жалоба_была = жалоба
+                            if жалоба:
+                                log.warning("страница аватара: %s", жалоба)
+                            else:
+                                log.info("страница аватара: всё в порядке")
+                    cdp.send("Page.stopScreencast")
+                    контекст.close()
+            finally:
+                браузер.close()
+                log.info("съёмка аватара остановлена: робот не смотрит")
 
 
 # Типы того, что реально лежит в pc/avatar/: страница, настройка и файлы
@@ -1803,6 +2035,9 @@ class Handler(BaseHTTPRequestHandler):
                 "голос_чей": getattr(getattr(cfg, "voice", None), "speaker", ""),
                 "узнаю_по_голосу": sorted(
                     getattr(getattr(cfg, "who", None), "people", {})),
+                # Поедет ли аватар на экран робота. Робот по этому решает,
+                # тянуть ли поток или сразу рисовать самому.
+                "аватар_поток": getattr(self.server.avatar, "съёмка", None) is not None,
                 # Часы. Робот сверяет их со своими: на его SBC нет батарейки
                 # часов, и после выключения питания время уезжает на часы. А от
                 # него зависят будильники, напоминания и тихие часы.
@@ -1847,6 +2082,12 @@ class Handler(BaseHTTPRequestHandler):
         if хвост == "state":
             self._json(200, self.server.avatar.состояние())
             return
+        if хвост == "stream":
+            self._avatar_stream()
+            return
+        if хвост == "frame.jpg":
+            self._avatar_frame()
+            return
         файл = (self.АВАТАР_ПАПКА / (хвост or "index.html")).resolve()
         # Не выйти за пределы папки: «..» в пути мог бы отдать любой файл ПК.
         try:
@@ -1876,6 +2117,97 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.server.avatar.принять(данные)
         self._json(200, {"ok": True})
+
+    # Сколько ждать первого кадра. Браузер поднимается по первому же спросу,
+    # и холодный старт Edge с загрузкой модели занимает секунды; робот тем
+    # временем рисует лицо сам и ничего не теряет.
+    ПЕРВЫЙ_КАДР = 20.0
+    # Граница частей MJPEG. Любая строка, лишь бы не встречалась в JPEG.
+    ГРАНИЦА = b"kuzya-frame"
+    # Как часто повторять прежний кадр, когда новых нет. Робот считает поток
+    # мёртвым через полторы секунды тишины — пульс должен быть заметно чаще.
+    ПУЛЬС = 0.5
+
+    def _размер_запрошен(self) -> tuple[int, int] | None:
+        """?w=1280&h=800 — экран робота; страница рисуется ровно под него."""
+        from urllib.parse import parse_qs, urlparse
+        q = parse_qs(urlparse(self.path).query)
+        try:
+            w, h = int(q["w"][0]), int(q["h"][0])
+        except (KeyError, ValueError, IndexError):
+            return None
+        return (w, h) if 64 <= w <= 4096 and 64 <= h <= 4096 else None
+
+    def _съёмка(self):
+        """Съёмка, если она есть, иначе — 503 с причиной и None."""
+        съёмка = getattr(self.server.avatar, "съёмка", None)
+        if съёмка is None:
+            self._json(503, {"error": "съёмка аватара не поднята: нужен Playwright "
+                                      "(pip install playwright) или снят ключ "
+                                      "--no-avatar-stream"})
+            return None
+        съёмка.нужна(self._размер_запрошен())
+        return съёмка
+
+    def _avatar_frame(self) -> None:
+        съёмка = self._съёмка()
+        if съёмка is None:
+            return
+        кадр, _ = съёмка.кадр(0, ждать=self.ПЕРВЫЙ_КАДР)
+        if not кадр:
+            self._json(503, {"error": съёмка.беда or "кадров ещё нет"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(кадр)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(кадр)
+
+    def _avatar_stream(self) -> None:
+        """MJPEG: одна HTTP-ответ, кадры друг за другом, пока робот слушает.
+
+        Старейший из потоковых форматов и единственный, который робот
+        разберёт без видеокарты и без кодеков: каждая часть — обычный JPEG,
+        pygame читает его сам. Сжатия между кадрами нет, зато нет и задержки
+        на буферизацию, а по домашней сети мегабайта в секунду хватает.
+        """
+        съёмка = self._съёмка()
+        if съёмка is None:
+            return
+        кадр, номер = съёмка.кадр(0, ждать=self.ПЕРВЫЙ_КАДР)
+        if not кадр:
+            self._json(503, {"error": съёмка.беда or "кадров ещё нет"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         f"multipart/x-mixed-replace; boundary={self.ГРАНИЦА.decode()}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        log.info("робот подключился к потоку аватара")
+        try:
+            while True:
+                self.wfile.write(b"--" + self.ГРАНИЦА + b"\r\n"
+                                 b"Content-Type: image/jpeg\r\n"
+                                 b"Content-Length: " + str(len(кадр)).encode() + b"\r\n\r\n"
+                                 + кадр + b"\r\n")
+                self.wfile.flush()
+                съёмка.нужна()
+                новый_кадр, новый = съёмка.кадр(номер, ждать=self.ПУЛЬС)
+                if новый_кадр:
+                    кадр, номер = новый_кадр, новый
+                elif съёмка.беда or self.server.avatar.съёмка is not съёмка:
+                    # Браузер упал. Роботу честнее увидеть обрыв и рисовать
+                    # самому, чем смотреть на застывший последний кадр.
+                    break
+                # Иначе — страница просто не меняется (Chrome шлёт кадр
+                # только на изменение). Повторяем прежний: робот судит о
+                # живости ПК по потоку, а не по тому, моргает ли модель.
+        except (ConnectionError, BrokenPipeError, OSError):
+            pass
+        log.info("робот отключился от потока аватара")
 
     # --- кто говорит ---
     def _who(self):
@@ -2319,6 +2651,13 @@ def main() -> int:
                         "женские, xenia самый живой")
     p.add_argument("--no-voiceprints", action="store_true",
                    help="не узнавать людей по голосу")
+    p.add_argument("--no-avatar-stream", action="store_true",
+                   help="не снимать аватар для экрана робота (робот тогда "
+                        "рисует лицо сам, как раньше)")
+    p.add_argument("--avatar-fps", type=int, default=15,
+                   help="сколько кадров аватара в секунду слать роботу; "
+                        "больше — плавнее, но робот декодирует каждый на "
+                        "процессоре")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
@@ -2377,6 +2716,18 @@ def main() -> int:
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.cfg = cfg
     srv.avatar = Аватар()
+    if not args.no_avatar_stream:
+        try:
+            import playwright  # noqa: F401
+        except ImportError:
+            log.warning("аватар на экран робота не поедет: нет Playwright. "
+                        "Поставить: pip install playwright — и Edge или Chrome "
+                        "на этом ПК. Робот пока рисует лицо сам.")
+        else:
+            съёмка = Съёмка(f"http://127.0.0.1:{args.port}/avatar/",
+                            кадров_в_секунду=args.avatar_fps)
+            съёмка.запустить()
+            srv.avatar.съёмка = съёмка
     srv.daemon_threads = True
     log.info("мозг на %s:%d | модель %s | распознавание %s | голос %s | "
              "сборка %s", args.host, args.port, args.model,

@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kuzya_pc                                          # noqa: E402
-from kuzya_pc import (Аватар, Config, Handler, Whisper,   # noqa: E402
+from kuzya_pc import (Аватар, Config, Handler, Съёмка, Whisper,   # noqa: E402
                       to_ollama_messages, to_ollama_tools)
 
 FAILED: list[str] = []
@@ -1081,11 +1081,133 @@ def test_avatar() -> None:
         srv.shutdown()
 
 
+def test_avatar_stream() -> None:
+    """/avatar/stream — кадры аватара роботу на экран, без браузера.
+
+    Сам headless-браузер здесь не поднимается: он про Playwright и Chrome, а
+    не про логику. Кадры кладём в Съёмку руками и проверяем ТО, что робот на
+    том конце увидит по HTTP: первый кадр, повтор при тишине (иначе робот
+    решит, что ПК пропал, и уйдёт в своё лицо), новый кадр, размер экрана.
+    """
+    section("поток аватара на экран робота")
+    import http.client
+    import json
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlsplit
+
+    ч = [0.0]
+    srv, url = serve(FakeOllama([]))
+    адрес = urlsplit(url)
+    первый_кадр_было = Handler.ПЕРВЫЙ_КАДР
+    Handler.ПЕРВЫЙ_КАДР = 0.3            # ждать двадцать секунд тут незачем
+    try:
+        def спросить(путь: str) -> tuple[int, bytes]:
+            с = http.client.HTTPConnection(адрес.hostname, адрес.port, timeout=5)
+            с.request("GET", путь)
+            ответ = с.getresponse()
+            тело = ответ.read()
+            с.close()
+            return ответ.status, тело
+
+        # Без Playwright съёмки нет — и робот должен узнать об этом сразу,
+        # словами, а не висеть на пустом ответе.
+        код, тело = спросить("/avatar/stream")
+        check("нет съёмки — 503, а не молчание", код, 503)
+        check("…и сказано, чего не хватает",
+              "playwright" in тело.decode("utf-8", "replace").lower(), True)
+
+        съёмка = Съёмка("")
+        srv.avatar.съёмка = съёмка
+        check("до первого запроса спроса нет — браузер не крутится впустую",
+              съёмка.спрос_есть(), False)
+
+        # Кадров ещё нет (браузер, допустим, только поднимается).
+        код, _ = спросить("/avatar/frame.jpg")
+        check("кадров ещё нет — 503", код, 503)
+        check("запрос робота — это спрос: теперь снимать надо",
+              съёмка.спрос_есть(), True)
+
+        первый = b"\xff\xd8first-frame\xff\xd9"
+        съёмка.положить(первый)
+        with urllib.request.urlopen(url + "/avatar/frame.jpg?w=1024&h=600",
+                                    timeout=5) as r:
+            check("frame.jpg — последний кадр как есть", r.read(), первый)
+            check("…с типом картинки", r.getheader("Content-Type"), "image/jpeg")
+        check("размер экрана робота из запроса — размер съёмки",
+              съёмка.размер, (1024, 600))
+
+        # Поток. Читаем в своём потоке: сервер отдаёт его бесконечно.
+        части: list[bytes] = []
+        готово = threading.Event()
+
+        def читать() -> None:
+            с = http.client.HTTPConnection(адрес.hostname, адрес.port, timeout=10)
+            с.request("GET", "/avatar/stream")
+            ответ = с.getresponse()
+            части.append(ответ.getheader("Content-Type", "").encode())
+            буфер = b""
+            while len(части) < 5:
+                кусок = ответ.read1(65536)
+                if not кусок:
+                    break
+                буфер += кусок
+                while True:
+                    н = буфер.find(b"\r\n\r\n")
+                    if н < 0:
+                        break
+                    длина = int([з for з in буфер[:н].split(b"\r\n")
+                                 if з.lower().startswith(b"content-length")][0].split(b":")[1])
+                    if len(буфер) < н + 4 + длина:
+                        break
+                    части.append(буфер[н + 4:н + 4 + длина])
+                    буфер = буфер[н + 4 + длина:]
+            с.close()
+            готово.set()
+
+        threading.Thread(target=читать, daemon=True).start()
+        # Новых кадров не кладём: первые части обязаны быть ПОВТОРОМ первого —
+        # страница без движения (или с застывшей моделью) не повод для
+        # робота считать ПК пропавшим.
+        срок = time.monotonic() + 5
+        while len(части) < 3 and time.monotonic() < срок:
+            time.sleep(0.05)
+        второй = b"\xff\xd8second-frame\xff\xd9"
+        съёмка.положить(второй)
+        готово.wait(5)
+        # По индексам через get: при сломанном пульсе поток обрывается после
+        # первого кадра, и частей меньше — это должно стать несходимостью
+        # с именем, а не IndexError без имени.
+        часть = lambda н: части[н] if len(части) > н else None   # noqa: E731
+        check("поток — multipart/x-mixed-replace",
+              (часть(0) or b"").startswith(b"multipart/x-mixed-replace"), True)
+        check("первая часть — первый кадр", часть(1), первый)
+        check("без новых кадров поток повторяет прежний (пульс), а не молчит",
+              часть(2), первый)
+        check("новый кадр доехал", второй in части[3:], True)
+    finally:
+        Handler.ПЕРВЫЙ_КАДР = первый_кадр_было
+        srv.shutdown()
+
+    # Робот замолчал — аватар спит, а не держит последнее живое лицо.
+    аватар = Аватар(часы=lambda: ч[0])
+    аватар.принять({"эмоция": "рад", "батарея": 11.3})
+    check("свежее состояние — как прислали", аватар.состояние()["эмоция"], "рад")
+    ч[0] += Аватар.СТАРЕЕТ + 1
+    с = аватар.состояние()
+    check("робот замолчал — аватар спит, а не застывает радостным",
+          (с["эмоция"], с["поза"]["метка"]), ("сплю", "спит"))
+    check("батарея сон переживает", с["батарея"], 11.3)
+
+
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
     for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_жилец_по_имени_что, test_warming, test_think_switch, test_model_choice,
                  test_tool_call, test_broken,
-                 test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health, test_avatar):
+                 test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health, test_avatar,
+                 test_avatar_stream):
         test()
         print("   ...")
     if FAILED:

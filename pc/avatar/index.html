@@ -15,15 +15,6 @@
 <body>
 <div id="беда"></div>
 
-<!--
-  Три чужих файла. Их порядок важен: Cubism Core — низкоуровневый движок
-  формата модели, pixi.js — то, чем это рисуется на экране, pixi-live2d-
-  display — мост между ними. Свой код — весь ниже, одним куском.
--->
-<script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.9/dist/browser/pixi.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
-
 <script>
 "use strict";
 /*
@@ -41,7 +32,42 @@ function показать(текст) {
   if (текст) console.error(текст);
 }
 
+/*
+ * Три чужих файла. Их порядок важен: Cubism Core — низкоуровневый движок
+ * формата модели, pixi.js — то, чем это рисуется на экране, pixi-live2d-
+ * display — мост между ними.
+ *
+ * Грузятся из кода, а не тегами <script src>: тег с чужого адреса держит
+ * первую отрисовку страницы, пока не загрузится, — и без интернета
+ * страница остаётся пустой и белой, не сказав ни слова. А эту страницу
+ * снимает headless-браузер на ПК и отдаёт роботу на экран: там пустота
+ * без объяснения — худшее, что можно показать. Так страница рисуется
+ * сразу, а чего не хватает — пишет сама.
+ */
+const СКРИПТЫ = [
+  "https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js",
+  "https://cdn.jsdelivr.net/npm/pixi.js@6.5.9/dist/browser/pixi.min.js",
+  "https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js",
+];
+function скрипт(адрес) {
+  return new Promise((готово, беда) => {
+    const s = document.createElement("script");
+    s.src = адрес;
+    s.onload = () => готово();
+    s.onerror = () => беда(new Error("не загрузился " + адрес));
+    document.head.appendChild(s);
+  });
+}
+
 async function главная() {
+  try {
+    for (const адрес of СКРИПТЫ) await скрипт(адрес);
+  } catch (e) {
+    показать("Нужен интернет: " + e.message +
+             "\nБиблиотеки Live2D и pixi.js берутся с их сайтов при каждом открытии.");
+    return;
+  }
+
   let настройки;
   try {
     const ответ = await fetch("config.json", { cache: "no-store" });
