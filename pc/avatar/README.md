@@ -39,13 +39,23 @@
 
 Если уже есть купленная или своя модель — то же самое, просто с ней.
 
-## Шаг 2. Настроить config.json
+## Шаг 2. Указать путь к модели — в config.local.json
 
-Открой `pc/avatar/config.json` и укажи путь к модели:
+Создай рядом с `config.json` файл `pc/avatar/config.local.json` с одной
+строкой (путь — к твоему `.model3.json` внутри `pc/avatar/`):
 
 ```json
-"модель": "model/Hiyori.model3.json"
+{ "модель": "model/mark_en/runtime/mark_free_t04.model3.json" }
 ```
+
+Сам `config.json` не трогай: он лежит в репозитории, и правка в нём
+ломает `git pull` («Your local changes … would be overwritten») — на живом
+ПК из-за этого три часа крутился старый код. `config.local.json` git не
+видит, а сервер накладывает его поверх общего сам. Если `config.json` уже
+правил — верни его: `git checkout -- pc/avatar/config.json`.
+
+Открой `http://127.0.0.1:4000/avatar/config.json` — в ответе должен быть
+твой путь.
 
 Остальное можно не трогать: имена параметров (`ParamMouthOpenY` и т.д.) —
 стандартные для редактора Cubism, у большинства готовых моделей они именно

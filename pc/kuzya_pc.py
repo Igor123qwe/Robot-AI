@@ -2237,6 +2237,8 @@ class Handler(BaseHTTPRequestHandler):
                          "туда нужно положить страницу и модель самому, один раз"})
             return
         тело = файл.read_bytes()
+        if хвост == "config.json":
+            тело = self._настройки_с_местными(тело)
         self.send_response(200)
         self.send_header("Content-Type",
                          АВАТАР_ТИПЫ.get(файл.suffix.lower(), "application/octet-stream"))
@@ -2244,6 +2246,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(тело)
+
+    def _настройки_с_местными(self, тело: bytes) -> bytes:
+        """config.json плюс config.local.json поверх — своё отдельно от общего.
+
+        Путь к модели у каждого свой, а config.json лежит в репозитории. На
+        живом ПК из-за этого не проходил git pull: «Your local changes to
+        pc/avatar/config.json would be overwritten» — и ПК три часа крутил
+        старый код, а на экране робота не появлялся персонаж. Своё теперь в
+        config.local.json (его git не видит), и pull больше ни с чем не спорит.
+        """
+        местный = self.АВАТАР_ПАПКА / "config.local.json"
+        if not местный.is_file():
+            return тело
+        try:
+            общее = json.loads(тело.decode("utf-8"))
+            своё = json.loads(местный.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            log.warning("аватар: config.local.json не разобрался (%s) — беру общий", e)
+            return тело
+        for ключ, значение in своё.items():
+            # Словари («параметры», «эмоции») дополняем, остальное заменяем.
+            if isinstance(значение, dict) and isinstance(общее.get(ключ), dict):
+                общее[ключ] = {**общее[ключ], **значение}
+            else:
+                общее[ключ] = значение
+        return json.dumps(общее, ensure_ascii=False).encode("utf-8")
 
     def _avatar_post(self) -> None:
         try:

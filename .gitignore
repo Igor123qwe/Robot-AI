@@ -4,6 +4,10 @@ secrets/
 *.key
 wpa_supplicant*.conf
 
+# Аватар на ПК: своя модель Live2D и свой путь к ней — не в репозитории
+pc/avatar/model/
+pc/avatar/config.local.json
+
 # Python
 __pycache__/
 *.py[cod]

@@ -1054,6 +1054,27 @@ def test_avatar() -> None:
               "робота (говорит → рот приоткрыт хоть иногда)",
               "рот" in данные.get("поза", {}), True)
 
+        # Своё — в config.local.json поверх общего config.json: путь к модели
+        # у каждого свой, а правка общего файла ломала git pull на живом ПК.
+        местный = Handler.АВАТАР_ПАПКА / "config.local.json"
+        было = местный.read_text(encoding="utf-8") if местный.exists() else None
+        try:
+            местный.write_text(json.dumps({"модель": "model/своя.model3.json",
+                                           "параметры": {"рот": "MyMouth"}},
+                                          ensure_ascii=False), encoding="utf-8")
+            with urllib.request.urlopen(url + "/avatar/config.json", timeout=5) as r:
+                настройки = json.loads(r.read().decode("utf-8"))
+            check("config.local.json поверх config.json: свой путь к модели",
+                  настройки["модель"], "model/своя.model3.json")
+            check("…словари дополняются, а не заменяются целиком",
+                  (настройки["параметры"]["рот"], настройки["параметры"]["взгляд_x"]),
+                  ("MyMouth", "ParamAngleX"))
+        finally:
+            if было is None:
+                местный.unlink(missing_ok=True)
+            else:
+                местный.write_text(было, encoding="utf-8")
+
         # Модель (.model3.json) каждый кладёт сам — см. pc/avatar/README.md;
         # пока её нет, отсутствующий файл обязан дать понятную ошибку, а не
         # тихо промолчать пустым экраном без единого объяснения.
