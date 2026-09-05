@@ -41,6 +41,13 @@ PYEOF
 if [ ! -f "$FONT" ]; then
   sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 fonts-dejavu-core
 fi
+# Колесо pygame везёт свой SDL, но libdrm и libgbm SDL грузит с системы — без
+# них kmsdrm «недоступен», и это одно слово на все причины разом. Пакеты
+# крохотные; ставим, если нет.
+if ! ldconfig -p | grep -q "libgbm.so.1" || ! ldconfig -p | grep -q "libdrm.so.2"; then
+  echo "==> ставлю libdrm2 libgbm1 — без них SDL не откроет DRM"
+  sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 libdrm2 libgbm1 || true
+fi
 
 if sdl_ok; then
   echo "==> pygame с годным SDL уже стоит"
@@ -102,6 +109,10 @@ if systemctl is-active --quiet robot-face; then
   echo "==> robot-face работает. Журнал: journalctl -u robot-face -f"
   echo "    В нём раз в минуту строка «лицо: N к/с» — это проверка №1 из docs/screen.md."
 else
-  echo "!! robot-face не поднялась. Смотреть: journalctl -u robot-face -n 50"
+  echo "!! robot-face не поднялась. Журнал: journalctl -u robot-face -n 50"
+  echo "==> разбираю, почему SDL не открывает экран:"
+  sudo systemctl stop robot-face
+  python3 "$REPO/face/diag.py" || true
+  sudo systemctl start robot-face
   exit 1
 fi

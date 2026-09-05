@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
@@ -484,29 +485,54 @@ class Яркость:
 
 # --- главный цикл -------------------------------------------------------------
 def _открыть_экран() -> pygame.Surface:
-    """kmsdrm → fbcon → любой. Ошибка каждого пишется, а не глотается."""
-    pygame.display.init()
+    """kmsdrm по каждой карте → fbcon → любой. Ошибка каждого пишется.
+
+    ОШИБКА, КОТОРАЯ ТУТ БЫЛА: первый `display.init()` стоял ДО цикла, и на
+    роботе он и падал — до запасных вариантов дело не доходило вовсе, а в
+    журнале было одно «kmsdrm not available» без перебора. Теперь init —
+    внутри каждой попытки.
+
+    Карт может быть несколько (/dev/dri/card0, card1…), и SDL по умолчанию
+    берёт нулевую. На плате с двумя DRM-устройствами панель может висеть на
+    второй — перебираем индексы. Честно: что не открылось и почему, — в
+    журнал, по строке на попытку; общий вердикт SDL «недоступно» ничего не
+    объясняет, подробнее — python3 face/diag.py.
+    """
     pygame.font.init()
-    попытки = [os.environ.get("SDL_VIDEODRIVER", "kmsdrm"), "fbcon", ""]
+    попытки: list[tuple[str, str | None]] = []
+    хотели = os.environ.get("SDL_VIDEODRIVER", "kmsdrm")
+    if хотели == "kmsdrm":
+        карт = len(glob.glob("/dev/dri/card*")) or 1
+        попытки += [("kmsdrm", str(i)) for i in range(карт)]
+    else:
+        попытки.append((хотели, None))
+    попытки += [("fbcon", None), ("", None)]
     последняя = None
-    for драйвер in попытки:
+    for драйвер, карта in попытки:
         try:
             if драйвер:
                 os.environ["SDL_VIDEODRIVER"] = драйвер
             else:
                 os.environ.pop("SDL_VIDEODRIVER", None)
+            if карта is not None:
+                os.environ["SDL_KMSDRM_DEVICE_INDEX"] = карта
+            else:
+                os.environ.pop("SDL_KMSDRM_DEVICE_INDEX", None)
             pygame.display.quit()
             pygame.display.init()
             флаги = pygame.FULLSCREEN if драйвер != "dummy" else 0
             экран = pygame.display.set_mode((0, 0), флаги)
             print(f"лицо: экран {экран.get_width()}×{экран.get_height()} через "
-                  f"{драйвер or 'SDL по умолчанию'}", flush=True)
+                  f"{драйвер or 'SDL по умолчанию'}"
+                  f"{f' (card{карта})' if карта is not None else ''}", flush=True)
             return экран
         except pygame.error as e:
             последняя = e
-            print(f"лицо: драйвер {драйвер or 'по умолчанию'} не открылся: {e}",
+            print(f"лицо: {драйвер or 'драйвер по умолчанию'}"
+                  f"{f' card{карта}' if карта is not None else ''} не открылся: {e}",
                   flush=True)
-    raise SystemExit(f"лицо: экран не открылся ({последняя})")
+    raise SystemExit(f"лицо: экран не открылся ({последняя}). "
+                     f"Разобраться: python3 face/diag.py")
 
 
 def главный() -> int:
