@@ -54,4 +54,4 @@ jobs:
 
       - name: Скрипты установки
         # Опечатка в них выясняется только на живом роботе, посреди установки.
-        run: bash -n scripts/install.sh scripts/setup_voice.sh scripts/setup_face.sh scripts/update.sh
+        run: bash -n scripts/install.sh scripts/setup_voice.sh scripts/setup_face.sh scripts/setup_screenshot_sudo.sh scripts/update.sh
