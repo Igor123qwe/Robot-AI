@@ -251,8 +251,9 @@ ReSpeaker: это ничего не стоит и ничего не закрыв
 экран уедет на мачту (§3 в `docs/screen.md`).
 
 Лицо: служба `robot-face`, ставится `bash scripts/setup_face.sh`. Ей нужны
-`python3-pygame` из apt, группы `video,render` и включённая в `srpi-config`
-панель. Состояние приходит файлом `/run/robot-ai/face.json` от голосовой
+pygame **с PyPI** (не из apt: системный SDL 2.0.20 на этом образе падает при
+открытии экрана с `undefined symbol: _udev_device_get_action`, колесо везёт
+свой SDL 2.28), группы `video,render` и включённая в `srpi-config` панель. Состояние приходит файлом `/run/robot-ai/face.json` от голосовой
 службы; нет файла или он старше секунды — лицо спит.
 
 **Рабочий стол выключен намеренно.** Образ RDK X5 поднимал на панели X через

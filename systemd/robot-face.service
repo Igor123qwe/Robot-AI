@@ -29,6 +29,7 @@ EnvironmentFile=-/home/wheeltec/.robot-ai.env
 Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=SDL_AUDIODRIVER=dummy
 Environment=PYTHONUNBUFFERED=1
+Environment=PYGAME_HIDE_SUPPORT_PROMPT=1
 ExecStart=/usr/bin/python3 /home/wheeltec/Robot-AI/face/face.py
 # Упало — поднимаем. Запрет №1 из docs/screen.md: замершее лицо хуже отказа.
 Restart=always

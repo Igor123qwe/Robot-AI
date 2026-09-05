@@ -9,51 +9,52 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "==> лицо робота: ставлю зависимости"
-# pygame из apt, а не из pip: колесо под aarch64 тянет сборку SDL, а системный
-# pygame 2.1 уже собран с SDL2 и умеет kmsdrm. Шрифт — DejaVu, у него есть
-# кириллица; без него подпись «слушаю» превратится в квадратики.
-#
-# `apt-get update` НЕ ЗОВЁМ ПЕРВЫМ ДЕЛОМ, и это урок с живого робота. В
-# источниках образа WHEELTEC стоят зеркала D-Robotics, которые из России
-# отвечают минутами или никак, а с `-qq` это выглядело как повисший скрипт.
-# Порядок: если всё уже стоит — не трогаем apt вовсе; иначе ставим из тех
-# списков, что есть; и только если пакета в них нет — обновляем, с пределом
-# по времени и с выводом на экран, чтобы было видно, на каком зеркале стоим.
+# Шрифт — DejaVu, у него есть кириллица; без него подпись «слушаю» превратится
+# в квадратики. Он в базовом образе, но проверяем, а не предполагаем.
 FONT=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
-have_pygame() { python3 -c "import pygame" 2>/dev/null; }
+export PYGAME_HIDE_SUPPORT_PROMPT=1
 
-# --no-install-recommends — не экономия, а необходимость. Без него apt тянет
-# libsdl2-mixer, а с ним timgm6mb-soundfont на пять мегабайт из семи: звуковой
-# шрифт для микшера, который лицу не нужен вовсе (звук у службы выключен).
-# На зеркале Tsinghua из России это 1.4 КБ/с и обрыв по таймауту — проверено.
-# Retries — потому что обрывается оно не всегда, и второй раз докачивает.
-APT_INSTALL="sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3"
+# pygame — С PyPI, А НЕ ИЗ APT, и это выяснилось на живом роботе. Системный
+# python3-pygame 2.1.2 собран с SDL 2.0.20, а тот на arm64 Ubuntu 22.04 при
+# открытии экрана падает с «undefined symbol: _udev_device_get_action»: ищет
+# символ libudev с лишним подчёркиванием в самом себе. Известная беда SDL
+# 2.0.20; чинится только другим SDL. Колесо pygame с PyPI везёт свой SDL 2.28 —
+# ровно тот, на котором проверки гонялись в сборщике. Поэтому мерило не
+# «pygame импортируется», а «SDL не старше 2.24».
+#
+# Ставим в пользователя: служба идёт от /usr/bin/python3 под wheeltec, а
+# пользовательские пакеты в sys.path стоят РАНЬШЕ системных — колесо перекроет
+# сломанный системный pygame, не трогая его.
+sdl_ok() {
+  python3 - <<'PYEOF'
+import sys
+try:
+    import pygame
+except ImportError:
+    sys.exit(1)
+maj, mi, _ = pygame.get_sdl_version()
+print(f"    pygame {pygame.version.ver}, SDL {maj}.{mi}")
+sys.exit(0 if (maj, mi) >= (2, 24) else 2)
+PYEOF
+}
 
-if have_pygame && [ -f "$FONT" ]; then
-  echo "==> pygame и шрифт уже стоят, apt не трогаю"
-elif $APT_INSTALL python3-pygame fonts-dejavu-core; then
-  echo "==> поставил из имеющихся списков"
-else
-  echo "==> apt не смог (зеркало не отвечает или пакета нет в списках)"
-  # Шрифт почти наверняка уже есть — он в базовом образе. Проверяем, а не
-  # предполагаем: без него подпись превратится в квадратики.
-  [ -f "$FONT" ] || $APT_INSTALL fonts-dejavu-core || true
-  # Колесо pygame с PyPI: у него свой CDN, из России он обычно отвечает, и в
-  # колесе 2.6 SDL2 собран с kmsdrm. Ставим в пользователя — служба идёт от
-  # /usr/bin/python3 под wheeltec и пользовательские пакеты видит.
-  echo "==> пробую колесо с PyPI: pip3 install --user pygame"
-  if ! python3 -m pip --version >/dev/null 2>&1; then
-    $APT_INSTALL python3-pip || true
-  fi
-  python3 -m pip install --user --disable-pip-version-check pygame
+if [ ! -f "$FONT" ]; then
+  sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 fonts-dejavu-core
 fi
 
-if ! have_pygame; then
-  echo "!! pygame так и не встал. Варианты:"
-  echo "   1) повторить скрипт — зеркало могло просто отвалиться на минуту;"
-  echo "   2) сменить зеркало apt на ближнее (mirror.yandex.ru/ubuntu-ports) —"
-  echo "      это правка /etc/apt/sources.list, скажи, и я подготовлю."
-  exit 1
+if sdl_ok; then
+  echo "==> pygame с годным SDL уже стоит"
+else
+  echo "==> ставлю колесо pygame с PyPI (свой SDL 2.28)"
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 python3-pip
+  fi
+  python3 -m pip install --user --upgrade --disable-pip-version-check pygame
+  if ! sdl_ok; then
+    echo "!! pygame с SDL >= 2.24 так и не встал — лицо экран не откроет."
+    echo "   Проверить руками: python3 -c 'import pygame; print(pygame.get_sdl_version())'"
+    exit 1
+  fi
 fi
 if [ ! -f "$FONT" ]; then
   echo "!! шрифта DejaVu нет — кириллица на экране не отрисуется"
