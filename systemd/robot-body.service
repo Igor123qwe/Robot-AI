@@ -1,0 +1,23 @@
+[Unit]
+Description=Robot-AI: детектор людей на BPU и раздача картинки (порт 8080)
+After=network.target
+# Раньше пульта намеренно: камерой владеет этот узел, а пульт берёт картинку
+# у него. Стартуй они наоборот, пульт успел бы схватить /dev/video0 первым, и
+# детектор упал бы с «terminate called after throwing an instance of char*» —
+# без единого слова о том, что устройство занято.
+Before=robot-web.service
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/home/wheeltec/Robot-AI
+EnvironmentFile=-/home/wheeltec/.robot-ai.env
+ExecStart=/bin/bash /home/wheeltec/Robot-AI/scripts/body_service.sh
+Restart=always
+# Пятнадцать секунд, а не пять: узел поднимает модель на BPU и открывает
+# камеру, и перезапуск чаще этого превращается в бесконечную карусель, если
+# камера занята чем-то посторонним.
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

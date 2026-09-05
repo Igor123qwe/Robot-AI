@@ -9,3 +9,7 @@ Type=oneshot
 # запускается от владельца репозитория — у root нет ssh-ключа для GitHub.
 WorkingDirectory=/home/wheeltec/Robot-AI
 ExecStart=/bin/bash /home/wheeltec/Robot-AI/scripts/update.sh
+# У Type=oneshot таймаута по умолчанию нет вовсе. Один зависший проход — и
+# таймер больше не запустит новый, потому что старый ещё «активен»:
+# обновления перестанут приезжать до перезагрузки, ни строчкой не пожаловавшись.
+TimeoutStartSec=120

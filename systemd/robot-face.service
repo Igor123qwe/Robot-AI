@@ -1,0 +1,41 @@
+[Unit]
+Description=Robot-AI: лицо робота на экране (DSI, без X)
+# Лицо не зависит от голосовой службы намеренно: нет файла состояния —
+# рисует «сплю». Зависимость сделала бы экран заложником голоса, а экран
+# как раз и нужен, чтобы видеть, что голос упал.
+After=systemd-user-sessions.service
+# Экран один, и консольный getty на нём мигал бы курсором поверх лица.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+# ГЛАВНОЕ. Образ RDK X5 поднимает на панели X через lightdm (и x11vnc к нему).
+# X — DRM-мастер card0, и пока он жив, SDL через kmsdrm экран не откроет:
+# второго хозяина у панели не бывает, а /dev/fb* на этом ядре нет вовсе, так
+# что запасного пути тоже нет. Проверено на живом роботе: 62 перезапуска по
+# кругу. Роботу рабочий стол не нужен — экран отдаём лицу. Conflicts= значит,
+# что при старте лица systemd сам остановит lightdm; чтобы он не поднимался
+# после перезагрузки, setup_face.sh его ещё и выключает (обратимо одной
+# командой, см. там).
+Conflicts=lightdm.service x11vnc.service
+After=lightdm.service
+
+[Service]
+Type=simple
+User=wheeltec
+# DRM и фреймбуфер выдаются группами video/render; input — на будущее, под тач.
+SupplementaryGroups=video render input
+WorkingDirectory=/home/wheeltec/Robot-AI/face
+EnvironmentFile=-/home/wheeltec/.robot-ai.env
+# Прямо в DRM, без X. Звук не трогаем: у карты уже есть хозяин.
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=SDL_AUDIODRIVER=dummy
+Environment=PYTHONUNBUFFERED=1
+Environment=PYGAME_HIDE_SUPPORT_PROMPT=1
+ExecStart=/usr/bin/python3 /home/wheeltec/Robot-AI/face/face.py
+# Упало — поднимаем. Запрет №1 из docs/screen.md: замершее лицо хуже отказа.
+Restart=always
+RestartSec=3
+# Лицо не имеет права мешать зрению и голосу: ниже них по приоритету.
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

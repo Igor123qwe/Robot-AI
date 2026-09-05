@@ -30,14 +30,29 @@ IP Webcam умеет только отдавать звук, но не прин�
   POST /listen        ← вкладка шлёт сырой PCM 16 кГц с микрофона
   /listen/stream      → голосовой пайплайн забирает его потоком
   /listen/status      → JSON: идёт ли звук
+
+Четвёртое — музыка. Радио это бесконечный поток, а трек из Яндекса кончается,
+и следующий ставит робот: только у него есть очередь и ключ, а ссылки живут
+минуты, так что отдать пульту плейлист вперёд нельзя.
+
+  POST /speak/radio   ← адрес потока; пустое тело — выключить всё
+  POST /speak/track   ← одна песня: {"адрес": …, "название": …}
+  POST /speak/volume  ← громкость музыки, 0–1
+  POST /music/ended   ← пульт: песня кончилась или не пошла
+  /music/state        → JSON: сколько песен доиграно
 """
 
 from __future__ import annotations
 
+import io
 import ipaddress
 import json
 import os
 import queue
+import re
+import socket
+import subprocess
+import ssl
 import sys
 import threading
 import time
@@ -47,15 +62,45 @@ import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import camera as камера_модуль
+import tls
+import wsproxy
+
 WEB_DIR = Path(__file__).resolve().parent
 PORT = int(os.environ.get("ROBOT_WEB_PORT", "8000"))
+# Второй вход, по https: браузер пускает к микрофону только
+# в защищённом контексте, и с телефона обычного http не хватает.
+# Ноль — не поднимать вовсе.
+TLS_PORT = int(os.environ.get("ROBOT_WEB_TLS_PORT", "8443"))
 DEFAULT_PHONE = os.environ.get("ROBOT_PHONE_URL", "http://192.168.3.9:8080").rstrip("/")
+
+# Откуда брать картинку: usb — камера робота, phone — телефон с IP Webcam,
+# пусто — сама разберётся (есть камера в роботе, значит она; нет — телефон).
+# Явная настройка нужна ровно для одного случая: камера воткнута, но смотреть
+# надо с телефона, потому что он стоит в другой комнате.
+CAMERA_SOURCE = os.environ.get("ROBOT_CAMERA", "").strip().lower()
+КАМЕРА = камера_модуль.Камера()
+
+
+def камера_робота() -> bool:
+    """Показывать ли свою камеру вместо телефонной."""
+    if CAMERA_SOURCE == "usb":
+        return True
+    if CAMERA_SOURCE == "phone":
+        return False
+    return КАМЕРА.доступна()
 
 # Сколько ждать телефон, прежде чем признать его недоступным.
 CONNECT_TIMEOUT = 5
 
 # Реплики держим в памяти: они живут секунды, писать их на флешку незачем.
 CLIP_LIMIT = 12
+
+# Сколько ждём, пока строка keepalive уйдёт подписчику. Без этого мёртвая
+# вкладка числится живой около пятнадцати минут — столько TCP повторяет
+# отправку, прежде чем сдаться. Десяти секунд хватает любой живой сети, а
+# мёртвая отваливается сразу.
+SSE_WRITE_TIMEOUT = 10.0
 MAX_CLIP_BYTES = 8 * 1024 * 1024
 # Кусок звука с микрофона компьютера: полсекунды при 16 кГц — 16 КБ.
 MAX_MIC_CHUNK = 256 * 1024
@@ -144,7 +189,35 @@ class MicRelay:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._listeners: set[queue.Queue] = set()
-        self._last_chunk = 0.0
+        # Минус бесконечность, а не ноль: monotonic() идёт от загрузки машины,
+        # и с нулём первые секунды после включения выглядели бы как «кусок
+        # только что приходил».
+        self._last_chunk = float("-inf")
+        # Чья сейчас очередь говорить в микрофон и кому мы уже отказали:
+        # второе — только чтобы не писать одну и ту же строку в лог сто раз
+        # в секунду.
+        self._owner = ""
+        self._refused = ""
+
+    # Сколько ждать молчания прежней вкладки, прежде чем отдать микрофон
+    # новой. Вкладку закрывают, обновляют, переоткрывают — и если держаться за
+    # ушедшую, робот оглохнет до перезапуска сервера.
+    HANDOVER = 3.0
+
+    def take(self, кто: str) -> bool:
+        """Занимает микрофон. False — им уже пользуется другая вкладка."""
+        with self._lock:
+            свежо = time.monotonic() - self._last_chunk < self.HANDOVER
+            if self._owner and self._owner != кто and свежо:
+                if кто != self._refused:
+                    self._refused = кто
+                    print(f"микрофон занят вкладкой {self._owner[:8]} — "
+                          f"отказал {кто[:8]}", flush=True)
+                return False
+            if self._owner != кто:
+                print(f"микрофон теперь у вкладки {кто[:8]}", flush=True)
+                self._owner = кто
+            return True
 
     def push(self, data: bytes) -> None:
         with self._lock:
@@ -172,8 +245,41 @@ class MicRelay:
             return time.monotonic() - self._last_chunk < 3.0
 
 
+class TrackCount:
+    """Сколько песен пульт доиграл. Единственный канал пульт → голос.
+
+    Радио — поток, он не кончается; трек кончается всегда, и кто-то должен
+    поставить следующий. Ставит его голосовой процесс: только у него есть
+    очередь и ключ к Яндексу, а ссылки живут минуты, так что отдать пульту
+    плейлист вперёд нельзя.
+
+    Обратного канала от пульта к голосу нет вовсе: пульт разговаривает с этим
+    сервером, сервер шлёт пульту SSE, голос ходит сюда запросами. Заводить
+    ради одного события четвёртый канал дороже, чем раз в секунду спросить
+    число, — поэтому здесь просто счётчик.
+
+    Ошибка проигрывания считается так же, как конец: битая ссылка не должна
+    останавливать вечер, следующий трек её переживёт.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._done = 0
+
+    def done(self) -> int:
+        with self._lock:
+            self._done += 1
+            return self._done
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._done
+
+
 SPEECH = SpeechQueue()
 MIC = MicRelay()
+TRACKS = TrackCount()
 
 
 def _is_home_address(host: str) -> bool:
@@ -220,6 +326,30 @@ class Handler(SimpleHTTPRequestHandler):
         self.path = "/pult.html"
         return SimpleHTTPRequestHandler.send_head(self)
 
+    def send_head(self):
+        """Пульт браузеру кэшировать нельзя.
+
+        Робот подтягивает обновления с гитхаба каждые две минуты, а вкладка
+        держит страницу открытой часами. Браузер честно берёт её из кэша — и
+        человек видит вчерашний пульт при сегодняшнем роботе. На живом доме на
+        это ушёл вечер: сервер уже умел включать радио, страница ещё нет, и в
+        логах всё выглядело исправным.
+        """
+        путь = self.path.partition("?")[0]
+        if путь.endswith((".html", "/")) or путь == "":
+            self.send_response(200)
+            try:
+                тело = (WEB_DIR / "pult.html").read_bytes()
+            except OSError:
+                self.send_error(404, "нет пульта")
+                return None
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(тело)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return io.BytesIO(тело)
+        return SimpleHTTPRequestHandler.send_head(self)
+
     def do_GET(self):
         path, _, query = self.path.partition("?")
         # Сравниваем раскодированный путь: иначе /server%2Epy проходит мимо
@@ -227,18 +357,44 @@ class Handler(SimpleHTTPRequestHandler):
         if urllib.parse.unquote(path).endswith(".py"):
             self.fail(404, "нет такой страницы")
             return
+        # Мостик до rosbridge. Нужен из-за https: страница по https не имеет
+        # права открыть ws:// — браузер молча блокирует это как смешанное
+        # содержимое, и джойстик на телефоне перестал бы двигать робота.
+        if path == "/ros" and wsproxy.это_вебсокет(self.headers):
+            self.close_connection = True
+            wsproxy.проводить(self.connection, self.headers)
+            return
         if path == "/camera":
-            self.proxy_stream(phone_base(query) + "/video")
+            if камера_робота():
+                self.поток_камеры()
+            else:
+                self.proxy_stream(phone_base(query) + "/video")
         elif path == "/camera/snapshot":
-            self.proxy_once(phone_base(query) + "/shot.jpg")
+            if камера_робота():
+                self.снимок_камеры()
+            else:
+                self.proxy_once(phone_base(query) + "/shot.jpg")
         elif path == "/camera/status":
-            self.camera_status(phone_base(query))
+            if камера_робота():
+                self.состояние_камеры()
+            else:
+                self.camera_status(phone_base(query))
         elif path == "/speak/events":
             self.speak_events(query)
         elif path == "/listen/stream":
             self.listen_stream()
         elif path == "/listen/status":
             self.send_json({"live": MIC.live})
+        elif path == "/tof":
+            self.сетка_дальномера()
+        elif path == "/map":
+            self.карта_вокруг()
+        elif path == "/flat":
+            self.план_квартиры()
+        elif path == "/tof/aim":
+            self.send_json(прицел())
+        elif path == "/music/state":
+            self.send_json({"кончилось": TRACKS.count})
         elif path.startswith("/speak/") and path.endswith(".wav"):
             self.speak_clip(path[len("/speak/"):-len(".wav")])
         else:
@@ -255,11 +411,63 @@ class Handler(SimpleHTTPRequestHandler):
                 self.close_connection = True
                 self.fail(400, "пустой или слишком большой кусок звука")
                 return
-            MIC.push(self.rfile.read(length))
+            кусок = self.rfile.read(length)
+            # Микрофон может быть только один. Две открытые вкладки шлют звук
+            # в один буфер, куски перемешиваются, и распознавание выдаёт
+            # «Кукузи — это что-то заразило» вместо «Кузя, включи музыку». На
+            # живом доме на это ушёл вечер: в логе всё исправно, а робот
+            # оглох. Кто пришёл раньше — тот и микрофон; остальным честный
+            # отказ, и они перестают слушать.
+            кто = self.headers.get("X-Mic-Id") or self.client_address[0]
+            if not MIC.take(кто):
+                self.fail(409, "микрофоном уже занята другая вкладка")
+                return
+            MIC.push(кусок)
             self.send_json({"ok": True})
             return
 
-        if path not in ("/speak", "/speak/stop", "/speak/heard", "/speak/status"):
+        if path == "/music/ended":
+            # Пульт доиграл песню (или не смог её начать) и просит следующую.
+            # Приходит из браузера, то есть не с локалхоста, — проверка ниже
+            # сюда не распространяется намеренно, как и у микрофона.
+            self.rfile.read(max(0, min(int(self.headers.get("Content-Length") or 0),
+                                       1024)))
+            self.send_json({"кончилось": TRACKS.done()})
+            return
+
+        if path == "/tof/aim":
+            # Куда в кадре смотрит сетка и как она развёрнута. Настраивается
+            # глазами в пульте: калибровочной доски у нас нет, а точность до
+            # пикселя тут и не нужна — зона дальномера это конус шириной с
+            # ладонь на метре.
+            #
+            # Стоит ВЫШЕ проверки «только с самого робота», и это не
+            # небрежность, а суть: пульт живёт в браузере на компьютере
+            # человека, то есть как раз не на роботе. Ниже эта ручка была
+            # недостижима в принципе — ровно та ошибка, которую человек видит
+            # как «не вышло: 400» и не может объяснить. Речь тут не идёт ни о
+            # движении, ни о голосе: это четыре числа и две галки про то, как
+            # рисовать сетку.
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(max(0, min(length, 512))).decode("utf-8", "replace")
+            try:
+                пришло = json.loads(body or "{}")
+                новый = {к: float(пришло[к]) for к in ("x", "y", "ш", "в")}
+            except (ValueError, KeyError, TypeError):
+                self.fail(400, "нужны числа x, y, ш, в — доли кадра")
+                return
+            if not all(0.0 <= з <= 1.0 for з in новый.values()):
+                self.fail(400, "доли кадра — от нуля до единицы")
+                return
+            новый["зеркало"] = bool(пришло.get("зеркало"))
+            новый["вверхногами"] = bool(пришло.get("вверхногами"))
+            новый["поперёк"] = bool(пришло.get("поперёк"))
+            записать_прицел(новый)
+            self.send_json({"ok": True, "прицел": новый})
+            return
+
+        if path not in ("/speak", "/speak/stop", "/speak/heard", "/speak/status",
+                        "/speak/radio", "/speak/track", "/speak/volume"):
             self.fail(404, "нет такой ручки")
             return
         # Говорить роботом может только сам робот, не любое устройство в сети.
@@ -274,6 +482,43 @@ class Handler(SimpleHTTPRequestHandler):
             # «Замолчи»: реплики уже в очереди вкладки, сам робот их оттуда
             # не достанет — просит пульт бросить очередь.
             SPEECH.broadcast({"stop": True})
+            self.send_json({"ok": True})
+            return
+
+        if path == "/speak/radio":
+            # Радио играет сама вкладка: у робота своего динамика пока нет, а
+            # браузер тянет поток без нашего участия. Робот только называет
+            # адрес — и он же велит замолчать, прислав пустое тело.
+            body = self.rfile.read(max(0, min(length, 4096))).decode("utf-8", "replace")
+            SPEECH.broadcast({"radio": body})
+            self.send_json({"ok": True})
+            return
+
+        if path == "/speak/track":
+            # Одна песня из Яндекса. От потока отличается тем, что кончается:
+            # пульт обязан сказать об этом на /music/ended, иначе следующую
+            # никто не поставит.
+            body = self.rfile.read(max(0, min(length, 8192))).decode("utf-8", "replace")
+            try:
+                трек = json.loads(body)
+            except ValueError:
+                self.fail(400, "трек не разобрался")
+                return
+            SPEECH.broadcast({"трек": {"адрес": трек.get("адрес") or "",
+                                       "название": трек.get("название") or ""}})
+            self.send_json({"ok": True})
+            return
+
+        if path == "/speak/volume":
+            # Громкость музыки, не голоса: голос робот делает тише сам, ещё
+            # до синтеза, а поток играет вкладка и про робота ничего не знает.
+            body = self.rfile.read(max(0, min(length, 32))).decode("utf-8", "replace")
+            try:
+                доля = min(1.0, max(0.0, float(body.strip() or 0.7)))
+            except ValueError:
+                self.fail(400, "громкость не число")
+                return
+            SPEECH.broadcast({"громкость": доля})
             self.send_json({"ok": True})
             return
 
@@ -307,6 +552,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
+        # Обрыв без FIN — крышку ноутбука закрыли, Wi-Fi пропал, телефон
+        # уснул — запись в сокет не падает: семнадцать байт keepalive спокойно
+        # ложатся в буфер ядра, и ошибка приходит только когда TCP исчерпает
+        # ретрансмиссии, то есть минут через пятнадцать. Всё это время робот
+        # считает вкладку слушателем: синтезирует реплику, честно ждёт конца
+        # звучания и не повторяет таймер, который никто не слышал.
+        try:
+            self.connection.settimeout(SSE_WRITE_TIMEOUT)
+        except OSError:
+            pass
         try:
             while True:
                 try:
@@ -320,7 +575,7 @@ class Handler(SimpleHTTPRequestHandler):
                     payload = ": keepalive\n\n"   # чтобы соединение не уснуло
                 self.wfile.write(payload.encode())
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass
         finally:
             SPEECH.unsubscribe(q)
@@ -394,6 +649,62 @@ class Handler(SimpleHTTPRequestHandler):
             upstream.close()
         self.close_connection = True
 
+    # --- своя камера ----------------------------------------------------
+    # Граница кадров в multipart-потоке. Значение произвольное, важно лишь,
+    # чтобы оно не встречалось внутри данных, — для двоичного JPEG это так.
+    #
+    # И только латиница. Заголовки HTTP кодируются в latin-1, и русская буква
+    # роняет отправку целиком: браузер получает обрыв вместо картинки, а в
+    # журнале — ничего внятного. В этом проекте на те же грабли наступали уже
+    # трижды (имя в адресе, User-Agent, заголовок X-Voice), и вот четвёртый.
+    ГРАНИЦА = "frame"
+
+    def снимок_камеры(self) -> None:
+        """Один кадр со своей камеры."""
+        кадр = КАМЕРА.кадр()
+        if not кадр:
+            self.fail(503, КАМЕРА.беда or "камера не отдала кадр")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(кадр)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(кадр)
+
+    def поток_камеры(self) -> None:
+        """Кадры своей камеры в том же виде, в каком их отдаёт телефон.
+
+        Формат тот же самый не случайно: пульт показывает картинку обычным
+        <img>, и ему всё равно, кто на том конце. Значит переезд на свою
+        камеру не требует ни строчки в pult.html.
+        """
+        первый = КАМЕРА.кадр()
+        if not первый:
+            self.fail(503, КАМЕРА.беда or "камера не отдала кадр")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type",
+                         f"multipart/x-mixed-replace; boundary={self.ГРАНИЦА}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            for кадр in КАМЕРА.поток():
+                self.wfile.write(
+                    f"--{self.ГРАНИЦА}\r\nContent-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(кадр)}\r\n\r\n".encode())
+                self.wfile.write(кадр)
+                self.wfile.write(b"\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # зритель закрыл вкладку — это норма
+        self.close_connection = True
+
+    def состояние_камеры(self) -> None:
+        живая = bool(КАМЕРА.кадр(ждать=2.0))
+        self.send_json({"source": f"робот: {КАМЕРА.устройство}",
+                        "online": живая,
+                        "detail": "ok" if живая else (КАМЕРА.беда or "нет кадра")})
+
     def proxy_once(self, url: str) -> None:
         try:
             with urllib.request.urlopen(url, timeout=CONNECT_TIMEOUT) as upstream:
@@ -419,6 +730,106 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"source": base, "online": ok, "detail": detail})
 
     # --- вспомогательное ------------------------------------------------
+    def сетка_дальномера(self) -> None:
+        """Последняя сетка 8×8 в метрах — для пульта.
+
+        Читаем файл, который выкладывает голосовая служба. Своего порта не
+        открываем и открыть не можем: он не читается вдвоём, и второй читатель
+        не просто ничего не увидит — он отнимет байты у робота. Владелец один,
+        остальные смотрят через его окно.
+        """
+        файл = Path.home() / ".robot-ai" / "tof_last.json"
+        try:
+            данные = json.loads(файл.read_text())
+        except (OSError, ValueError):
+            self.send_json({"есть": False,
+                            "почему": "дальномер молчит или не настроен"})
+            return
+        возраст = time.time() - float(данные.get("когда") or 0)
+        сетка = данные.get("сетка")
+        if not (isinstance(сетка, list) and len(сетка) == 8) or возраст > СЕТКА_СТАРЕЕТ:
+            # Старая сетка хуже отсутствующей: пульт показал бы позавчерашнюю
+            # комнату как сегодняшнюю, и человек поверил бы картинке.
+            self.send_json({"есть": False,
+                            "почему": f"сетке {возраст:.0f} с, это уже не сейчас"})
+            return
+        # Порог стопа берём ИЗ ФАЙЛА, а не из своей копии. Он больше не
+        # постоянный: у робота он считается от скорости (тормозной путь растёт
+        # квадратом), так что «то же число, что в tof.py» — понятие, которого
+        # больше нет. Нет в файле — служба старая, показываем зазор, ближе
+        # которого робот не подъезжает ни при какой скорости.
+        стоп = данные.get("стоп")
+        if not isinstance(стоп, (int, float)) or not (0 < стоп < 2):
+            стоп = СТОП_БЕЗ_ХОДА
+        self.send_json({"есть": True, "возраст": round(возраст, 2),
+                        "сетка": сетка, "стоп": round(float(стоп), 3)})
+
+    def карта_вокруг(self) -> None:
+        """Карта проходимости вокруг робота — для пульта.
+
+        Как и сетка дальномера: файл выкладывает голосовая служба, сервер его
+        только отдаёт. Своей карты у сервера нет и быть не может — она
+        собирается из дальномера и колёс в том процессе, который ими владеет.
+
+        Смотрим в два места. Основное — /run/robot-ai: это tmpfs, то есть
+        память, и карту туда можно писать хоть три раза в секунду, не стирая
+        карточку. Запасное — рядом с сеткой дальномера, для машины без
+        systemd, где каталога в /run просто нет.
+        """
+        for файл in (Path(КАРТА_ФАЙЛ), Path.home() / ".robot-ai" / "map.json"):
+            try:
+                данные = json.loads(файл.read_text())
+            except (OSError, ValueError):
+                continue
+            возраст = time.time() - float(данные.get("когда") or 0)
+            if возраст > КАРТА_СТАРЕЕТ:
+                # Старая карта хуже отсутствующей — ровно как старая сетка:
+                # человек поверит нарисованной комнате, которой уже нет.
+                self.send_json({"есть": False,
+                                "почему": f"карте {возраст:.0f} с, это уже не сейчас"})
+                return
+            данные["есть"] = True
+            данные["возраст"] = round(возраст, 2)
+            self.send_json(данные)
+            return
+        self.send_json({"есть": False,
+                        "почему": "робот не выкладывает карту"})
+
+    def план_квартиры(self) -> None:
+        """Постоянная карта квартиры — для пульта.
+
+        Не то же самое, что /map, и путать их нельзя. /map отдаёт быструю
+        карту: шесть метров вокруг робота, половина стирается за тридцать пять
+        секунд, и стирается НАРОЧНО — стул унесли, кот ушёл. А это план
+        квартиры: он копится месяцами и не тускнеет вовсе.
+
+        Игорь смотрел на «карту вокруг» и говорил «карту не сохраняет, каждый
+        раз заново рисует» — и был прав про симптом: постоянную карту до сих
+        пор не показывало ничто.
+
+        Свежесть тут другая. Быстрая карта старше полутора секунд — уже враньё;
+        план квартиры живёт месяцами, и минутная давность в нём нормальна.
+        Робот выкладывает его раз в пять секунд.
+        """
+        for файл in (Path(ПЛАН_ФАЙЛ),
+                     Path.home() / ".robot-ai" / "flat.json"):
+            try:
+                данные = json.loads(файл.read_text())
+            except (OSError, ValueError):
+                continue
+            возраст = time.time() - float(данные.get("когда") or 0)
+            if возраст > ПЛАН_СТАРЕЕТ:
+                self.send_json({"есть": False,
+                                "почему": f"плану {возраст:.0f} с — "
+                                          "робот его не обновляет"})
+                return
+            данные["есть"] = True
+            данные["возраст"] = round(возраст, 2)
+            self.send_json(данные)
+            return
+        self.send_json({"есть": False,
+                        "почему": "робот ещё не выкладывал план квартиры"})
+
     def send_json(self, obj: dict, code: int = 200) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
@@ -432,9 +843,227 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json({"online": False, "detail": message}, code)
 
 
+# Куда в кадре смотрит сетка дальномера — доли ширины и высоты картинки.
+# Умолчание считается по полям зрения: камера AR0234 даёт 130 градусов по
+# горизонтали, дальномер — 60 на 60. По модели дырочной камеры середина кадра
+# шириной tan(30°)/tan(65°) от половины — это и есть накрытая область.
+#
+# Умолчание — только начало. Оно не учитывает ни разноса между платами, ни
+# перекоса кронштейна, ни того, что видео в пульте может быть обрезано.
+# Поэтому цифры правятся глазами в пульте и запоминаются на роботе: свести
+# два поля зрения по картинке человек делает за минуту, а калибровочная доска
+# для 64 конусов шириной с ладонь — из пушки по воробьям.
+ФАЙЛ_ПРИЦЕЛА = "tof_aim.json"
+
+
+def _по_умолчанию() -> dict:
+    import math
+    доля_г = math.tan(math.radians(30.0)) / math.tan(math.radians(65.0))
+    # Вертикаль выводим из горизонтали через соотношение сторон 16:10 —
+    # пиксели квадратные, значит фокус общий.
+    фокус = 0.5 / math.tan(math.radians(65.0))
+    доля_в = math.tan(math.radians(30.0)) * фокус / (0.5 * 10 / 16)
+    return {"x": 0.5, "y": 0.5,
+            "ш": round(min(1.0, доля_г * 2), 3),
+            "в": round(min(1.0, доля_в * 2), 3),
+            # Как сетка развёрнута относительно картинки. Плата нигде не
+            # говорит, с какой стороны у неё первая колонка и первый ряд, а
+            # видно это человеку за минуту: поднеси ладонь к краю и смотри,
+            # тот ли край загорелся.
+            "зеркало": False, "вверхногами": False, "поперёк": False}
+
+
+def прицел() -> dict:
+    try:
+        данные = json.loads((Path.home() / ".robot-ai" / ФАЙЛ_ПРИЦЕЛА).read_text())
+        готово = {к: float(данные[к]) for к in ("x", "y", "ш", "в")}
+        готово["зеркало"] = bool(данные.get("зеркало"))
+        готово["вверхногами"] = bool(данные.get("вверхногами"))
+        готово["поперёк"] = bool(данные.get("поперёк"))
+        return готово
+    except (OSError, ValueError, KeyError, TypeError):
+        return _по_умолчанию()
+
+
+def записать_прицел(новый: dict) -> None:
+    файл = Path.home() / ".robot-ai" / ФАЙЛ_ПРИЦЕЛА
+    файл.parent.mkdir(parents=True, exist_ok=True)
+    врем = файл.with_name(файл.name + ".tmp")
+    врем.write_text(json.dumps(новый, ensure_ascii=False))
+    врем.replace(файл)
+
+
+# Дальше этого сетка дальномера — уже не «сейчас». Полторы секунды: служба
+# пишет её пять раз в секунду, так что живая сетка всегда свежее.
+СЕТКА_СТАРЕЕТ = 1.5
+
+# Ближе этого робот не подъедет ни при какой скорости — пульт красит такие
+# зоны иначе. Нужно только как запасной ответ: настоящий порог приходит вместе
+# с сеткой, потому что у робота он считается от скорости и на ходу меняется.
+#
+# Прежняя редакция хранила здесь копию СТОП_БЛИЖЕ с припиской «держать в
+# согласии с tof.py» — и разошлась с оригиналом при первой же правке. Приписка
+# согласия не обеспечивает; обеспечивает его отсутствие второго числа.
+СТОП_БЕЗ_ХОДА = 0.10
+
+# Куда голосовая служба выкладывает ПОСТОЯННУЮ карту квартиры — ту, что
+# копится месяцами. Держать в согласии с ФАЙЛ_ПОКАЗА в atlas.py.
+ПЛАН_ФАЙЛ = os.environ.get("ROBOT_FLAT_FILE", "/run/robot-ai/flat.json")
+# Дальше этого план — уже не «сейчас». Минута, а не полторы секунды, как у
+# сетки: план квартиры живёт месяцами, и мгновенная свежесть ему не нужна.
+# Робот выкладывает его раз в пять секунд, так что минута молчания означает,
+# что копить он перестал.
+ПЛАН_СТАРЕЕТ = 60.0
+
+# Куда голосовая служба выкладывает карту вокруг робота. /run — tmpfs, то есть
+# память: карта пишется три раза в секунду, и карточке этого не надо. Держать
+# в согласии с ФАЙЛ_КАРТЫ в voice/robot_voice/mapping.py.
+КАРТА_ФАЙЛ = os.environ.get("ROBOT_MAP_FILE", "/run/robot-ai/map.json")
+# Дальше этого карта — уже не «сейчас». Пять секунд, а не полторы, как у
+# сетки: карта живёт полминуты по построению, и мгновенная свежесть ей не
+# нужна. Но и вчерашнюю показывать нельзя — человек поверит нарисованной
+# комнате, которой уже нет.
+КАРТА_СТАРЕЕТ = 5.0
+
+# Сколько ждём рукопожатия от клиента. Дальше — не наш человек: браузер
+# здоровается сразу.
+РУКОПОЖАТИЕ = 15.0
+
+
+class ЗащищённыйСервер(ThreadingHTTPServer):
+    """https, у которого рукопожатие делается в потоке соединения.
+
+    Раньше защищённым делался слушающий сокет целиком, а значит рукопожатие
+    случалось внутри accept() — в том же единственном потоке, который принимает
+    всех. Один клиент, открывший соединение и замолчавший, замораживал https
+    для всей квартиры: пульт на телефоне переставал отвечать, а робот при этом
+    выглядел живым, потому что обычный http работал.
+    """
+
+    контекст: ssl.SSLContext | None = None
+
+    def finish_request(self, request, client_address) -> None:
+        try:
+            request.settimeout(РУКОПОЖАТИЕ)
+            защищённый = self.контекст.wrap_socket(request, server_side=True)
+        except (OSError, ssl.SSLError) as e:
+            # Обычное дело: браузер зашёл по http на порт https, или человек
+            # закрыл вкладку посреди рукопожатия. Роняем соединение, не сервер.
+            log_tls(f"рукопожатие не состоялось с {client_address[0]}: {e}")
+            return
+        try:
+            # Дальше сроков нет: и события пульта, и картинка с камеры живут
+            # долго и молчат по полчаса — таймаут рвал бы их без причины.
+            защищённый.settimeout(None)
+            self.RequestHandlerClass(защищённый, client_address, self)
+        finally:
+            # Закрываем сами: обёрнутый сокет забирает себе файловый номер, и
+            # уборка socketserver до него уже не дотянется.
+            try:
+                защищённый.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            защищённый.close()
+
+
+def log_tls(строка: str) -> None:
+    """Тихо, но не молча: такое случается часто и пугать им человека незачем."""
+    print(f"https: {строка}", file=sys.stderr, flush=True)
+
+
+def _слушать_https() -> ThreadingHTTPServer | None:
+    """Второй вход, по https. Без него микрофон с телефона не работает.
+
+    Обычный http на своём порту остаётся нетронутым: по нему с роботом
+    разговаривает его же голосовая служба через 127.0.0.1, и ей сертификаты
+    ни к чему.
+    """
+    бумаги, беда = tls.выписать()
+    if бумаги is None:
+        print(f"https не поднял: {беда}. Микрофон с телефона не заработает,"
+              " см. README", flush=True)
+        return None
+    сертификат, ключ = бумаги
+    контекст = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        контекст.load_cert_chain(сертификат, ключ)
+    except (ssl.SSLError, OSError) as e:
+        print(f"https не поднял: сертификат не читается ({e})", flush=True)
+        return None
+    try:
+        сервер = ЗащищённыйСервер(("0.0.0.0", TLS_PORT), Handler)
+    except OSError as e:
+        # Порт занят — обычно это второй запуск службы. Ронять из-за этого
+        # весь пульт нельзя: по http он ещё нужен, а под systemd с вечным
+        # перезапуском мы бы просто падали по кругу.
+        print(f"https не поднял: порт {TLS_PORT} занят ({e}). "
+              f"Пульт работает по http", flush=True)
+        return None
+    сервер.daemon_threads = True
+    сервер.контекст = контекст
+    threading.Thread(target=сервер.serve_forever, daemon=True).start()
+    адрес = (tls.адреса() or ["адрес робота"])[-1]
+    print(f"https на порту {TLS_PORT}: https://{адрес}:{TLS_PORT}/pult.html "
+          f"— микрофон с телефона работает только отсюда", flush=True)
+    return сервер
+
+
+def кто_занял(порт: int) -> str:
+    """Кто держит порт — словами. Пусто, если выяснить не вышло.
+
+    Пишется ради одного случая, который уже случился и стоил часа. Детектор
+    людей поднимал через свой launch страничку просмотра TogetheROS, а та —
+    nginx НА ЭТОМ ЖЕ ПОРТУ. Пульт после этого не поднимался вовсе и уходил в
+    вечный перезапуск, а в браузере отвечал чужой «404 Not Found, nginx».
+    Снаружи это выглядит как «пульт сломался», и человек идёт чинить пульт,
+    который цел.
+
+    Разбирать вывод ss — некрасиво, и всё же это правильно: сообщение
+    «Address already in use» без имени виновника не сокращает поиск ни на
+    минуту, а с именем — сокращает до одной команды.
+    """
+    try:
+        готово = subprocess.run(["ss", "-ltnp"], capture_output=True,
+                                text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        # ss есть не везде — на машине разработчика его может не быть вовсе.
+        # Тогда просто молчим про виновника: сообщение про занятый порт
+        # человек всё равно увидит.
+        return ""
+    return разобрать_ss(готово.stdout, порт)
+
+
+def разобрать_ss(вывод: str, порт: int) -> str:
+    """Разбор вывода ss. Отдельно — чтобы это можно было проверить без ss."""
+    for строка in вывод.splitlines():
+        if f":{порт} " not in строка:
+            continue
+        имена = re.findall(r'"([^"]+)",pid=(\d+)', строка)
+        if имена:
+            return ", ".join(f"{имя} (pid {pid})" for имя, pid in имена)
+    return ""
+
+
 def main() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    except OSError as e:
+        # Молча падать с кодом 1 нельзя: systemd перезапустит, счётчик
+        # накрутится, а человек будет смотреть на чужой 404 в браузере и
+        # думать, что сломан пульт.
+        кто = кто_занял(PORT)
+        print(f"Порт {PORT} занять не вышло: {e}", file=sys.stderr, flush=True)
+        if кто:
+            print(f"Его держит: {кто}", file=sys.stderr, flush=True)
+            if "nginx" in кто:
+                print("Это страничка просмотра TogetheROS — её поднимает "
+                      "штатный launch детектора людей. Она нам не нужна:\n"
+                      "    sudo pkill -f nginx && sudo systemctl restart robot-web\n"
+                      "и обнови робота — свой launch её больше не запускает.",
+                      file=sys.stderr, flush=True)
+        raise SystemExit(1)
     server.daemon_threads = True
+    безопасный = _слушать_https() if TLS_PORT else None
     print(f"пульт на порту {PORT}, камера с {DEFAULT_PHONE}", flush=True)
     try:
         server.serve_forever()
@@ -442,6 +1071,8 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        if безопасный is not None:
+            безопасный.server_close()
 
 
 if __name__ == "__main__":
