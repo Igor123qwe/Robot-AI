@@ -74,6 +74,22 @@ if ! ls /dev/dri/card* >/dev/null 2>&1; then
   echo "   потом перезагрузка. После неё запустить этот скрипт ещё раз."
 fi
 
+echo "==> отдаю экран лицу: выключаю графический сервер"
+# Образ RDK X5 держит на панели X через lightdm, а x11vnc показывает этот X по
+# сети. X — DRM-мастер, и пока он жив, лицо экран не откроет (второго хозяина
+# у панели не бывает; /dev/fb* на этом ядре нет, запасного пути тоже нет).
+# Роботу рабочий стол не нужен: пульт — в браузере, лицо — на панели.
+#
+# ОБРАТИМО: вернуть рабочий стол — `sudo systemctl disable --now robot-face &&
+# sudo systemctl enable --now lightdm x11vnc`.
+for unit in lightdm x11vnc; do
+  if systemctl list-unit-files "$unit.service" >/dev/null 2>&1 \
+     && systemctl list-unit-files "$unit.service" | grep -q "$unit.service"; then
+    sudo systemctl disable --now "$unit" || true
+    echo "    $unit выключен"
+  fi
+done
+
 echo "==> служба robot-face"
 sudo cp "$REPO/systemd/robot-face.service" /etc/systemd/system/robot-face.service
 sudo systemctl daemon-reload
