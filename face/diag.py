@@ -13,10 +13,12 @@ CRTC) и требует, чтобы всех было больше нуля. П�
 from __future__ import annotations
 
 import ctypes
-import ctypes.util
 import glob
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from drmout import открыть_libdrm  # noqa: E402
 
 
 class _Res(ctypes.Structure):
@@ -29,11 +31,17 @@ class _Res(ctypes.Structure):
                 ("min_height", ctypes.c_uint32), ("max_height", ctypes.c_uint32)]
 
 
-def _lib(имя: str, so: str):
-    путь = ctypes.util.find_library(имя)
+def _lib(so: str) -> bool:
+    """Грузим SONAME напрямую — см. довод в drmout.открыть_libdrm.
+
+    ctypes.util.find_library() здесь НЕ ЗОВЁМ: на этом образе он может уйти
+    в subprocess (ldconfig/gcc) и упасть голым «No such file or directory»,
+    если их нет на PATH текущей оболочки, — и тогда результат этой проверки
+    зависит от того, как её запустили, а не от того, стоит ли библиотека.
+    """
     try:
-        ctypes.CDLL(путь or so)
-        print(f"  ok   {so}: грузится ({путь or so})")
+        ctypes.CDLL(so)
+        print(f"  ok   {so}: грузится")
         return True
     except OSError as e:
         print(f"  НЕТ  {so}: {e}")
@@ -46,9 +54,9 @@ def главный() -> int:
     print("SDL/kmsdrm: проверка по шагам")
     беда = False
     # 1. библиотеки, которые SDL грузит динамически
-    if not _lib("drm", "libdrm.so.2"):
+    if not _lib("libdrm.so.2"):
         беда = True
-    if not _lib("gbm", "libgbm.so.1"):
+    if not _lib("libgbm.so.1"):
         беда = True
     # 2. устройства
     карты = sorted(glob.glob("/dev/dri/card*"))
@@ -56,8 +64,9 @@ def главный() -> int:
         print("  НЕТ  /dev/dri/card* — DRM-устройства нет вовсе (панель не включена в srpi-config?)")
         return 1
     try:
-        drm = ctypes.CDLL(ctypes.util.find_library("drm") or "libdrm.so.2")
-    except OSError:
+        drm = открыть_libdrm()
+    except OSError as e:
+        print(f"  НЕТ  libdrm не загрузилась: {e}")
         return 1
     drm.drmModeGetResources.restype = ctypes.POINTER(_Res)
     drm.drmModeGetResources.argtypes = [ctypes.c_int]

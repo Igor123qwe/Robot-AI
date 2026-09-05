@@ -24,11 +24,48 @@ Pygame при этом остаётся: он рисует в обычную Sur
 from __future__ import annotations
 
 import ctypes
-import ctypes.util
 import errno
 import glob
 import mmap
 import os
+
+
+def открыть_libdrm() -> ctypes.CDLL:
+    """Загрузить libdrm без ctypes.util.find_library.
+
+    find_library("drm") на Linux, если ему не удаётся определить soname
+    напрямую, ХОДИТ ВО ВНЕШНИЕ ПРОЦЕССЫ — ldconfig, потом gcc/objdump — через
+    subprocess. На минимальном образе робота их может не быть на PATH, и
+    тогда find_library не возвращает None, а бросает FileNotFoundError
+    (кое-где — через posix_spawn, чьё OSError даже не называет виновника:
+    голое «[Errno 2] No such file or directory»). Ровно это и произошло:
+    служба robot-face (систем­ный PATH через systemd) открывала библиотеку
+    исправно, а тот же код из интерактивного SSH-сеанса падал этой
+    непонятной ошибкой — PATH там другой.
+
+    Soname `libdrm.so.2` на Ubuntu/Debian неизменен уже больше десяти лет,
+    и dlopen ищет его сам по стандартным путям без всякого find_library.
+    Поэтому грузим напрямую, а do find_library — на самый крайний случай,
+    и уже под try/except, чтобы он не мог уронить нас снова.
+    """
+    try:
+        return ctypes.CDLL("libdrm.so.2", use_errno=True)
+    except OSError:
+        pass
+    try:
+        import ctypes.util as _util   # своё имя: "import ctypes.util" здесь
+                                       # переопределило бы "ctypes" как
+                                       # локальное имя во всей функции и
+                                       # уронило бы более раннее ctypes.CDLL
+                                       # с UnboundLocalError — на этом и
+                                       # споткнулись при первом прогоне.
+        путь = _util.find_library("drm")
+    except Exception:                           # noqa: BLE001
+        путь = None
+    if not путь:
+        raise OSError("libdrm не найдена ни как libdrm.so.2, ни через "
+                      "find_library — установлена ли libdrm2?")
+    return ctypes.CDLL(путь, use_errno=True)
 
 # --- структуры libdrm (xf86drmMode.h) ------------------------------------------
 
@@ -110,8 +147,7 @@ class ЭкранDRM:
     """Панель как два dumb-буфера. `показать(surface)` — кадр на экран."""
 
     def __init__(self, карта: str | None = None) -> None:
-        self._drm = ctypes.CDLL(ctypes.util.find_library("drm") or "libdrm.so.2",
-                                use_errno=True)
+        self._drm = открыть_libdrm()
         d = self._drm
         d.drmModeGetResources.restype = ctypes.POINTER(_Res)
         d.drmModeGetResources.argtypes = [ctypes.c_int]

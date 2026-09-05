@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import ctypes.util
 import fcntl
 import glob
 import mmap
@@ -32,6 +31,9 @@ import os
 import struct
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from drmout import открыть_libdrm  # noqa: E402
 
 
 class _Res(ctypes.Structure):
@@ -81,7 +83,7 @@ DRM_FORMAT_XRGB8888 = 0x34325258  # 'XR24' little-endian, см. drm_fourcc.h
 
 def снять(карта: str) -> tuple[bytes, int, int]:
     """(сырые байты BGRX, ширина, высота) кадра, сейчас показанного на CRTC."""
-    drm = ctypes.CDLL(ctypes.util.find_library("drm") or "libdrm.so.2", use_errno=True)
+    drm = открыть_libdrm()
     drm.drmModeGetResources.restype = ctypes.POINTER(_Res)
     drm.drmModeGetResources.argtypes = [ctypes.c_int]
     drm.drmModeFreeResources.argtypes = [ctypes.c_void_p]
