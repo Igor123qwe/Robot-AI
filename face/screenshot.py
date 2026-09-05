@@ -13,6 +13,12 @@ drmModePageFlip, — и сохраняет его в PNG. Службу оста�
 не становится вовсе (открывает карту, не делает SetMaster) — он просто читает
 GEM-хендл активного FB через drmModeGetFB2 → PRIME-экспорт → mmap.
 
+ЗАПУСКАТЬ ЧЕРЕЗ sudo. Ядро отдаёт GEM-хендл кадра (тот самый, без которого
+PRIME-экспорт невозможен) только DRM-мастеру или процессу с CAP_SYS_ADMIN —
+это защита от того, чтобы любой процесс мог читать чужой экран. Мастером
+становиться нельзя (это отняло бы экран у robot-face), а sudo даёт
+CAP_SYS_ADMIN без смены мастера — ровно то, что нужно, и ничего больше.
+
 Если PRIME недоступен (старое ядро без GETFB2/PRIME_HANDLE_TO_FD) — скрипт
 честно называет отказавший шаг и причину, а не падает молча с чёрным PNG.
 """
@@ -163,6 +169,20 @@ def снять(карта: str) -> tuple[bytes, int, int]:
             if fb2.pixel_format != DRM_FORMAT_XRGB8888:
                 raise RuntimeError(f"неожиданный формат кадра 0x{fb2.pixel_format:08x} "
                                    "— ожидался XRGB8888")
+
+            # ЯДРО НАМЕРЕННО ВОЗВРАЩАЕТ handles[0]=0, если звонящий не DRM-мастер
+            # и не имеет CAP_SYS_ADMIN — это защита от чтения чужого кадра кем
+            # попало (drm_mode_getfb2_ioctl → drm_framebuffer_lookup, отдаёт
+            # хендл только доверенному клиенту). Мастер сейчас — robot-face, а
+            # мы отдельный процесс. Без хендла PRIME_HANDLE_TO_FD законно
+            # ответит ENOENT — «нет такого GEM-объекта», а на первый взгляд
+            # выглядит как «нет файла». Ловим здесь, а не после третьего ioctl.
+            if not fb2.handles[0]:
+                raise RuntimeError(
+                    "ядро не отдало GEM-хендл кадра — нет прав. Нужен "
+                    "CAP_SYS_ADMIN: запусти через sudo (sudo python3 "
+                    "face/screenshot.py …). Мастером DRM становиться не "
+                    "надо и нельзя: это отобрало бы экран у robot-face.")
 
             ph = _PrimeHandle(handle=fb2.handles[0], flags=0)
             итог = _шаг("PRIME_HANDLE_TO_FD", fcntl.ioctl, fd,
