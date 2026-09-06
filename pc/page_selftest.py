@@ -488,29 +488,47 @@ with sync_playwright() as p:
     настройки4 = dict(настройки); настройки4["модель"] = "samples/mao/Mao.model3.json"
     page4.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки4, ensure_ascii=False),
                                                       content_type="application/json"))
-    page4.route("**/state", lambda r: r.fulfill(body=json.dumps({
-        "эмоция": "спокоен", "говорит": "", "музыка": {"играет": False}, "сцена": {},
-        "поза": {"метка": "стоит", "x": 640, "наклон": 0, "подскок": 0, "рот": 0, "нога": 0},
-    }, ensure_ascii=False), content_type="application/json"))
+    состояние4 = {"эмоция": "спокоен", "говорит": "", "музыка": {"играет": False}, "сцена": {},
+                  "поза": {"метка": "стоит", "x": 640, "наклон": 0, "подскок": 0, "рот": 0,
+                           "нога": 0, "рассеян_x": 0.0, "рассеян_y": 0.0}}
+    page4.route("**/state", lambda r: r.fulfill(body=json.dumps(состояние4, ensure_ascii=False),
+                                                content_type="application/json"))
     ошибки4 = []
     page4.on("pageerror", lambda e: ошибки4.append(str(e)))
     page4.goto(url + "/avatar/", wait_until="load")
     page4.wait_for_function("!!(window.__listeners && window.__listeners.afterMotionUpdate)", timeout=10000)
-    for _ in range(25):
-        page4.evaluate("window.__виртуальное_время += 30")
-        page4.evaluate("window.__listeners.afterMotionUpdate()")
-    бл_x, бл_y = [], []
-    for _ in range(80):
-        page4.evaluate("window.__виртуальное_время += 300")
-        page4.evaluate("window.__listeners.afterMotionUpdate()")
-        бл_x.append(page4.evaluate("window.__params['ParamAngleX'] || 0"))
-        бл_y.append(page4.evaluate("window.__params['ParamEyeBallY'] || 0"))
-    check("рассеянный взгляд: голова не застывает в одной точке",
-          max(бл_x) - min(бл_x) > 0.5, True)
-    check("рассеянный взгляд: глаза тоже блуждают",
-          max(бл_y) - min(бл_y) > 0.05, True)
-    check("рассеянный взгляд: амплитуда небольшая — блуждание, а не рывок через весь экран",
-          max(abs(x) for x in бл_x) < 8, True)
+
+    def взгляд_при(рас_x, рас_y, **ещё):
+        """Поставить блуждание (и что ещё нужно) и дать сглаживанию сойтись."""
+        состояние4["поза"]["рассеян_x"] = рас_x
+        состояние4["поза"]["рассеян_y"] = рас_y
+        состояние4["поза"]["метка"] = ещё.pop("метка", "стоит")
+        состояние4["поза"]["наклон"] = ещё.pop("наклон", 0)
+        состояние4["сцена"] = ещё.pop("сцена", {})
+        состояние4.update(ещё)
+        page4.wait_for_timeout(200)              # страница успевает опросить /state
+        for _ in range(25):
+            page4.evaluate("window.__виртуальное_время += 300")
+            page4.evaluate("window.__listeners.afterMotionUpdate()")
+        return (page4.evaluate("window.__params['ParamAngleX'] || 0"),
+                page4.evaluate("window.__params['ParamEyeBallY'] || 0"))
+
+    вправо = взгляд_при(1.0, 1.0)
+    влево = взгляд_при(-1.0, -1.0)
+    ровно = взгляд_при(0.0, 0.0)
+    check("рассеянный взгляд: доли из общей логики доезжают до параметров модели",
+          (round(вправо[0]), round(вправо[1], 2), round(влево[0]), round(влево[1], 2),
+           round(ровно[0]), round(ровно[1], 2)),
+          (6, 0.25, -6, -0.25, 0, 0.0))
+    # Гасится там, где о взгляде уже позаботились. Числа точные: если
+    # блуждание всё-таки прибавится, к каждому прибавится ещё 6 градусов.
+    со_сценкой = взгляд_при(1.0, 1.0, сцена={"к": 0.5})
+    в_контакте = взгляд_при(1.0, 1.0, наклон=6.0)
+    в_танце = взгляд_при(1.0, 1.0, метка="танцует",
+                         музыка={"играет": True, "название": "x"})
+    check("рассеянный взгляд молчит, когда взглядом заняты сценка, контакт глаз или танец",
+          (round(со_сценкой[0], 1), round(в_контакте[0], 1), round(в_танце[0], 1)),
+          (12.5, 30.0, 0.0))
     check("рассеянный взгляд: ошибок страницы нет", not ошибки4, True)
     page4.close()
     b.close()

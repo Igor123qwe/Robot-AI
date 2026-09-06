@@ -1059,16 +1059,37 @@ def test_avatar() -> None:
         местный = Handler.АВАТАР_ПАПКА / "config.local.json"
         было = местный.read_text(encoding="utf-8") if местный.exists() else None
         try:
-            местный.write_text(json.dumps({"модель": "model/своя.model3.json",
+            # Своя модель, которая ЕСТЬ на диске (берём вторую готовую), —
+            # сильнее общей: так и задумано.
+            местный.write_text(json.dumps({"модель": "samples/mao/Mao.model3.json",
                                            "параметры": {"рот": "MyMouth"}},
                                           ensure_ascii=False), encoding="utf-8")
             with urllib.request.urlopen(url + "/avatar/config.json", timeout=5) as r:
                 настройки = json.loads(r.read().decode("utf-8"))
             check("config.local.json поверх config.json: свой путь к модели",
-                  настройки["модель"], "model/своя.model3.json")
+                  настройки["модель"], "samples/mao/Mao.model3.json")
             check("…словари дополняются, а не заменяются целиком",
                   (настройки["параметры"]["рот"], настройки["параметры"]["взгляд_x"]),
                   ("MyMouth", "ParamAngleX"))
+            # А вот путь к модели, которой на диске НЕТ (старый config.local
+            # с прошлых времён: модель переставили, переименовали, не
+            # докачали), не должен оставлять экран вовсе без персонажа —
+            # берём общую и говорим об этом в лог. Это и есть та ловушка, из-за
+            # которой после git pull готовые модели могли не появиться.
+            жалобы: list = []
+            старый_warning = kuzya_pc.log.warning
+            kuzya_pc.log.warning = lambda ф, *а: жалобы.append(ф % а if а else ф)
+            try:
+                местный.write_text(json.dumps({"модель": "model/её-нет.model3.json"},
+                                              ensure_ascii=False), encoding="utf-8")
+                with urllib.request.urlopen(url + "/avatar/config.json", timeout=5) as r:
+                    настройки2 = json.loads(r.read().decode("utf-8"))
+            finally:
+                kuzya_pc.log.warning = старый_warning
+            check("модели из config.local.json нет на диске — берём общую, а не пустой экран",
+                  настройки2["модель"], "samples/shizuku/shizuku.model.json")
+            check("…и жалуемся в лог, чтобы это можно было понять, а не гадать",
+                  any("config.local.json" in ж and "её-нет" in ж for ж in жалобы), True)
         finally:
             if было is None:
                 местный.unlink(missing_ok=True)
@@ -2022,6 +2043,9 @@ def test_scenes() -> None:
     # одну точку.
     check("страница: рассеянный взгляд есть и выключается на контакте глаз/танце/сценке",
           "доля_наклона === 0 && !танцует && typeof сцена.к !== \"number\"" in страница, True)
+    check("страница: блуждание берётся из общей логики (поза «рассеян_x/y»), а не своё второе",
+          ("Number(поза.рассеян_x)" in страница, "Number(поза.рассеян_y)" in страница,
+           "Math.sin(t * 2 * Math.PI * 0.07)" not in страница), (True, True, True))
 
     # --- готовые модели в samples/ и старый формат Cubism 2 ---------------------
     # Настоящий прогон — page_selftest.py (страницы 12–14). Здесь по тексту и
