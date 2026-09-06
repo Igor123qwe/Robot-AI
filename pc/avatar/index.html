@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8">
 <title>Кузя</title>
+<!-- Без этого браузер сам просит /avatar/favicon.ico, получает 404 и пишет
+     это в консоль — а console.error слушает kuzya_pc.py и ругается в лог,
+     будто со страницей что-то не так. Пустая иконка — запроса не будет. -->
+<link rel="icon" href="data:,">
 <style>
   html, body { margin: 0; height: 100%; background: #0b0f14; overflow: hidden; }
   canvas { display: block; }
