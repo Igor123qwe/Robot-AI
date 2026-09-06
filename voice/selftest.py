@@ -1002,6 +1002,25 @@ def test_meeting() -> None:
     check("«забудь» одно — это не про меня", бьётся(_FORGET_ME, "забудь"), False)
     check("«кто ты» — не «кто я»", бьётся(_WHO_AM_I, "кто ты"), False)
 
+    # meeting.name_is()/_about_people() отвечают voice.say() напрямую, в обход
+    # произнести() — а значит, в обход и сброса addressed.переспросил. На
+    # живом роботе «одноразовое право на переспрос» было потрачено на «Ладно,
+    # потом скажешь» (ответ name_is на чужую реплику) и осталось «съедено» для
+    # совершенно другого разговора: настоящее обращение чуть позже получило
+    # полную тишину вместо «Не разобрал, повтори» — а должно было переспросить.
+    # По исходнику, а не воспроизведением: сценарий целиком (два раздельных
+    # физических лица, реальный microphone-цикл, модель, отвечающая «не мне»)
+    # не смоделировать без огромного стенда, а молчаливый откат этой правки
+    # стоит дорого.
+    исходник_app = (Path(__file__).resolve().parent / "robot_voice" / "app.py"
+                    ).read_text(encoding="utf-8")
+    check("meeting.name_is() сбрасывает переспросил рядом с самим вызовом",
+          "if meeting.name_is(command, who, voice, people):\n"
+          "                addressed.переспросил = False" in исходник_app, True)
+    check("_about_people() — тоже: тот же обход произнести()",
+          "if _about_people(command, who, voice, people, meeting):\n"
+          "                addressed.переспросил = False" in исходник_app, True)
+
 
 def test_auto_meeting() -> None:
     """Голос заводится сам, имя приходит потом — и архив едет за ним.
@@ -17391,6 +17410,23 @@ def test_endpoints() -> None:
         b.endpoints[0].client = client(pc)
         b.endpoints[1].client = client(cloud)
         return b
+
+    # Таймаут ответа у ПК короче, чем у облака — иначе зависшая (не мёртвая:
+    # соединение принято, но Ollama синхронно считает большой промпт и не
+    # шлёт ни байта) Ollama держит фразу на общих TIMEOUT_SECONDS=25 с, как
+    # было на живом роботе: 37 секунд молчания на одну фразу и переполнение
+    # звуковой очереди, прежде чем робот догадался уйти на запасной путь.
+    from robot_voice.brain import CONNECT_SECONDS, LOCAL_TIMEOUT_SECONDS, TIMEOUT_SECONDS
+    cfg_таймаут = Config()
+    cfg_таймаут.local_api_base = "http://пк:4000"
+    cfg_таймаут.api_key = cfg_таймаут.local_api_key = "x"
+    b_таймаут = Brain(cfg_таймаут, [])
+    check("таймаут ПК — короткий, не общий 25-секундный",
+          b_таймаут.endpoints[0].client.timeout.read, LOCAL_TIMEOUT_SECONDS)
+    check("а у облака — прежний, длинный: думать оно может дольше",
+          b_таймаут.endpoints[1].client.timeout.read, TIMEOUT_SECONDS)
+    check("дозвон у ПК всё ещё короткий (выключенный ПК ловим быстро)",
+          b_таймаут.endpoints[0].client.timeout.connect, CONNECT_SECONDS)
 
     cfg_общий = Config()
     b = brain(pc="с ПК", cloud="из облака")

@@ -57,6 +57,18 @@ TIMEOUT_SECONDS = 25.0
 # чтобы ответить через облако.
 CONNECT_SECONDS = 2.0
 
+# Сколько ждём ОТВЕТА именно от ПК — отдельно от общего TIMEOUT_SECONDS.
+# Дозвон (CONNECT_SECONDS) ловит выключенный ПК быстро, но не ловит ПК,
+# который принял соединение и завис на генерации: Ollama получает запрос
+# целиком синхронно (kuzya_pc.py) и не шлёт ни байта, пока не досчитает, —
+# ни один keep-alive не спасает. На живом роботе большой промпт (8833
+# токена) подвесил ПК, и робот прождал полные TIMEOUT_SECONDS=25 с, прежде
+# чем уйти на запасной путь, — 37 секунд молчания на одну фразу и переполнение
+# звуковой очереди («выброшено 500 кадров») заодно. Домашняя модель отвечает
+# за 700-900 мс до первого токена в норме; пяти секунд с запасом ×6 хватает,
+# и это не трогает облачный путь, где TIMEOUT_SECONDS остаётся прежним.
+LOCAL_TIMEOUT_SECONDS = 5.0
+
 # Столько не трогаем собеседника, который не отозвался. Иначе робот будет
 # проверять выключенный ПК на каждой фразе и каждый раз терять на этом время.
 DOWN_SECONDS = 60.0
@@ -102,8 +114,8 @@ def наша_вина(ошибка: Exception) -> bool:
 CLOUD_CONNECT_SECONDS = 5.0
 
 
-def _timeout(connect: float):
-    """Таймаут запроса: связь коротко, чтение долго.
+def _timeout(connect: float, total: float = TIMEOUT_SECONDS):
+    """Таймаут запроса: связь коротко, чтение — по total.
 
     Без httpx (так бывает в самопроверке, где клиент модели подменён
     заглушкой) отдаём одно число — SDK его тоже понимает.
@@ -111,8 +123,8 @@ def _timeout(connect: float):
     try:
         import httpx
     except ImportError:
-        return TIMEOUT_SECONDS
-    return httpx.Timeout(TIMEOUT_SECONDS, connect=connect)
+        return total
+    return httpx.Timeout(total, connect=connect)
 
 
 class Thinkless:
@@ -329,7 +341,8 @@ class Brain:
             self.endpoints.append(Endpoint(
                 name=f"ПК ({cfg.local_api_base})",
                 client=self._client(cfg.local_api_key, cfg.local_api_base,
-                                    CONNECT_SECONDS, retries=0),
+                                    CONNECT_SECONDS, retries=0,
+                                    total=LOCAL_TIMEOUT_SECONDS),
                 model=cfg.local_model,
                 # Маленькая модель этого параметра не знает, и слать его
                 # незачем: первый же запрос уйдёт в отказ и потеряет секунду.
@@ -363,10 +376,11 @@ class Brain:
         self.last_talk = 0.0
 
     @staticmethod
-    def _client(key: str, base: str, connect: float, retries: int = 1):
+    def _client(key: str, base: str, connect: float, retries: int = 1,
+                total: float = TIMEOUT_SECONDS):
         args = {
             "api_key": key,
-            "timeout": _timeout(connect),
+            "timeout": _timeout(connect, total),
             # Облаку — две попытки: сетевой сбой бывает, но ждать третью робот
             # не может. Домашнему ПК — одна: за ним стоит облако, ради
             # которого вся конструкция и написана, а повтор к выключенной

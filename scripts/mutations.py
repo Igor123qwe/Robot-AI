@@ -1426,7 +1426,7 @@ def вернуть_недоделанное() -> None:
      '            return видео.видео_громкость(изменение)\n'
      '        if player is None or not player.играет:',
      '        if player is None or not player.играет:',
-     "видео: громче"),
+     "всё равно про видео"),
 
     ("видео: «следующий мультик» не двигает список — крутит один и тот же ролик",
      "voice/robot_voice/face.py",
@@ -1446,6 +1446,33 @@ def вернуть_недоделанное() -> None:
      "_voice_control, _abilities, _look, _music, _video, _rates, _news, _where,",
      "_voice_control, _abilities, _look, _music, _rates, _news, _where,",
      "video_pause"),
+
+    # --- аудит общения: таймаут ПК, утечка «переспросил» --------------------
+    ("аудит: таймаут ПК не отделён от облачного — зависшая Ollama держит "
+     "фразу все 25 секунд вместо 5",
+     "voice/robot_voice/brain.py",
+     "                client=self._client(cfg.local_api_key, cfg.local_api_base,\n"
+     "                                    CONNECT_SECONDS, retries=0,\n"
+     "                                    total=LOCAL_TIMEOUT_SECONDS),",
+     "                client=self._client(cfg.local_api_key, cfg.local_api_base,\n"
+     "                                    CONNECT_SECONDS, retries=0),",
+     "таймаут ПК — короткий"),
+
+    ("аудит: name_is() не сбрасывает «переспросил» — один переспрос, "
+     "потраченный на чужой разговор, отнимает переспрос у настоящего",
+     "voice/robot_voice/app.py",
+     "            if meeting.name_is(command, who, voice, people):\n"
+     "                addressed.переспросил = False",
+     "            if meeting.name_is(command, who, voice, people):",
+     "name_is() сбрасывает переспросил"),
+
+    ("аудит: _about_people() не сбрасывает «переспросил» — тот же обход "
+     "произнести()",
+     "voice/robot_voice/app.py",
+     "            if _about_people(command, who, voice, people, meeting):\n"
+     "                addressed.переспросил = False",
+     "            if _about_people(command, who, voice, people, meeting):",
+     "_about_people() — тоже"),
 
     # --- речь на своём динамике, частоты, лицо не ждёт сети ------------------
     ("речь: «замолчи» на своём динамике не обрывает реплику",

@@ -2244,10 +2244,21 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                     who = узнан
                     brain.about = people.brief(who, today=_сегодня())
 
+            # Обе ветки ниже отвечают voice.say() напрямую, в обход
+            # произнести() — а значит, в обход и сброса addressed.переспросил.
+            # На живом роботе это привело к тому, что «одноразовое право на
+            # переспрос» было потрачено на «Ладно, потом скажешь» (ответ
+            # meeting.name_is на чужую реплику) и осталось «съедено» для
+            # совершенно другого разговора: настоящее обращение получило
+            # полную тишину вместо честного «Не разобрал, повтори». Сбрасываем
+            # здесь же — это такой же живой ответ по делу, как и через
+            # произнести(), и должен восстанавливать право на переспрос.
             if meeting.name_is(command, who, voice, people):
+                addressed.переспросил = False
                 awake_until = time.monotonic() + cfg.session_seconds
                 continue
             if _about_people(command, who, voice, people, meeting):
+                addressed.переспросил = False
                 awake_until = time.monotonic() + cfg.session_seconds
                 last_talk = brain.last_talk = time.monotonic()
                 continue
