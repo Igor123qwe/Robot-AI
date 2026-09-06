@@ -33,8 +33,9 @@ log = logging.getLogger(__name__)
 class Проигрыватель:
     """Один запуск mpv — один ролик (и его «следующие» через loadfile)."""
 
-    def __init__(self, устройство: str = "") -> None:
+    def __init__(self, устройство: str = "", drm_device: str | None = None) -> None:
         self.устройство = (устройство or "").strip()
+        self.drm_device = (drm_device or "").strip()
         self.сокет = f"/tmp/robot-face-mpv-{uuid.uuid4().hex[:8]}.sock"
         self._proc: subprocess.Popen | None = None
 
@@ -52,6 +53,14 @@ class Проигрыватель:
             # программно легче. При желании можно поднять на месте.
             "--ytdl-format=bv*[height<=480]+ba/b[height<=480]/best",
         ]
+        if self.drm_device:
+            # Без этого mpv выбирает /dev/dri/card* сам — на плате с
+            # несколькими картами не обязательно ту же, где есть подключённая
+            # панель (её нашёл drmout.py перебором). Тогда видео рисуется в
+            # карту без экрана: картинки нет, а звук как ни в чём не бывало
+            # идёт через ALSA отдельным путём — «включил мультик, а играет
+            # только звук».
+            команда.append(f"--drm-device={self.drm_device}")
         if self.устройство:
             команда.append(f"--audio-device=alsa/{self.устройство}")
         команда.append(url)

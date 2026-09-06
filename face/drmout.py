@@ -185,6 +185,7 @@ class ЭкранDRM:
     # --- подготовка --------------------------------------------------------
     def _открыть(self, путь: str) -> None:
         d = self._drm
+        self.путь = путь
         self.fd = os.open(путь, os.O_RDWR | os.O_CLOEXEC)
         рес = d.drmModeGetResources(self.fd)
         if not рес:

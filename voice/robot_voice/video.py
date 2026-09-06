@@ -23,6 +23,13 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# Поиск идёт синхронно внутри хода модели — человек в этот момент ждёт ответа
+# молча. У yt-dlp свой таймаут по умолчанию (и свои повторы поверх него),
+# который ничем не ограничен сверху и может растянуться сильно дольше, чем
+# любой другой сетевой путь в этом файле (ср. weather.py TIMEOUT=8,
+# camera.py ОТВЕТ_ЖДЁМ=20) — а значит и дольше, чем человек готов молчать.
+ТАЙМАУТ = 10.0
+
 
 def possible() -> bool:
     """Есть ли чем искать. Нет yt-dlp — нет и поиска, а не падение."""
@@ -55,6 +62,7 @@ def search(что: str, сколько: int = 8) -> list[tuple[str, str]]:
         "skip_download": True,
         "extract_flat": "in_playlist",
         "noplaylist": True,
+        "socket_timeout": ТАЙМАУТ,
     }
     try:
         with yt_dlp.YoutubeDL(опции) as ydl:
