@@ -1706,6 +1706,7 @@ def _wav(raw: bytes, rate: int) -> bytes:
 # ПК танец начинается от одного и того же условия, посчитанного один раз.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "face"))
 import character  # noqa: E402
+import director  # noqa: E402
 import scenes  # noqa: E402
 
 # Мост к Open-LLM-VTuber — опциональная надстройка, см. pc/ollv_bridge.py.
@@ -1817,11 +1818,65 @@ class Аватар:
         # и без (face/scenes.py). Час и минута — для «пробило час» и утра.
         self.сценарист = scenes.Сценарист()
         self._часы_дня = time.localtime
+        # Режиссёр (face/director.py): раз в полминуты в покое спрашивает
+        # модель, чем человечку заняться, и кладёт её план сценаристу.
+        # Спрашивает — kuzya_pc.main через спросить_режиссёра, в своём
+        # потоке; пока идёт разговор с человеком, режиссёр в очередь к
+        # модели не лезет (разговоров > 0), а сам вопрос — короткий.
+        self.режиссёр = director.Режиссёр()
+        self._режиссёр_думает = False
+        self._разговоров = 0
 
     # Сколько держать настроение ответа: пока робот его произносит, плюс
     # немного. Скорость речи — около четырнадцати знаков в секунду.
     НАСТРОЕНИЕ_МИНИМУМ = 4.0
     ЗНАКОВ_В_СЕКУНДУ = 14.0
+
+    # Кого спросить о плане сценок: (текст вопроса) -> текст ответа. Ставит
+    # main — та же Ollama, что ведёт разговор. None — режиссёра нет, живём
+    # жребием сценариста, как раньше.
+    спросить_режиссёра = None
+
+    def разговор_начался(self) -> None:
+        with self._lock:
+            self._разговоров += 1
+
+    def разговор_кончился(self) -> None:
+        with self._lock:
+            self._разговоров = max(0, self._разговоров - 1)
+
+    def _позвать_режиссёра(self, с: dict, t: float, м) -> None:
+        """Под замком. Пора — собираем вопрос здесь, спрашиваем в потоке."""
+        if (self.спросить_режиссёра is None or self._режиссёр_думает
+                or self._разговоров > 0 or self._часы() < self._настроение_до):
+            return
+        if not self.режиссёр.пора(с, self.сценарист, t):
+            return
+        годные = self.сценарист.годные(с, t, м.tm_hour)
+        вопрос = self.режиссёр.запрос(с, self.сценарист, t, м.tm_hour, м.tm_min)
+        if not вопрос:
+            return
+        self._режиссёр_думает = True
+        threading.Thread(target=self._спросить_режиссёра, args=(вопрос, годные),
+                         name="режиссёр", daemon=True).start()
+
+    def _спросить_режиссёра(self, вопрос: str, годные: list) -> None:
+        try:
+            ответ = self.спросить_режиссёра(вопрос)
+        except Exception as e:                       # noqa: BLE001
+            log.debug("режиссёр: модель не ответила (%s)", e)
+            return
+        finally:
+            with self._lock:
+                self._режиссёр_думает = False
+        with self._lock:
+            принято, реплика = self.режиссёр.принять(self.сценарист, ответ, годные)
+        if принято:
+            log.info("режиссёр: %s%s", ", ".join(принято),
+                     f" — «{реплика}»" if реплика else "")
+        else:
+            log.info("режиссёр: ничего годного не выбрал (%s)",
+                     " ".join(str(ответ).split())[:120])
 
     def принять(self, данные: dict) -> None:
         with self._lock:
@@ -1902,8 +1957,8 @@ class Аватар:
                 с["эмоция"] = self._настроение
             # Сценка — по уже собранному состоянию (с настроением ответа и
             # ртом по звуку): она видит то же, что и страница.
+            м = self._часы_дня()
             try:
-                м = self._часы_дня()
                 с["сцена"] = self.сценарист.кадр(с, сейчас - self._начало,
                                                  час=м.tm_hour, минута=м.tm_min,
                                                  день=м.tm_mday, месяц=м.tm_mon,
@@ -1912,6 +1967,12 @@ class Аватар:
                 log.exception("аватар: сценка не разыгралась")
                 с["сцена"] = {"имя": "", "текст": "", "параметры": {}}
             self._считать_сценку(с["сцена"].get("имя") or "", сейчас)
+            # Режиссёр — по той же обстановке, что видит сценарист. Любая
+            # его беда — в лог, а не в кадр: кадр важнее плана.
+            try:
+                self._позвать_режиссёра(с, сейчас - self._начало, м)
+            except Exception:                       # noqa: BLE001
+                log.exception("режиссёр: не собрал вопрос")
             return с
 
     # Диагностика жизни в покое: без неё «человечек ничего не делает» —
@@ -2718,10 +2779,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._whole_text(model, WARMING_REPLY)
             return
 
-        if req.get("stream"):
-            self._stream(model, messages, tools, limit)
-        else:
-            self._whole(model, messages, tools, limit)
+        # Пока идёт разговор, режиссёр сценок (Аватар._позвать_режиссёра) к
+        # модели не лезет: очередь Ollama одна, и его вопрос задержал бы
+        # ответ человеку.
+        аватар = getattr(self.server, "avatar", None)
+        if аватар is not None:
+            аватар.разговор_начался()
+        try:
+            if req.get("stream"):
+                self._stream(model, messages, tools, limit)
+            else:
+                self._whole(model, messages, tools, limit)
+        finally:
+            if аватар is not None:
+                аватар.разговор_кончился()
 
     def _warming(self) -> bool:
         """Модель ещё грузится, и ждать её дольше, чем ждёт робот.
@@ -3067,6 +3138,16 @@ def main() -> int:
         return ответ
 
     srv.avatar.спросить_настроение = спросить_настроение
+
+    def спросить_режиссёра(вопрос: str) -> str:
+        """План сценок — той же моделью, коротко: имена из списка и реплика."""
+        ответ = ""
+        for часть in ollama.chat(cfg.model, [{"role": "user", "content": вопрос}],
+                                 [], 160):
+            ответ += (часть.get("message") or {}).get("content") or ""
+        return ответ
+
+    srv.avatar.спросить_режиссёра = спросить_режиссёра
     if not args.no_avatar_stream:
         try:
             import playwright  # noqa: F401
