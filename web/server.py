@@ -354,7 +354,11 @@ class Handler(SimpleHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         # Сравниваем раскодированный путь: иначе /server%2Epy проходит мимо
         # проверки, и исходник сервера уезжает любому в домашней сети.
-        if urllib.parse.unquote(path).endswith(".py"):
+        # И байткод тоже: web/__pycache__/server.cpython-311.pyc лежит рядом
+        # и раздавался как обычный файл — это тот же исходник, только в
+        # другой упаковке (decompyle — минута). Ловим и папку, и расширение.
+        раскодирован = urllib.parse.unquote(path)
+        if раскодирован.endswith((".py", ".pyc")) or "__pycache__" in раскодирован:
             self.fail(404, "нет такой страницы")
             return
         # Мостик до rosbridge. Нужен из-за https: страница по https не имеет

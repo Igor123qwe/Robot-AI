@@ -41,6 +41,14 @@ log = logging.getLogger(__name__)
 ДОЛЯ_СВЕТА = 0.5            # изменилось больше половины кадра — это свет, не движение
 ДЕРЖАТЬ = 1.5               # секунд «движение есть» после последнего кадра с ним
 ПОВТОР = 15.0               # секунд между попытками поднять ffmpeg заново
+# Секунд без единого кадра — ffmpeg считается зависшим, и его убивают.
+# Кадры идут четыре раза в секунду; десять секунд тишины — это не пауза, а
+# труба, из которой больше ничего не придёт: камера отвалилась, а ffmpeg
+# сидит на соединении без тайм-аута. Без сторожа read() ниже висел бы
+# вечно, а «почему» честно показывало бы «смотрю».
+БЕЗ_КАДРОВ = 10.0
+# Сколько последних байт stderr ffmpeg хранить для строки «поток оборвался».
+ХВОСТ_STDERR = 300
 
 
 def разница(было: bytes, стало: bytes, ширина: int = ШИРИНА) -> tuple[float, float]:
@@ -130,7 +138,6 @@ class Движение:
                 "-f", "rawvideo", "-"]
 
     def _крутиться(self) -> None:
-        размер = ШИРИНА * ВЫСОТА
         while True:
             try:
                 proc = subprocess.Popen(self._команда(), stdout=subprocess.PIPE,
@@ -142,23 +149,81 @@ class Движение:
                 continue
             self.почему = "смотрю"
             log.info("движение: смотрю поток %s", self.источник)
-            было = b""
-            try:
-                while True:
-                    стало = proc.stdout.read(размер)
-                    if len(стало) < размер:
-                        break
-                    if было:
-                        self.кадр(было, стало)
-                    было = стало
-            finally:
-                беда = b""
-                try:
-                    proc.kill()
-                    беда = (proc.stderr.read() or b"")[-300:]
-                except Exception:               # noqa: BLE001
-                    pass
+            беда = self._читать(proc)
             self.почему = "поток оборвался" + (f": {беда.decode('utf-8', 'replace').strip()}"
                                                if беда else "")
             log.warning("движение: %s — попробую через %.0f с", self.почему, ПОВТОР)
             time.sleep(ПОВТОР)
+
+    def _читать(self, proc) -> bytes:
+        """Читает кадры из ffmpeg, пока поток жив. Возвращает хвост его stderr.
+
+        ДВА ПОТОКА РЯДОМ С ЧТЕНИЕМ, и оба — от живых зависаний.
+
+        stderr сливается ПОСТОЯННО, а не читается после смерти. Раньше он
+        был открыт трубой и не читался никем, пока ffmpeg жив: стоило ему
+        наговорить в stderr шестьдесят четыре килобайта (камера отдаёт
+        битые JPEG-и — и ffmpeg жалуется на каждый), труба наполнялась,
+        ffmpeg вставал на записи в неё, кадры кончались, а read() ниже
+        висел вечно с «почему = смотрю». Слив держит последние байты для
+        строки в журнале — и не больше: это не журнал ffmpeg, это диагноз.
+
+        Сторож по возрасту кадра: нет кадра дольше БЕЗ_КАДРОВ — ffmpeg
+        убивают, read() получает конец файла и цикл заводит его заново.
+        Иначе отвалившаяся камера (ffmpeg сидит на HTTP без тайм-аута)
+        оставляла детектор «смотрящим» до перезапуска сервиса.
+
+        И после kill — wait: иначе зомби на каждый перезапуск ffmpeg.
+        """
+        размер = ШИРИНА * ВЫСОТА
+        хвост = bytearray()
+
+        def сливать() -> None:
+            try:
+                while True:
+                    кусок = proc.stderr.read1(4096) if hasattr(proc.stderr, "read1") \
+                        else proc.stderr.read(4096)
+                    if not кусок:
+                        break
+                    хвост.extend(кусок)
+                    del хвост[:-ХВОСТ_STDERR]
+            except (OSError, ValueError):
+                pass
+
+        последний = [time.monotonic()]
+        кончили = threading.Event()
+
+        def сторожить() -> None:
+            while not кончили.wait(min(1.0, БЕЗ_КАДРОВ / 2)):
+                if time.monotonic() - последний[0] > БЕЗ_КАДРОВ:
+                    log.warning("движение: %.0f с без кадра — ffmpeg завис, убиваю",
+                                БЕЗ_КАДРОВ)
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    return
+
+        threading.Thread(target=сливать, name="движение-stderr", daemon=True).start()
+        threading.Thread(target=сторожить, name="движение-сторож", daemon=True).start()
+        было = b""
+        try:
+            while True:
+                стало = proc.stdout.read(размер)
+                if len(стало) < размер:
+                    break
+                последний[0] = time.monotonic()
+                if было:
+                    self.кадр(было, стало)
+                было = стало
+        finally:
+            кончили.set()
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:                   # noqa: BLE001
+                pass
+        return bytes(хвост)

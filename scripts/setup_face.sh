@@ -74,6 +74,30 @@ echo "==> права на экран"
 # та же засада, что с камерой (см. docs/hardware.md).
 sudo usermod -aG video,render,input wheeltec
 
+echo "==> права на подсветку"
+# /sys/class/backlight/*/brightness ядро создаёт root-only (0644). Служба
+# идёт от wheeltec, и запись туда падала с EACCES на первом же кадре —
+# после чего лицо молча тушило экран программно, умножая каждый кадр
+# (дорого на A55, и панель при этом светит фоном). Отдаём узел группе video,
+# в которой служба и так состоит: правило udev — чтобы это переживало
+# перезагрузку и появление панели, chgrp/chmod — чтобы работало прямо сейчас,
+# без перезагрузки. %k в правиле — имя устройства (backlight0, panel-bl…).
+RULE=/etc/udev/rules.d/90-robot-face-backlight.rules
+sudo tee "$RULE" >/dev/null <<'EOF'
+# Robot-AI: лицу робота (группа video) нужна запись в подсветку панели.
+SUBSYSTEM=="backlight", ACTION=="add", RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"
+EOF
+sudo udevadm control --reload-rules 2>/dev/null || true
+found_backlight=0
+for bl in /sys/class/backlight/*/brightness; do
+  [ -e "$bl" ] || continue
+  found_backlight=1
+  sudo chgrp video "$bl" && sudo chmod g+w "$bl" && echo "    $bl — группе video, запись разрешена"
+done
+if [ "$found_backlight" = 0 ]; then
+  echo "    /sys/class/backlight пуст — яркость будет программной (см. docs/screen.md)"
+fi
+
 # Проверка, что панель вообще включена. RDK X5 настраивается через srpi-config,
 # и пока DSI не выбран там, /dev/dri есть, а картинки нет.
 if ! ls /dev/dri/card* >/dev/null 2>&1; then
