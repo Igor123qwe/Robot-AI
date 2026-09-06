@@ -65,7 +65,10 @@ PIXI.live2d = { Live2DModel: { from: async (path) => {
   const params = {}; const listeners = {};
   const model = { width: 500, height: 900, scale:{set(){}}, anchor:{set(){}},
     position:{set(){}, y:0}, rotation:0,
-    internalModel: { on(ev, fn){ listeners[ev]=fn; }, coreModel: {
+    internalModel: { on(ev, fn){ listeners[ev]=fn; },
+      motionManager: { definitions: { Idle: [{}], TapBody: [{}], Flick: [{}], Shake: [{}] } },
+      settings: { expressions: [{Name: "normal"}, {Name: "smile"}, {Name: "sad"}] },
+      coreModel: {
       getParameterValueById(id){ return params[id]||0; },
       setParameterValueById(id,v){ params[id]=v; } } },
     expression(n){ model.__expr=n; }, motion(g){ model.__motion=g; } };
@@ -232,6 +235,28 @@ with sync_playwright() as p:
     page.wait_for_timeout(300); кадры(40)
     check("сценка кончилась — наклон корпуса ушёл в ноль, а не остался запечённым",
           abs(парам("ParamBodyAngleZ")) < 1.0, True)
+
+    # 10. Готовые поведения модели: группы motion и выражения подобраны по
+    # именам, движение играется раз на старте сценки с таким поводом,
+    # выражение — по эмоции, без единой строчки в config.json.
+    готовые = page.evaluate("window.__готовые")
+    check("группы движений модели найдены и разложены по поводам (Tap → встреча, Flick → движение, Shake → тревога)",
+          (готовые["движения"]["человек_пришёл"], готовые["движения"]["движение"], готовые["движения"]["тревога"]),
+          ("TapBody", "Flick", "Shake"))
+    check("выражения модели разложены по эмоциям (smile → рад, sad → огорчён)",
+          (готовые["выраженияПоЭмоции"]["рад"], готовые["выраженияПоЭмоции"]["огорчён"]), ("smile", "sad"))
+    class _Встреча:
+        def кадр(self, *a, **kw):
+            return {"имя": "помахал рукой", "когда": "человек_пришёл", "текст": "Привет!", "параметры": {}}
+    srv.avatar.сценарист = _Встреча()
+    page.evaluate("window.__model.__motion = ''; window.__сыграно = []")
+    for _ in range(4):
+        post({"эмоция": "рад", "говорит": "", "музыка": {"играет": False}})
+        page.wait_for_timeout(150)
+    check("сценка встречи → у модели сыграно её движение TapBody, один раз, а не на каждый опрос",
+          (page.evaluate("window.__model.__motion"), page.evaluate("window.__сыграно.length")), ("TapBody", 1))
+    check("эмоция «рад» → выражение smile самой модели", page.evaluate("window.__model.__expr"), "smile")
+    srv.avatar.сценарист = _БезСценок()
 
     # 9. Руки сценки («помахал рукой»: рука_п 60 = до упора) — в параметр
     # руки из config.json, в его размахе; левой в config нет — ничего не

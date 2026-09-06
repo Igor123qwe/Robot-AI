@@ -1709,6 +1709,16 @@ import character  # noqa: E402
 import scenes  # noqa: E402
 
 
+def свои_праздники(папка) -> dict:
+    """«праздники» из config.local.json: {"ДД-ММ": "что сказать"}; нет — пусто."""
+    try:
+        своё = json.loads((папка / "config.local.json").read_text(encoding="utf-8"))
+        праздники = своё.get("праздники") or {}
+        return {str(к): str(з) for к, з in праздники.items()} if isinstance(праздники, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
 def настроение_по_слову(ответ: str) -> str:
     """Вердикт модели → «рад» | «огорчён» | «спокоен» | «» (не разобрала).
 
@@ -1890,7 +1900,9 @@ class Аватар:
             try:
                 м = self._часы_дня()
                 с["сцена"] = self.сценарист.кадр(с, сейчас - self._начало,
-                                                 час=м.tm_hour, минута=м.tm_min)
+                                                 час=м.tm_hour, минута=м.tm_min,
+                                                 день=м.tm_mday, месяц=м.tm_mon,
+                                                 день_недели=м.tm_wday)
             except Exception:                       # noqa: BLE001
                 log.exception("аватар: сценка не разыгралась")
                 с["сцена"] = {"имя": "", "текст": "", "параметры": {}}
@@ -2962,6 +2974,9 @@ def main() -> int:
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.cfg = cfg
     srv.avatar = Аватар()
+    # Свои праздники и дни рождения — из config.local.json («праздники»:
+    # {"05-12": "С днём рождения, Игорь!"}), к встроенным датам сценария.
+    srv.avatar.сценарист = scenes.Сценарист(праздники=свои_праздники(Handler.АВАТАР_ПАПКА))
 
     def спросить_настроение(текст: str) -> str:
         """Одним коротким запросом к той же модели: пять токенов, доли секунды."""
