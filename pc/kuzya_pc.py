@@ -1708,6 +1708,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "face"))
 import character  # noqa: E402
 import scenes  # noqa: E402
 
+# Мост к Open-LLM-VTuber — опциональная надстройка, см. pc/ollv_bridge.py.
+# Отдельный модуль рядом, не пакет: включается только переменной окружения
+# OLLV_URL, и без неё этого импорта как будто и не было.
+import ollv_bridge  # noqa: E402
+
 
 def свои_праздники(папка) -> dict:
     """«праздники» из config.local.json: {"ДД-ММ": "что сказать"}; нет — пусто."""
@@ -2279,6 +2284,27 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/avatar" or path.startswith("/avatar/"):
             self._avatar_get(path[len("/avatar"):].lstrip("/"))
             return
+        # Мост к Open-LLM-VTuber (pc/ollv_bridge.py) — их провайдеры-заглушки
+        # спрашивают отсюда, что сейчас говорит робот. Моста нет (OLLV_URL не
+        # задан) — маршрутов тоже нет, честные 404, а не пустой ответ.
+        мост = getattr(self.server, "мост_ollv", None)
+        if path == "/ollv/line":
+            if мост is None:
+                self._json(404, {"error": "мост к OLLV не поднят (OLLV_URL не задан)"})
+            else:
+                self._json(200, мост.строка())
+            return
+        if path == "/ollv/audio":
+            if мост is None:
+                self._json(404, {"error": "мост к OLLV не поднят (OLLV_URL не задан)"})
+                return
+            звук = мост.звук()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(звук)))
+            self.end_headers()
+            self.wfile.write(звук)
+            return
         self._json(404, {"error": "нет такого адреса"})
 
     def do_POST(self) -> None:
@@ -2557,6 +2583,15 @@ class Handler(BaseHTTPRequestHandler):
                 аватар.озвучил(wav[44:], voice.RATE)
             except Exception:                       # noqa: BLE001
                 log.exception("аватар: не разобрал звук под рот")
+        # И туда же, если поднят мост к Open-LLM-VTuber: тот же текст, та
+        # же эмоция, тот же звук — без второго синтеза и лишней нагрузки.
+        мост = getattr(self.server, "мост_ollv", None)
+        if мост is not None:
+            try:
+                эмоция = аватар.состояние().get("эмоция", "спокоен") if аватар else "спокоен"
+                мост.готово(text, эмоция, wav[44:], voice.RATE)
+            except Exception:                       # noqa: BLE001
+                log.exception("мост к OLLV: не передал фразу")
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")
         self.send_header("Content-Length", str(len(wav)))
@@ -3013,6 +3048,14 @@ def main() -> int:
     # Свои праздники и дни рождения — из config.local.json («праздники»:
     # {"05-12": "С днём рождения, Игорь!"}), к встроенным датам сценария.
     srv.avatar.сценарист = scenes.Сценарист(праздники=свои_праздники(Handler.АВАТАР_ПАПКА))
+    # Мост к Open-LLM-VTuber — по умолчанию его нет, свой аватар работает
+    # как раньше. Задан OLLV_URL — поднимаем: их провайдеры-заглушки
+    # (pc/ollv_bridge/README.md) спрашивают фразу здесь же, этим сервером.
+    ollv_url = os.environ.get("OLLV_URL", "").strip()
+    if ollv_url:
+        srv.мост_ollv = ollv_bridge.Мост(ollv_url)
+        srv.мост_ollv.start()
+        log.info("мост к Open-LLM-VTuber: %s", ollv_url)
 
     def спросить_настроение(текст: str) -> str:
         """Одним коротким запросом к той же модели: пять токенов, доли секунды."""

@@ -1892,12 +1892,125 @@ def test_scenes() -> None:
           (True, True))
 
 
+def test_ollv_bridge() -> None:
+    """Мост к Open-LLM-VTuber: очередь на одну фразу плюс свой WS-клиент.
+
+    Опциональная надстройка (voice: включается OLLV_URL), которая не трогает
+    ни свой аватар, ни сценарист. Проверяется отдельно от них: очередь —
+    числами, WAV — по байтам заголовка, а рукопожатие и кадр — против
+    настоящего сервера по протоколу (RFC 6455), поднятого здесь же на
+    голом сокете, без реального Open-LLM-VTuber.
+    """
+    section("мост к Open-LLM-VTuber")
+    import base64
+    import hashlib
+    import socket
+    import struct
+    import threading
+    import time
+
+    import ollv_bridge as мб
+
+    # --- очередь: текст, эмоция → тег, звук --------------------------------
+    ч = [10.0]
+    м = мб.Мост("127.0.0.1:12393", часы=lambda: ч[0])
+    check("до первой фразы — номер 0, текста нет", м.строка(), {"номер": 0, "текст": ""})
+    м.готово("Привет!", "рад", b"\x10\x00\x20\x00", 22050)
+    check("эмоция стала тегом OLLV, номер вырос", м.строка(), {"номер": 1, "текст": "[joy] Привет!"})
+    м.готово("Не понял.", "не_понял", b"\x00\x00", 16000)
+    check("другая эмоция — другой тег, номер снова вырос",
+          м.строка(), {"номер": 2, "текст": "[surprise] Не понял."})
+    м.готово("Просто говорю.", "неизвестная-эмоция", b"", 22050)
+    check("неизвестное слово эмоции — тега нет, но текст цел",
+          м.строка()["текст"], "Просто говорю.")
+    звук = м.звук()
+    check("WAV собран правильно: заголовок RIFF/WAVE, частота, данные на месте",
+          (звук[:4], звук[8:12], struct.unpack("<I", звук[24:28])[0], звук[44:]),
+          (b"RIFF", b"WAVE", 22050, b""))
+
+    # --- кадр_текстом: чистая функция, проверяется по протоколу --------------
+    кадр = мб.кадр_текстом("привет")
+    check("кадр промаскирован (клиент обязан маскировать) — бит 0x80 в длине", кадр[1] & 0x80, 0x80)
+    маска, тело = кадр[2:6], кадр[6:]
+    check("размаскированный кадр — исходный текст в UTF-8",
+          bytes(б ^ маска[i % 4] for i, б in enumerate(тело)), "привет".encode("utf-8"))
+    длинная = мб.кадр_текстом("ф" * 200)
+    check("кадр длиннее 125 байт — 16-битная длина (второй байт 126)", длинная[1] & 0x7F, 126)
+
+    # --- рукопожатие и сигнал — против настоящего сервера по RFC 6455 --------
+    ПРИВЯЗКА_WS = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    получено: list[str] = []
+    сервер = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    сервер.bind(("127.0.0.1", 0))
+    сервер.listen(1)
+    порт = сервер.getsockname()[1]
+
+    def фальшивый_ollv() -> None:
+        соединение, _ = сервер.accept()
+        with соединение:
+            запрос = b""
+            while b"\r\n\r\n" not in запрос:
+                запрос += соединение.recv(4096)
+            заголовки = запрос.decode("ascii", "replace")
+            check("рукопожатие просит апгрейд до websocket, версию 13",
+                  ("Upgrade: websocket" in заголовки, "Sec-WebSocket-Version: 13" in заголовки),
+                  (True, True))
+            ключ = next(с.split(":", 1)[1].strip() for с in заголовки.split("\r\n")
+                       if с.lower().startswith("sec-websocket-key:"))
+            принято = base64.b64encode(
+                hashlib.sha1((ключ + ПРИВЯЗКА_WS).encode()).digest()).decode()
+            соединение.sendall(
+                (b"HTTP/1.1 101 Switching Protocols\r\n"
+                 b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                 + f"Sec-WebSocket-Accept: {принято}\r\n\r\n".encode()))
+            голова = соединение.recv(2)
+            длина = голова[1] & 0x7F
+            маска = соединение.recv(4)
+            замаскировано = соединение.recv(длина)
+            получено.append(bytes(б ^ маска[i % 4] for i, б in
+                                  enumerate(замаскировано)).decode("utf-8"))
+
+    поток = threading.Thread(target=фальшивый_ollv, daemon=True)
+    поток.start()
+    м2 = мб.Мост(f"127.0.0.1:{порт}/client-ws")
+    м2._послать_сигнал()
+    поток.join(timeout=3.0)
+    check("настоящий (по протоколу) сервер принял рукопожатие и прочитал наш кадр",
+          получено, ['{"type": "ai-speak-signal"}'])
+    сервер.close()
+
+    # --- фоновый поток: будится, шлёт, не долбит без повода -------------------
+    сигналов: list[int] = []
+    м3 = мб.Мост("127.0.0.1:1")           # порт, где никто не слушает — только считаем попытки
+    м3._послать_сигнал = lambda: sigнализировать(сигналов)
+
+    def sigнализировать(лог):
+        лог.append(1)
+
+    м3.start()
+    м3.готово("Тест", "спокоен", b"", 16000)
+    срок = time.monotonic() + 2.0
+    while len(сигналов) < 1 and time.monotonic() < срок:
+        time.sleep(0.02)
+    check("новая фраза будит фоновый поток — сигнал отправлен один раз", сигналов, [1])
+    м3.stop()
+
+    # --- провода в kuzya_pc.py: /tts кладёт фразу в мост, роуты подключены ---
+    исходник = (Path(__file__).resolve().parent / "kuzya_pc.py").read_text(encoding="utf-8")
+    check("kuzya_pc.py: /tts сообщает мосту готовую фразу тем же звуком, что и роботу",
+          "мост.готово(" in исходник, True)
+    check("kuzya_pc.py: HTTP-роуты /ollv/line и /ollv/audio подключены",
+          ('"/ollv/line"' in исходник, '"/ollv/audio"' in исходник), (True, True))
+    check("мост включается только переменной окружения (по умолчанию выключен, ничего не трогает)",
+          'os.environ.get("OLLV_URL"' in исходник, True)
+
+
 def main() -> int:
     # Whisper в проверке не участвует: он про видеокарту, а не про логику.
     for test in (test_messages, test_stream, test_ping, test_whisper_fallback, test_tts, test_voiceprints, test_жилец_по_имени_что, test_warming, test_think_switch, test_model_choice,
                  test_tool_call, test_broken,
                  test_context_window, test_unthink, test_gigaam, test_no_initial_prompt, test_stt_confidence, test_health, test_avatar,
-                 test_avatar_stream, test_avatar_reactions, test_scenes):
+                 test_avatar_stream, test_avatar_reactions, test_scenes, test_ollv_bridge):
         test()
         print("   ...")
     if FAILED:
