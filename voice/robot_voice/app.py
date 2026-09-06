@@ -167,6 +167,12 @@ GARBAGE_BELOW = -1.15
 UNSURE_BELOW = -0.85
 
 
+def _сегодня() -> tuple[int, int]:
+    """(день, месяц) — для дней рождения из личных дел (people.py)."""
+    сейчас = datetime.now()
+    return сейчас.day, сейчас.month
+
+
 def _лицо(voice, что: str, *доводы) -> None:
     """Сказать лицу, если оно есть. Нет экрана — нет и ошибки.
 
@@ -2081,7 +2087,7 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # принадлежать другому человеку, и подтверждать ею знакомство — значит
             # приписать его голос чужому имени.
             who = "" if мгновенный else getattr(recognizer, "speaker", "")
-            brain.about = people.brief(who)
+            brain.about = people.brief(who, today=_сегодня())
             sure = None if мгновенный else getattr(recognizer, "confidence", None)
             if debug_audio:
                 _dump_audio(wav, text)
@@ -2223,11 +2229,16 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             узнан = meeting.confirm(метка) or who
             if узнан:
                 people.met(узнан)
+                # Личное дело помнит день рождения (remember_birthday) — и
+                # сегодня как раз тот день: персонаж празднует на экране.
+                # people.отпраздновать сама следит, чтобы это было раз в
+                # день, а не на каждой узнанной фразе разговора.
+                _лицо(voice, "праздник", people.отпраздновать(узнан, _сегодня()))
                 if узнан != who:
                     # Голос завели прямо сейчас: справку для модели надо
                     # пересобрать, иначе первый разговор пройдёт мимо дела.
                     who = узнан
-                    brain.about = people.brief(who)
+                    brain.about = people.brief(who, today=_сегодня())
 
             if meeting.name_is(command, who, voice, people):
                 awake_until = time.monotonic() + cfg.session_seconds

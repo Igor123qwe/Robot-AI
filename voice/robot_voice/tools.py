@@ -2414,6 +2414,41 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
         ]
 
+        def remember_birthday(день: int, месяц: int) -> str:
+            # Тот же довод, что у remember_person: без узнанного голоса
+            # дата ушла бы в карточку неизвестно кого.
+            кто = who()
+            if not кто:
+                return "Не понял, кто говорит — не записываю."
+            насколько = уверенность() if уверенность is not None else 1.0
+            if насколько < УЗНАЛИ_ГОЛОС_ОТ:
+                return "Не понял, кто говорит — не записываю."
+            return people.set_birthday(кто, день, месяц)
+
+        tools += [
+            Tool(
+                name="remember_birthday",
+                description=(
+                    "Записать день рождения того, кто сейчас говорит. Зови "
+                    "сам, как только услышал дату («у меня день рождения "
+                    "пятого декабря», «родился 12 июня») — не переспрашивая "
+                    "и не объявляя вслух, что записал. В этот день ты сам "
+                    "увидишь в справке о собеседнике, что сегодня у него "
+                    "праздник, и сможешь поздравить."),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "день": {"type": "integer", "minimum": 1, "maximum": 31,
+                                 "description": "Число месяца."},
+                        "месяц": {"type": "integer", "minimum": 1, "maximum": 12,
+                                  "description": "Месяц, 1 — январь, 12 — декабрь."},
+                    },
+                    "required": ["день", "месяц"],
+                },
+                run=remember_birthday,
+            ),
+        ]
+
     if notes is not None:
         tools += [
             Tool(
