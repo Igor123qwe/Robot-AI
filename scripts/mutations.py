@@ -1401,6 +1401,52 @@ def вернуть_недоделанное() -> None:
      "киваешь, а всё",
      "первое лицо, глаза"),
 
+    # --- видео (мультики с YouTube) -----------------------------------------
+    ("видео: «стоп» не проверяет видео первым — заглушит колёса, а мультик "
+     "продолжит играть",
+     "voice/robot_voice/tools.py",
+     '        if видео is not None and видео.видео_играет():\n'
+     '            ros.stop_motion()\n'
+     '            return видео.видео_стоп()\n'
+     '        # moving',
+     '        # moving',
+     "гасит именно его"),
+
+    ("видео: голое «выключи» (stop_music) не проверяет видео первым",
+     "voice/robot_voice/tools.py",
+     '        if видео is not None and видео.видео_играет():\n'
+     '            return видео.видео_стоп()\n'
+     '        играет = player is not None and player.играет',
+     '        играет = player is not None and player.играет',
+     "stop_music: видео играет"),
+
+    ("видео: «погромче»/«потише» (music_volume) не проверяет видео первым",
+     "voice/robot_voice/tools.py",
+     '        if видео is not None and видео.видео_играет():\n'
+     '            return видео.видео_громкость(изменение)\n'
+     '        if player is None or not player.играет:',
+     '        if player is None or not player.играет:',
+     "видео: громче"),
+
+    ("видео: «следующий мультик» не двигает список — крутит один и тот же ролик",
+     "voice/robot_voice/face.py",
+     "            self._видео_индекс += 1",
+     "            pass",
+     "второй ролик из уже найденного"),
+
+    ("видео: mpv без --vo=drm не нарисует ничего на этой панели (нет GPU/Mesa)",
+     "face/videoplayer.py",
+     '"mpv", "--no-terminal", "--really-quiet", "--vo=drm",',
+     '"mpv", "--no-terminal", "--really-quiet",',
+     "видеовыход drm"),
+
+    ("видео: правило _video не подключено к общему списку — «пауза»/«дальше» "
+     "уходят модели вместо мгновенного ответа",
+     "voice/robot_voice/intents.py",
+     "_voice_control, _abilities, _look, _music, _video, _rates, _news, _where,",
+     "_voice_control, _abilities, _look, _music, _rates, _news, _where,",
+     "video_pause"),
+
     # --- речь на своём динамике, частоты, лицо не ждёт сети ------------------
     ("речь: «замолчи» на своём динамике не обрывает реплику",
      "voice/robot_voice/tts.py",

@@ -26,3 +26,10 @@ websocket-client>=1.7
 # библиотека, поставленная системному, ей не видна.
 #     voice/.venv/bin/pip install yandex-music
 #     voice/.venv/bin/python voice/yandex_auth.py
+
+# Мультики/видео с YouTube (voice/robot_voice/video.py) — поиск без токена и
+# аккаунта, свободной утилитой. Без неё «включи мультики» честно ответит,
+# что искать нечем, а не упадёт. Играет найденное mpv на самом экране робота
+# (face/videoplayer.py) — mpv тоже должен быть установлен (тот же пакет, что
+# уже нужен для музыки, см. README).
+#     voice/.venv/bin/pip install yt-dlp
