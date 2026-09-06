@@ -48,11 +48,33 @@ function показать(текст) {
  * без объяснения — худшее, что можно показать. Так страница рисуется
  * сразу, а чего не хватает — пишет сама.
  */
-const СКРИПТЫ = [
+/*
+ * ДВА ФОРМАТА МОДЕЛЕЙ. Новый — Cubism 3/4 (`.model3.json`, ядро
+ * live2dcubismcore.min.js с сайта Live2D), старый — Cubism 2.1
+ * (`.model.json`, ядро live2d.min.js; Live2D его больше не раздаёт, берётся
+ * с зеркала, на которое ссылается сама pixi-live2d-display). В старом
+ * формате — Shizuku, самый известный персонаж Live2D (pc/avatar/samples/),
+ * и добрая половина моделей из чужих подборок. Мост pixi-live2d-display
+ * для каждого формата свой (cubism2.min.js / cubism4.min.js): общая сборка
+ * index.min.js требует ОБА ядра сразу и без любого из них не загружается
+ * вовсе — а тянуть второе ядро ради формата, который сейчас не нужен,
+ * значит зависеть от второго сайта зря. Какой формат — видно по имени
+ * файла модели, поэтому настройки читаются раньше библиотек.
+ */
+const СКРИПТЫ_CUBISM4 = [
   "https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js",
   "https://cdn.jsdelivr.net/npm/pixi.js@6.5.9/dist/browser/pixi.min.js",
   "https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js",
 ];
+const СКРИПТЫ_CUBISM2 = [
+  "https://cdn.jsdelivr.net/gh/dylanNew/live2d/webgl/Live2D/lib/live2d.min.js",
+  "https://cdn.jsdelivr.net/npm/pixi.js@6.5.9/dist/browser/pixi.min.js",
+  "https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism2.min.js",
+];
+function старый_формат(путь) {
+  // «shizuku.model.json» — Cubism 2; «Mao.model3.json» — Cubism 3/4.
+  return /\.model\.json(\?.*)?$/i.test(String(путь || ""));
+}
 function скрипт(адрес) {
   return new Promise((готово, беда) => {
     const s = document.createElement("script");
@@ -63,15 +85,26 @@ function скрипт(адрес) {
   });
 }
 
-async function главная() {
-  try {
-    for (const адрес of СКРИПТЫ) await скрипт(адрес);
-  } catch (e) {
-    показать("Нужен интернет: " + e.message +
-             "\nБиблиотеки Live2D и pixi.js берутся с их сайтов при каждом открытии.");
-    return;
-  }
+/*
+ * ИМЕНА ПАРАМЕТРОВ В СТАРОМ ФОРМАТЕ. Cubism 2 зовёт те же вещи иначе:
+ * ParamAngleX → PARAM_ANGLE_X, ParamMouthOpenY → PARAM_MOUTH_OPEN_Y — по
+ * одному правилу (слова через подчёркивание, заглавными), плюс пара имён,
+ * которые у старых моделей просто другие (корпус, румянец). Вся страница
+ * говорит новыми именами, перевод — в одном месте, при обращении к ядру.
+ */
+const ПСЕВДОНИМЫ_CUBISM2 = {
+  PARAM_BODY_ANGLE_X: ["PARAM_BODY_X"], PARAM_BODY_ANGLE_Y: ["PARAM_BODY_Y"],
+  PARAM_BODY_ANGLE_Z: ["PARAM_BODY_Z"], PARAM_CHEEK: ["PARAM_TERE"],
+};
+function имя_cubism2(id) {
+  if (/^[A-Z0-9_]+$/.test(id)) return id;             // уже старое имя
+  return id.replace(/([a-z0-9])([A-Z])/g, "$1_$2")     // ParamEyeLOpen → Param_Eye_L_Open
+           .replace(/([A-Z])([A-Z][a-z])/g, "$1_$2")   // …LOpen → L_Open
+           .replace(/([A-Z])([XYZ])$/, "$1_$2")         // ParamBrowLY → …Brow_L_Y
+           .toUpperCase();
+}
 
+async function главная() {
   let настройки;
   try {
     const ответ = await fetch("config.json", { cache: "no-store" });
@@ -94,6 +127,15 @@ async function главная() {
     return;
   }
 
+  const cubism2 = старый_формат(настройки.модель);
+  try {
+    for (const адрес of (cubism2 ? СКРИПТЫ_CUBISM2 : СКРИПТЫ_CUBISM4)) await скрипт(адрес);
+  } catch (e) {
+    показать("Нужен интернет: " + e.message +
+             "\nБиблиотеки Live2D и pixi.js берутся с их сайтов при каждом открытии.");
+    return;
+  }
+
   const app = new PIXI.Application({
     resizeTo: window,
     backgroundAlpha: 0,
@@ -107,8 +149,9 @@ async function главная() {
     модель = await PIXI.live2d.Live2DModel.from(настройки.модель);
   } catch (e) {
     показать("Не загрузил модель «" + настройки.модель + "»: " + e +
-             "\nПроверь путь \"модель\" в config.json — .model3.json должен " +
-             "лежать по этому пути внутри pc/avatar/.");
+             "\nПроверь путь \"модель\" в config.json — .model3.json (или " +
+             ".model.json у старых моделей) должен лежать по этому пути внутри " +
+             "pc/avatar/. Готовые: samples/shizuku/shizuku.model.json, samples/mao/Mao.model3.json.");
     return;
   }
   app.stage.addChild(модель);
@@ -170,15 +213,48 @@ async function главная() {
 
   const ядро = модель.internalModel.coreModel;
   const п = настройки.параметры || {};
+  // Ядро старого формата зовёт параметры setParamFloat/getParamFloat и
+  // старыми именами; нового — setParameterValueById и новыми. Страница
+  // везде говорит новыми именами, разница — только здесь.
+  const старое_ядро = cubism2 || (typeof ядро.setParameterValueById !== "function"
+                                  && typeof ядро.setParamFloat === "function");
+  function имена(id) {
+    if (!старое_ядро) return [id];
+    const старое = имя_cubism2(id);
+    return [старое].concat(ПСЕВДОНИМЫ_CUBISM2[старое] || []);
+  }
   function значение(id) {
-    try { return ядро.getParameterValueById(id) || 0; } catch (e) { return 0; }
+    try {
+      const имя = имена(id)[0];
+      return (старое_ядро ? ядро.getParamFloat(имя) : ядро.getParameterValueById(имя)) || 0;
+    } catch (e) { return 0; }
   }
   function поставить(id, v) {
     // Не у каждой модели есть каждый параметр — молча пропускаем то, чего
     // нет, а не роняем страницу из-за чужого файла модели.
     if (!id) return;
-    try { ядро.setParameterValueById(id, v); } catch (e) { /* нет такого */ }
+    for (const имя of имена(id)) {
+      try {
+        if (старое_ядро) ядро.setParamFloat(имя, v); else ядро.setParameterValueById(имя, v);
+      } catch (e) { /* нет такого */ }
+    }
   }
+  /*
+   * РОТ — НЕ ВСЕГДА ParamMouthOpenY. У Mao (официальный образец Live2D)
+   * такого параметра нет вовсе, рот открывает ParamA, и это записано в самой
+   * модели — группа LipSync в .model3.json. Поэтому: параметр из config
+   * берётся, если он у модели есть; нет — тот, что модель сама назвала для
+   * речи; нет и его — стандартное имя, как раньше. Список параметров есть
+   * только у нового ядра; у старого имена стандартные, там сомнений нет.
+   */
+  const список_параметров = (((ядро || {})._model || {}).parameters || {}).ids || null;
+  function есть_параметр(id) { return !список_параметров || список_параметров.includes(id); }
+  const настройки_модели = (модель.internalModel || {}).settings || {};
+  const группы_параметров = настройки_модели.groups || (настройки_модели.json || {}).Groups || [];
+  const липсинк = ((группы_параметров.find(г => g_имя(г) === "LipSync") || {}).Ids || [])[0] || "";
+  function g_имя(г) { return (г && (г.Name || г.name || "")) + ""; }
+  const РОТ = (п.рот && есть_параметр(п.рот)) ? п.рот : (липсинк || п.рот || "ParamMouthOpenY");
+  window.__ядро = { старое: старое_ядро, рот: РОТ, липсинк, имя_cubism2 };
 
   /*
    * ЭМОЦИИ БЕЗ НАСТРОЙКИ. Выражения (expressions) есть не у каждой модели,
@@ -290,6 +366,36 @@ async function главная() {
         try { модель.motion(группа); } catch (e) { /* нет такой группы */ }
       }
     }
+    жест_в_покое(с, поза, сцена);
+  }
+
+  /*
+   * ЖЕСТЫ В ПОКОЕ. Настольные виджеты (live2d-widget и подобные) время от
+   * времени сами проигрывают авторские движения модели — потянуться,
+   * наклонить голову, махнуть рукой, — просто чтобы персонаж не простаивал.
+   * У нас такие движения играли только по сценкам, а те редкие и с паузами:
+   * между ними модель лишь дышит. Теперь раз в ЖЕСТЫ_В_ПОКОЕ секунд (срок
+   * случайный, иначе читается расписанием) — случайное движение из группы
+   * «тап», самой живой у готовых моделей. Не поверх дела: пока сценка,
+   * речь, сон или танец — не лезем; срок просто откладывается.
+   * config.json: "жесты_в_покое": [10, 25] — секунды; 0 или [] — выключить.
+   */
+  const ЖЕСТЫ_В_ПОКОЕ = Array.isArray(настройки.жесты_в_покое)
+    ? настройки.жесты_в_покое : (настройки.жесты_в_покое === 0 ? [] : [10, 25]);
+  function срок_жеста() {
+    if (ЖЕСТЫ_В_ПОКОЕ.length < 2) return Infinity;
+    const [мин, макс] = ЖЕСТЫ_В_ПОКОЕ;
+    return performance.now() + (мин + Math.random() * Math.max(0, макс - мин)) * 1000;
+  }
+  let жест_в = срок_жеста();
+  window.__жестов_покоя = 0;
+  function жест_в_покое(с, поза, сцена) {
+    if (performance.now() < жест_в) return;
+    жест_в = срок_жеста();
+    const занят = !!сцена.имя || !!с.говорит || с.эмоция === "сплю" || поза.метка === "танцует";
+    if (занят || !тап) return;
+    window.__жестов_покоя++;
+    try { модель.motion(тап); } catch (e) { /* нет такой группы */ }
   }
 
   /*
@@ -438,7 +544,7 @@ async function главная() {
     // шире, тот и виден: зевок посреди реплики не закроет рта, и реплика
     // не отменит зевок.
     if (!Number.isFinite(рот_сцены)) рот_сцены = 0;   // битое число из config.json/сценки — не открытый рот
-    поставить(п.рот || "ParamMouthOpenY",
+    поставить(РОТ,
               эмоция === "сплю" ? 0 : Math.max(0, Math.min(1, Math.max(поза.рот || 0, рот_сцены))));
     // Спит — глаза закрыты. Только во сне: в остальное время моргание модели
     // само владеет веками, и трогать их — значит отучить её моргать. Сценка

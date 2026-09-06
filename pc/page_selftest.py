@@ -106,6 +106,11 @@ with sync_playwright() as p:
     настройки = json.loads((Path(__file__).resolve().parent / "avatar" / "config.json").read_text(encoding="utf-8"))
     настройки["параметры"]["рука_п"] = "ParamArmRA"
     настройки["параметры"]["рука_размах"] = 10
+    # Основной прогон — на модели нового формата (Cubism 4): по имени файла
+    # страница выбирает, какие библиотеки грузить, и заглушки ниже — именно
+    # для них. Старый формат (Shizuku, .model.json) проверяется отдельно.
+    настройки["модель"] = "samples/mao/Mao.model3.json"
+    настройки["жесты_в_покое"] = 0            # жесты в покое — отдельной страницей ниже
     page.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки, ensure_ascii=False),
                                                      content_type="application/json"))
     ошибки = []
@@ -207,24 +212,6 @@ with sync_playwright() as p:
     check("человек → голова повёрнута (ParamAngleX > 10)", парам("ParamAngleX") > 10, True)
     check("человек → глаза в ту же сторону", парам("ParamEyeBallX") > 0.3, True)
 
-    # 6б. Рассеянный взгляд: без человека, сценки и танца — голова и глаза
-    # не должны стоять чучелом в одной точке между редкими сценками. Живая
-    # жалоба, из-за которой это появилось: «двигается просто вверх-вниз-
-    # влево-вправо, нет ощущения живого персонажа» — а на Live2D между
-    # сценками голова и глаза вообще не шевелились.
-    post({"эмоция": "спокоен", "человек": False, "говорит": "", "музыка": {"играет": False}})
-    page.wait_for_timeout(300)
-    бл_x, бл_y = [], []
-    for _ in range(80):
-        page.evaluate("window.__listeners.afterMotionUpdate()")
-        бл_x.append(парам("ParamAngleX")); бл_y.append(парам("ParamEyeBallY"))
-        page.wait_for_timeout(50)
-    check("рассеянный взгляд: голова не застывает в одной точке",
-          len({round(x, 2) for x in бл_x}) > 5, True)
-    check("рассеянный взгляд: глаза тоже блуждают",
-          len({round(y, 2) for y in бл_y}) > 5, True)
-    check("рассеянный взгляд: амплитуда небольшая — блуждание, а не рывок через весь экран",
-          max(abs(x) for x in бл_x) < 8, True)
 
     # 7. Сценка открывает рот («зевнул», «свистит», «смеётся»). Раньше рот
     # сценки складывался как сдвиг, а потом затирался абсолютным ртом позы —
@@ -343,6 +330,189 @@ with sync_playwright() as p:
     post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": False}})
     page.wait_for_timeout(300); кадры(40)
     check("сценка кончилась — рука опущена", abs(парам("ParamArmRA")) < 1.0, True)
+
+    # 12. Старый формат (Cubism 2, Shizuku из samples/): по имени файла
+    # страница грузит другое ядро и другой мост, параметры зовёт старыми
+    # именами (ParamMouthOpenY → PARAM_MOUTH_OPEN_Y) через setParamFloat,
+    # корпус — и стандартным PARAM_BODY_ANGLE_X, и PARAM_BODY_X, как у
+    # Shizuku. Заглушка ядра — только старый API: setParameterValueById у
+    # неё нет, и если страница позовёт его — параметр не встанет.
+    CUBISM2_STUB = """
+    PIXI.live2d = { Live2DModel: { from: async (path) => {
+      const params = {}; const listeners = {};
+      const model = { width: 500, height: 900, scale:{set(){}}, anchor:{set(){}},
+        position:{set(){}, y:0}, rotation:0,
+        internalModel: { on(ev, fn){ listeners[ev]=fn; },
+          motionManager: { definitions: { idle: [{}], tap_body: [{}], flick_head: [{}], shake: [{}] } },
+          settings: { expressions: [{name: "f01", file: "exp/f01.exp.json"}] },
+          coreModel: {
+          getParamFloat(id){ return params[id]||0; },
+          setParamFloat(id,v){ params[id]=v; } } },
+        expression(n){ model.__expr=n; }, motion(g){ model.__motion=g; model.__motions=(model.__motions||0)+1; } };
+      window.__model = model; window.__params = params; window.__listeners = listeners;
+      return model; } } };
+    """
+    page2 = b.new_page(viewport={"width": 1280, "height": 800})
+    запросы2 = []
+    page2.on("request", lambda r: запросы2.append(r.url))
+    page2.route("**/live2d.min.js", lambda r: r.fulfill(body="", content_type="text/javascript"))
+    page2.route("**/pixi.min.js", lambda r: r.fulfill(body=PIXI_STUB, content_type="text/javascript"))
+    page2.route("**/cubism2.min.js", lambda r: r.fulfill(body=CUBISM2_STUB, content_type="text/javascript"))
+    настройки2 = dict(настройки)
+    настройки2["модель"] = "samples/shizuku/shizuku.model.json"
+    настройки2["жесты_в_покое"] = [0.2, 0.3]
+    page2.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки2, ensure_ascii=False),
+                                                      content_type="application/json"))
+    ошибки2 = []
+    page2.on("pageerror", lambda e: ошибки2.append(str(e)))
+    page2.on("console", lambda m: ошибки2.append(m.text) if m.type == "error" else None)
+    page2.goto(url + "/avatar/", wait_until="load")
+    page2.wait_for_function("!!(window.__listeners && window.__listeners.afterMotionUpdate)", timeout=10000)
+    check("старый формат: по имени .model.json страница взяла ядро Cubism 2, а не Cubism 4",
+          (any("live2d.min.js" in з for з in запросы2), any("cubism2.min.js" in з for з in запросы2),
+           any("cubismcore" in з or "cubism4" in з for з in запросы2)), (True, True, False))
+
+    def парам2(id):
+        return page2.evaluate(f"window.__params[{json.dumps(id)}] || 0")
+    def кадры2(n=25, шаг=30):
+        for _ in range(n):
+            page2.evaluate("window.__listeners.afterMotionUpdate()")
+            page2.wait_for_timeout(шаг)
+    post({"эмоция": "рад", "говорит": "привет", "музыка": {"играет": True, "название": "x"}})
+    page2.wait_for_timeout(300)
+    рты = []
+    for _ in range(20):
+        page2.evaluate("window.__listeners.afterMotionUpdate()")
+        рты.append(парам2("PARAM_MOUTH_OPEN_Y"))
+        page2.wait_for_timeout(50)
+        post({"эмоция": "рад", "говорит": "привет", "музыка": {"играет": True, "название": "x"}})
+    check("старый формат: рот речи → PARAM_MOUTH_OPEN_Y (старое имя, setParamFloat)", max(рты) > 0.5, True)
+    check("старый формат: улыбка → PARAM_MOUTH_FORM ≈ 1", round(парам2("PARAM_MOUTH_FORM"), 1), 1.0)
+    # Без «говорит»: та ветка перебивает танец (см. «тело: говорит перебивает
+    # взгляд и танец» в scripts/mutations.py) — с ним корпус качаться не будет.
+    post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": True, "название": "x"}})
+    page2.wait_for_timeout(300)
+    for _ in range(15):
+        page2.evaluate("window.__listeners.afterMotionUpdate()")
+        page2.wait_for_timeout(50)
+        post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": True, "название": "x"}})
+    body_angle_x = парам2("PARAM_BODY_ANGLE_X")
+    check("старый формат: корпус качается в танце (PARAM_BODY_ANGLE_X)", abs(body_angle_x) > 0.5, True)
+    check("старый формат: псевдоним PARAM_BODY_X держит то же значение (Shizuku зовёт корпус так)",
+          парам2("PARAM_BODY_X"), body_angle_x)
+    check("старый формат: новых имён (ParamMouthOpenY) в ядро не ушло",
+          page2.evaluate("Object.keys(window.__params).filter(k => /^Param[A-Z]/.test(k)).length"), 0)
+    check("старый формат: группы движений разложены по поводам (tap_body → встреча, flick_head, shake)",
+          page2.evaluate("[window.__готовые.движения.человек_пришёл, window.__готовые.движения.движение, "
+                         "window.__готовые.движения.тревога]"), ["tap_body", "flick_head", "shake"])
+
+    # 13. Жесты в покое: раз в срок (тут 0.2–0.3 с) — своё движение «тап»,
+    # но не поверх речи, сна, танца или сценки.
+    page2.evaluate("window.__жестов_покоя = 0; window.__model.__motion = ''")
+    for _ in range(12):
+        post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": False}})
+        page2.wait_for_timeout(100)
+    check("жесты в покое: за секунду покоя сыграно хотя бы одно движение «тап»",
+          (page2.evaluate("window.__жестов_покоя") >= 1, page2.evaluate("window.__model.__motion")),
+          (True, "tap_body"))
+    # Переключаем на «говорит» и даём странице время реально это узнать
+    # (её собственный опрос идёт раз в 100 мс, независимо от post() ниже) —
+    # иначе счётчик сбросился бы раньше, чем страница увидела перемену, и
+    # жест из уже устаревшего «в покое» состояния засчитался бы как «во
+    # время речи», хотя речь для страницы ещё не наступила.
+    post({"эмоция": "спокоен", "говорит": "Привет, как дела", "музыка": {"играет": False}})
+    page2.wait_for_timeout(250)
+    page2.evaluate("window.__жестов_покоя = 0")
+    for _ in range(15):
+        post({"эмоция": "спокоен", "говорит": "Привет, как дела", "музыка": {"играет": False}})
+        page2.wait_for_timeout(100)
+    check("жесты в покое: во время речи — ни одного", page2.evaluate("window.__жестов_покоя"), 0)
+    check("старый формат: ошибок страницы нет", not ошибки2, True)
+    page2.close()
+
+    # 14. Mao (официальный образец, Cubism 4): параметра ParamMouthOpenY у
+    # модели нет, рот открывает ParamA — так записано в её группе LipSync.
+    # Страница должна взять его сама, без правки config.json.
+    CUBISM_MAO_STUB = CUBISM_STUB.replace(
+        "settings: { expressions: [{Name: \"normal\"}, {Name: \"smile\"}, {Name: \"sad\"}] },",
+        "settings: { expressions: [{Name: \"exp_01\"}], groups: [{Target: \"Parameter\", Name: \"LipSync\", Ids: [\"ParamA\"]}] },")
+    CUBISM_MAO_STUB = CUBISM_MAO_STUB.replace(
+        "coreModel: {",
+        "coreModel: { _model: { parameters: { ids: [\"ParamA\", \"ParamAngleX\", \"ParamEyeLSmile\"] } },")
+    page3 = b.new_page(viewport={"width": 1280, "height": 800})
+    page3.route("**/live2dcubismcore.min.js", lambda r: r.fulfill(body="", content_type="text/javascript"))
+    page3.route("**/pixi.min.js", lambda r: r.fulfill(body=PIXI_STUB, content_type="text/javascript"))
+    page3.route("**/cubism4.min.js", lambda r: r.fulfill(body=CUBISM_MAO_STUB, content_type="text/javascript"))
+    page3.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки, ensure_ascii=False),
+                                                      content_type="application/json"))
+    ошибки3 = []
+    page3.on("pageerror", lambda e: ошибки3.append(str(e)))
+    page3.goto(url + "/avatar/", wait_until="load")
+    page3.wait_for_function("!!(window.__listeners && window.__listeners.afterMotionUpdate)", timeout=10000)
+    check("Mao: рот взят из группы LipSync модели (ParamA), а не ParamMouthOpenY из config",
+          page3.evaluate("window.__ядро.рот"), "ParamA")
+    рты3 = []
+    for _ in range(20):
+        post({"эмоция": "спокоен", "говорит": "привет", "музыка": {"играет": False}})
+        page3.wait_for_timeout(50)
+        page3.evaluate("window.__listeners.afterMotionUpdate()")
+        рты3.append(page3.evaluate("window.__params['ParamA'] || 0"))
+    check("Mao: речь открывает ParamA", max(рты3) > 0.5, True)
+    check("Mao: ошибок страницы нет", not ошибки3, True)
+    page3.close()
+
+    # 15. Рассеянный взгляд: без человека, сценки и танца — голова и глаза
+    # не должны стоять чучелом в одной точке между редкими сценками. Живая
+    # жалоба, из-за которой это появилось: «двигается просто вверх-вниз-
+    # влево-вправо, нет ощущения живого персонажа» — а на Live2D между
+    # сценками голова и глаза вообще не шевелились. Своя страница: «поза»
+    # на общем сервере всегда считает настоящий, живой Питомец (тот же
+    # character.py, что и на роботе) — он сам бродит по экрану даже когда
+    # сценарист выключен, и «идёт» время от времени даёт наклон ±4° сам по
+    # себе, независимо от рассеянного взгляда; здесь ответ /state —
+    # заглушка, наклон гарантированно 0. Само блуждание — суммы синусов с
+    # периодами ~14-20 с; окно короче периода могло бы попасть на его
+    # плоскую вершину и увидеть только малую часть размаха — не баг приёма,
+    # а неудачное время проверки. Поэтому время здесь — свои, управляемые
+    # часы (window.__виртуальное_время, подставлены до навигации), а не
+    # реальные секунды: страница живёт с рождения только на них, ничего
+    # общего с остальными страницами этого файла не делит.
+    page4 = b.new_page(viewport={"width": 1280, "height": 800})
+    page4.add_init_script("""
+        window.__виртуальное_время = 1000;
+        performance.now = () => window.__виртуальное_время;
+    """)
+    page4.route("**/live2dcubismcore.min.js", lambda r: r.fulfill(body="", content_type="text/javascript"))
+    page4.route("**/pixi.min.js", lambda r: r.fulfill(body=PIXI_STUB, content_type="text/javascript"))
+    page4.route("**/cubism4.min.js", lambda r: r.fulfill(body=CUBISM_STUB, content_type="text/javascript"))
+    настройки4 = dict(настройки); настройки4["модель"] = "samples/mao/Mao.model3.json"
+    page4.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки4, ensure_ascii=False),
+                                                      content_type="application/json"))
+    page4.route("**/state", lambda r: r.fulfill(body=json.dumps({
+        "эмоция": "спокоен", "говорит": "", "музыка": {"играет": False}, "сцена": {},
+        "поза": {"метка": "стоит", "x": 640, "наклон": 0, "подскок": 0, "рот": 0, "нога": 0},
+    }, ensure_ascii=False), content_type="application/json"))
+    ошибки4 = []
+    page4.on("pageerror", lambda e: ошибки4.append(str(e)))
+    page4.goto(url + "/avatar/", wait_until="load")
+    page4.wait_for_function("!!(window.__listeners && window.__listeners.afterMotionUpdate)", timeout=10000)
+    for _ in range(25):
+        page4.evaluate("window.__виртуальное_время += 30")
+        page4.evaluate("window.__listeners.afterMotionUpdate()")
+    бл_x, бл_y = [], []
+    for _ in range(80):
+        page4.evaluate("window.__виртуальное_время += 300")
+        page4.evaluate("window.__listeners.afterMotionUpdate()")
+        бл_x.append(page4.evaluate("window.__params['ParamAngleX'] || 0"))
+        бл_y.append(page4.evaluate("window.__params['ParamEyeBallY'] || 0"))
+    check("рассеянный взгляд: голова не застывает в одной точке",
+          max(бл_x) - min(бл_x) > 0.5, True)
+    check("рассеянный взгляд: глаза тоже блуждают",
+          max(бл_y) - min(бл_y) > 0.05, True)
+    check("рассеянный взгляд: амплитуда небольшая — блуждание, а не рывок через весь экран",
+          max(abs(x) for x in бл_x) < 8, True)
+    check("рассеянный взгляд: ошибок страницы нет", not ошибки4, True)
+    page4.close()
     b.close()
 
 srv.shutdown()

@@ -2263,6 +2263,10 @@ class Съёмка:
     # берёт его как ArrayBuffer, тип ему безразличен. Записан явно, чтобы
     # было видно, что это не забытый, а честный octet-stream.
     ".moc3": "application/octet-stream",
+    # Старый формат Cubism 2 (samples/shizuku): модель и движения — тоже
+    # двоичные, тот же честный octet-stream.
+    ".moc": "application/octet-stream",
+    ".mtn": "application/octet-stream",
 }
 
 

@@ -2023,6 +2023,44 @@ def test_scenes() -> None:
     check("страница: рассеянный взгляд есть и выключается на контакте глаз/танце/сценке",
           "доля_наклона === 0 && !танцует && typeof сцена.к !== \"number\"" in страница, True)
 
+    # --- готовые модели в samples/ и старый формат Cubism 2 ---------------------
+    # Настоящий прогон — page_selftest.py (страницы 12–14). Здесь по тексту и
+    # по файлам: модели на месте (после git pull они должны появиться сами),
+    # страница выбирает ядро по имени файла, старые имена параметров
+    # переводятся в одном месте, рот берётся из группы LipSync модели, жесты
+    # в покое есть и не лезут поверх речи/сна/танца/сценки.
+    папка = _Path(__file__).resolve().parent / "avatar"
+    check("samples/: Shizuku (Cubism 2) и Mao (Cubism 4) лежат в репозитории со всем нужным",
+          ((папка / "samples/shizuku/shizuku.model.json").is_file(),
+           (папка / "samples/shizuku/moc/shizuku.moc").is_file(),
+           (папка / "samples/shizuku/shizuku.physics.json").is_file(),
+           (папка / "samples/mao/Mao.model3.json").is_file(),
+           (папка / "samples/mao/Mao.moc3").is_file(),
+           (папка / "samples/mao/Mao.physics3.json").is_file(),
+           (папка / "samples/README.md").is_file()), (True,) * 7)
+    import json
+    with open(папка / "config.json", encoding="utf-8") as f:
+        общий = json.load(f)
+    check("config.json: модель по умолчанию — из samples/, и она есть на диске",
+          (str(общий.get("модель", "")).startswith("samples/"), (папка / общий.get("модель", "")).is_file()),
+          (True, True))
+    check("страница: ядро и мост выбираются по имени файла модели (.model.json → Cubism 2)",
+          ("cubism2 ? СКРИПТЫ_CUBISM2 : СКРИПТЫ_CUBISM4" in страница,
+           "function старый_формат(" in страница), (True, True))
+    check("страница: старые имена параметров — переводом в одном месте, с псевдонимами Shizuku",
+          ("function имя_cubism2(" in страница, "PARAM_BODY_ANGLE_X: [\"PARAM_BODY_X\"]" in страница,
+           "ядро.setParamFloat(имя, v)" in страница), (True, True, True))
+    check("страница: рот — параметр из config, если он у модели есть, иначе из группы LipSync",
+          "const РОТ = (п.рот && есть_параметр(п.рот)) ? п.рот : (липсинк || п.рот || \"ParamMouthOpenY\");"
+          in страница, True)
+    check("страница: жесты в покое не лезут поверх сценки, речи, сна и танца",
+          'const занят = !!сцена.имя || !!с.говорит || с.эмоция === "сплю" || поза.метка === "танцует";'
+          in страница, True)
+    исходник_pc = (_Path(__file__).resolve().parent / "kuzya_pc.py").read_text(encoding="utf-8")
+    check("kuzya_pc: файлы старого формата (.moc, .mtn) отдаются как двоичные",
+          ('".moc": "application/octet-stream"' in исходник_pc, '".mtn": "application/octet-stream"' in исходник_pc),
+          (True, True))
+
     # --- живая беда: человечек «просто дышит», рот не открывает, 0 действий --
     # Настоящий прогон (браузер, page_selftest.py: «мусорная строка вместо
     # числа не превращается в NaN» и «мусор в ParamMouthOpenY…») — здесь,
