@@ -19,6 +19,7 @@ Playwright и Chromium — то же, чем ПК снимает аватар д
 """
 import json, sys, threading, time, urllib.request
 import os
+from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from http.server import ThreadingHTTPServer
 import kuzya_pc as k
@@ -96,6 +97,14 @@ with sync_playwright() as p:
     page.route("**/live2dcubismcore.min.js", lambda r: r.fulfill(body="", content_type="text/javascript"))
     page.route("**/pixi.min.js", lambda r: r.fulfill(body=PIXI_STUB, content_type="text/javascript"))
     page.route("**/cubism4.min.js", lambda r: r.fulfill(body=CUBISM_STUB, content_type="text/javascript"))
+    # config.json — настоящий, плюс параметр правой руки: у модели-заглушки
+    # он «есть» (заглушка принимает любой id), и по нему видно, что руки
+    # сценок доезжают до параметра из config.json.
+    настройки = json.loads((Path(__file__).resolve().parent / "avatar" / "config.json").read_text(encoding="utf-8"))
+    настройки["параметры"]["рука_п"] = "ParamArmRA"
+    настройки["параметры"]["рука_размах"] = 10
+    page.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки, ensure_ascii=False),
+                                                     content_type="application/json"))
     ошибки = []
     page.on("pageerror", lambda e: ошибки.append(str(e)))
     page.on("console", lambda m: ошибки.append(m.text) if m.type == "error" else None)
@@ -223,6 +232,24 @@ with sync_playwright() as p:
     page.wait_for_timeout(300); кадры(40)
     check("сценка кончилась — наклон корпуса ушёл в ноль, а не остался запечённым",
           abs(парам("ParamBodyAngleZ")) < 1.0, True)
+
+    # 9. Руки сценки («помахал рукой»: рука_п 60 = до упора) — в параметр
+    # руки из config.json, в его размахе; левой в config нет — ничего не
+    # ставится и страница не падает.
+    class _Машет:
+        def кадр(self, *a, **kw):
+            return {"имя": "помахал рукой", "текст": "Привет!", "параметры": {"рука_п": 60.0, "рука_л": 60.0}}
+    srv.avatar.сценарист = _Машет()
+    post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": False}})
+    page.wait_for_timeout(300); кадры(40)
+    check("рука сценки → параметр руки из config.json, в его размахе (≈10)",
+          round(парам("ParamArmRA")), 10)
+    check("левой руки в config нет — её параметр не выдуман",
+          page.evaluate("Object.keys(window.__params).filter(k => k === 'рука_л' || k === 'undefined').length"), 0)
+    srv.avatar.сценарист = _БезСценок()
+    post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": False}})
+    page.wait_for_timeout(300); кадры(40)
+    check("сценка кончилась — рука опущена", abs(парам("ParamArmRA")) < 1.0, True)
     b.close()
 
 srv.shutdown()
