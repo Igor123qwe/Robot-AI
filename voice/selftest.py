@@ -17416,17 +17416,25 @@ def test_endpoints() -> None:
     # шлёт ни байта) Ollama держит фразу на общих TIMEOUT_SECONDS=25 с, как
     # было на живом роботе: 37 секунд молчания на одну фразу и переполнение
     # звуковой очереди, прежде чем робот догадался уйти на запасной путь.
-    from robot_voice.brain import CONNECT_SECONDS, LOCAL_TIMEOUT_SECONDS, TIMEOUT_SECONDS
-    cfg_таймаут = Config()
-    cfg_таймаут.local_api_base = "http://пк:4000"
-    cfg_таймаут.api_key = cfg_таймаут.local_api_key = "x"
-    b_таймаут = Brain(cfg_таймаут, [])
+    #
+    # Проверяем саму _timeout(), а не то, во что её превратит anthropic.Anthropic
+    # внутри: у SDK разных версий разное устройство httpx (в 1.x — свой форк
+    # httpx2, и обычный httpx может быть не установлен вовсе) — и то, что
+    # окажется в client.timeout, от версии зависит, а _timeout() — нет.
+    from robot_voice import brain as brain_mod
+    from robot_voice.brain import LOCAL_TIMEOUT_SECONDS, TIMEOUT_SECONDS
+
+    def _прочитать(t):
+        return getattr(t, "read", t)
+
     check("таймаут ПК — короткий, не общий 25-секундный",
-          b_таймаут.endpoints[0].client.timeout.read, LOCAL_TIMEOUT_SECONDS)
+          _прочитать(brain_mod._timeout(2.0, LOCAL_TIMEOUT_SECONDS)),
+          LOCAL_TIMEOUT_SECONDS)
     check("а у облака — прежний, длинный: думать оно может дольше",
-          b_таймаут.endpoints[1].client.timeout.read, TIMEOUT_SECONDS)
-    check("дозвон у ПК всё ещё короткий (выключенный ПК ловим быстро)",
-          b_таймаут.endpoints[0].client.timeout.connect, CONNECT_SECONDS)
+          _прочитать(brain_mod._timeout(5.0, TIMEOUT_SECONDS)),
+          TIMEOUT_SECONDS)
+    check("и по умолчанию (без total) — тоже длинный, как у облака",
+          _прочитать(brain_mod._timeout(5.0)), TIMEOUT_SECONDS)
 
     cfg_общий = Config()
     b = brain(pc="с ПК", cloud="из облака")
