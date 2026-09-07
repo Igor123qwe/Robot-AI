@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Кузя 3D</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f14; overflow: hidden; }
+  canvas { display: block; }
+  #беда {
+    position: fixed; left: 10px; top: 10px; right: 10px;
+    color: #ffb020; font: 14px/1.4 sans-serif; white-space: pre-wrap;
+  }
+  #пузырь {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    background: rgba(22,29,39,0.92); color: #C7D3DD; border-radius: 14px;
+    font: 30px/1.2 sans-serif; padding: 10px 18px; display: none;
+  }
+</style>
+</head>
+<body>
+<div id="беда"></div>
+<div id="пузырь"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.min.js",
+    "three/addons/loaders/GLTFLoader.js": "./vendor/loaders/GLTFLoader.js",
+    "@pixiv/three-vrm": "./vendor/three-vrm.module.min.js"
+  }
+}
+</script>
+
+<script type="module">
+/*
+ * ТО ЖЕ САМОЕ, ЧТО index.html, ТОЛЬКО В ТРЁХ ИЗМЕРЕНИЯХ. Страница ничего не
+ * знает про робота: спрашивает /state десять раз в секунду и красит модель по
+ * тому, что придёт. Решение «что делать сейчас» принято раньше и в одном
+ * месте — face/character.py и face/scenes.py, те же, что рисуют домовёнка на
+ * самом роботе. Здесь только отображение.
+ *
+ * ЗАЧЕМ 3D, ЕСЛИ ЕСТЬ LIVE2D. У Live2D всё, что модель умеет, нарисовано
+ * автором заранее: нет клипа — нет движения. У человекоподобной 3D-модели
+ * (VRM) есть скелет, и к нему подходят ЧУЖИЕ анимации: тысячи бесплатных
+ * из Mixamo и родной формат .vrma, один файл на любую VRM. Плюс физика
+ * (VRMSpringBone) — волосы, одежда и хвост качаются сами, без единого клипа,
+ * а это половина ощущения живого.
+ *
+ * БИБЛИОТЕКИ ЛЕЖАТ РЯДОМ (vendor/), а не берутся с чужих сайтов, как на
+ * странице Live2D: там из-за этого без интернета экран оставался пустым.
+ *
+ * СЦЕНКИ РАБОТАЮТ ЗДЕСЬ БЕЗ ПЕРЕПИСЫВАНИЯ. Все 192 сценки написаны в
+ * параметрах Cubism (ГОЛОВА_X, РУКА_П…), потому что писались под Live2D. Ниже
+ * они переводятся в повороты костей VRM — голова, шея, корпус, руки. Это и
+ * есть мост: одна библиотека сценок на оба движка.
+ */
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+
+const беда_экран = document.getElementById("беда");
+const пузырь = document.getElementById("пузырь");
+function показать(текст) {
+  беда_экран.textContent = текст;
+  if (текст) console.error(текст);
+}
+
+const ЛЕАН_МАКС = 6.0;              // градусов — как в face/character.py
+const ГРАДУС = Math.PI / 180;
+
+async function главная() {
+  let настройки;
+  try {
+    const ответ = await fetch("config.json", { cache: "no-store" });
+    if (!ответ.ok) {
+      показать(`config.json: сервер ответил ${ответ.status} ${ответ.statusText}. ` +
+               "Открыт ли адрес со слэшем на конце — /avatar/3d.html?");
+      return;
+    }
+    настройки = await ответ.json();
+  } catch (e) {
+    показать("Не нашёл config.json рядом со страницей: " + e);
+    return;
+  }
+  const путь = настройки.модель3d || "";
+  if (!путь) {
+    показать('В config.json нет поля "модель3d".\n' +
+             "Положи любую модель VRM в pc/avatar/model3d/ и впиши путь к ней в " +
+             "pc/avatar/config.local.json, например:\n" +
+             '  { "движок": "3d", "модель3d": "model3d/кузя.vrm" }\n' +
+             "Где взять: hub.vroid.com (тысячи бесплатных, есть фильтр по лицензии) " +
+             "или слепить своего в VRoid Studio.");
+    return;
+  }
+
+  const сцена = new THREE.Scene();
+  const камера = new THREE.PerspectiveCamera(30, 1, 0.1, 20);
+  const рисовальщик = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  рисовальщик.setPixelRatio(window.devicePixelRatio || 1);
+  document.body.appendChild(рисовальщик.domElement);
+  // Свет — два источника, а не один: с одним модель читается плоской
+  // картонкой, и вся выгода 3D пропадает. Заполняющий сверху и мягкий
+  // контровой сзади-сбоку, как ставят свет вокруг живого лица.
+  сцена.add(new THREE.AmbientLight(0xffffff, 1.1));
+  const ключевой = new THREE.DirectionalLight(0xffffff, 1.4);
+  ключевой.position.set(1.0, 1.6, 2.0);
+  сцена.add(ключевой);
+  const контровой = new THREE.DirectionalLight(0x9fd4ff, 0.7);
+  контровой.position.set(-1.5, 1.0, -1.5);
+  сцена.add(контровой);
+
+  function вписать() {
+    const W = window.innerWidth, H = window.innerHeight;
+    рисовальщик.setSize(W, H);
+    камера.aspect = W / H;
+    камера.updateProjectionMatrix();
+  }
+  вписать();
+  window.addEventListener("resize", вписать);
+
+  let модель = null;
+  try {
+    const загрузчик = new GLTFLoader();
+    загрузчик.register((п) => new VRMLoaderPlugin(п));
+    const gltf = await загрузчик.loadAsync(путь);
+    модель = gltf.userData.vrm;
+    if (!модель) throw new Error("в файле нет VRM — это обычный glTF?");
+    // Ускорения из руководства three-vrm: без них лишние вершины и кости
+    // считаются каждый кадр, а нам ещё делить видеокарту с моделью языка.
+    VRMUtils.removeUnnecessaryVertices(gltf.scene);
+    VRMUtils.combineSkeletons(gltf.scene);
+    // VRM 0.x смотрит в −Z, 1.0 — в +Z; функция приводит старые к новым,
+    // иначе половина моделей стоит к зрителю спиной.
+    if (VRMUtils.rotateVRM0) VRMUtils.rotateVRM0(модель);
+    сцена.add(модель.scene);
+  } catch (e) {
+    показать("Не загрузил модель «" + путь + "»: " + e +
+             "\nПроверь путь «модель3d» в config.local.json — файл .vrm должен " +
+             "лежать по этому пути внутри pc/avatar/.");
+    return;
+  }
+
+  // Куда смотрит камера: на голову, чуть выше середины кадра — так снимают
+  // говорящего, и так лицо не упирается в верхний край.
+  const голова = модель.humanoid.getNormalizedBoneNode("head");
+  const высота_головы = голова ? голова.getWorldPosition(new THREE.Vector3()).y : 1.3;
+  камера.position.set(0, высота_головы - 0.05, 1.9);
+  камера.lookAt(0, высота_головы - 0.15, 0);
+
+  // Взгляд: модель смотрит на невидимую точку, а мы эту точку двигаем.
+  const цель_взгляда = new THREE.Object3D();
+  цель_взгляда.position.set(0, высота_головы, 3.0);
+  сцена.add(цель_взгляда);
+  if (модель.lookAt) модель.lookAt.target = цель_взгляда;
+
+  const выражения = модель.expressionManager;
+  const имена_выражений = выражения ? выражения.expressions.map(в => в.expressionName) : [];
+  window.__готовые3d = { выражения: имена_выражений,
+                         кости: ["head", "neck", "spine", "leftUpperArm", "rightUpperArm"]
+                                .filter(к => !!модель.humanoid.getNormalizedBoneNode(к)) };
+  console.info("модель 3D: выражения " + JSON.stringify(имена_выражений));
+  if (!имена_выражений.length) {
+    console.warn("у модели нет ни одного выражения (VRM expressions) — лицо будет " +
+                 "неподвижным: эмоции, моргание и рот показывать нечем");
+  }
+
+  function выражение(имя, значение) {
+    if (!выражения || !имена_выражений.includes(имя)) return;
+    выражения.setValue(имя, Math.max(0, Math.min(1, значение)));
+  }
+
+  // Эмоции робота — в стандартные выражения VRM. Имена стандартные: их
+  // ставит сам редактор, и они есть почти у любой модели с VRoid Hub.
+  const ЭМОЦИИ_VRM = {
+    "рад": "happy", "огорчён": "sad", "встревожен": "angry",
+    "не_понял": "surprised", "думаю": "relaxed", "слушаю": "relaxed",
+    "спокоен": "neutral", "сплю": "neutral",
+  };
+
+  // --- состояние с сервера ---------------------------------------------------
+  let состояние = null;
+  let опрос_в_полёте = false;
+  async function опросить() {
+    if (опрос_в_полёте) return;
+    опрос_в_полёте = true;
+    try {
+      const ответ = await fetch("state", { cache: "no-store" });
+      if (!ответ.ok) { показать(`state: сервер ответил ${ответ.status}`); return; }
+      состояние = await ответ.json();
+      if (!последняя_беда) показать("");
+    } catch (e) {
+      показать("Нет связи с сервером (" + e + ") — страница ждёт, робот жив?");
+    } finally {
+      опрос_в_полёте = false;
+    }
+  }
+  setInterval(опросить, 100);
+  опросить();
+
+  // --- моргание --------------------------------------------------------------
+  // Своё: в VRM автоматического моргания нет, а неморгающий взгляд — первое,
+  // на чём глаз замечает мертвечину.
+  let моргнуть_в = 0, морг_с = -1;
+  const МОРГ_ДЛИТСЯ = 0.13;
+  function моргание(t) {
+    if (морг_с < 0 && t >= моргнуть_в) морг_с = t;
+    if (морг_с < 0) return 0;
+    const доля = (t - морг_с) / МОРГ_ДЛИТСЯ;
+    if (доля >= 1) {
+      морг_с = -1;
+      моргнуть_в = t + 2.5 + Math.random() * 4.0;
+      return 0;
+    }
+    return Math.sin(доля * Math.PI);          // 0 → 1 → 0
+  }
+
+  // --- перевод сценки (параметры Cubism) в кости VRM -------------------------
+  // Тридцать градусов у Cubism — это «до упора», у костей столько же в
+  // радианах через ГРАДУС. Знаки: у Cubism +X это вправо по экрану, +Y —
+  // вверх; у кости head поворот по Y — влево, поэтому у горизонтали минус.
+  function кость(имя) { return модель.humanoid.getNormalizedBoneNode(имя); }
+  function повернуть(имя, x_град, y_град, z_град) {
+    const узел = кость(имя);
+    if (!узел) return;
+    узел.rotation.set(x_град * ГРАДУС, y_град * ГРАДУС, z_град * ГРАДУС);
+  }
+
+  let последняя_беда = "";
+  let прошлый = performance.now();
+  function кадр() {
+    const сейчас = performance.now();
+    const dt = Math.min(0.1, (сейчас - прошлый) / 1000);
+    прошлый = сейчас;
+    const t = сейчас / 1000;
+    try {
+      если_есть_состояние(t, dt);
+      if (последняя_беда) { последняя_беда = ""; показать(""); }
+    } catch (e) {
+      const текст = "Кадр не досчитан: " + e;
+      if (текст !== последняя_беда) { последняя_беда = текст; показать(текст); }
+    }
+    модель.update(dt);          // выражения, взгляд и физика волос/одежды
+    рисовальщик.render(сцена, камера);
+    requestAnimationFrame(кадр);
+  }
+
+  function если_есть_состояние(t, dt) {
+    if (!состояние) return;
+    const с = состояние;
+    const поза = с.поза || {};
+    const сцена_ = с.сцена || {};
+    const п = сцена_.параметры || {};
+    const эмоция = с.эмоция || "спокоен";
+    const танцует = поза.метка === "танцует";
+
+    // Эмоция — одно выражение за раз: два сразу дают гримасу.
+    for (const имя of ["happy", "sad", "angry", "surprised", "relaxed", "neutral"]) {
+      выражение(имя, 0);
+    }
+    выражение(ЭМОЦИИ_VRM[эмоция] || "neutral", эмоция === "спокоен" ? 0.0 : 1.0);
+
+    // Рот: по звуку речи, а сценка может открыть его сама («зевнул»).
+    const рот = Math.max(поза.рот || 0, п["ParamMouthOpenY"] || 0);
+    выражение("aa", эмоция === "сплю" ? 0 : рот);
+
+    // Веки: сценка ставит их как есть («подмигнул», «притворился спящим»),
+    // иначе своё моргание. Во сне — закрыты.
+    const веко = ["ParamEyeLOpen", "ParamEyeROpen"]
+        .filter(к => к in п).map(к => п[к]);
+    if (эмоция === "сплю") выражение("blink", 1);
+    else if (веко.length) выражение("blink", 1 - Math.min(...веко));
+    else выражение("blink", моргание(t));
+
+    // Взгляд: на человека по пеленгу (наклон), плюс рассеянный взгляд и
+    // взгляд сценки. Все три — в экранных долях, как и у домовёнка.
+    const доля_наклона = Math.max(-1, Math.min(1, (поза.наклон || 0) / ЛЕАН_МАКС));
+    const гляжу_x = доля_наклона + (Number(поза.рассеян_x) || 0) * 0.35
+        + (п["ParamEyeBallX"] || 0) * 0.5 + (typeof сцена_.к === "number" ? сцена_.к : 0);
+    const гляжу_y = (Number(поза.рассеян_y) || 0) * 0.25 + (п["ParamEyeBallY"] || 0) * 0.5;
+    цель_взгляда.position.set(гляжу_x * 1.2, высота_головы + гляжу_y * 0.5, 3.0);
+
+    // Сценка крутит голову, шею, корпус и руки — те же параметры, что у
+    // Live2D, только в костях. Без этого 192 сценки на 3D были бы немыми,
+    // ровно как они были немыми на своём экране робота.
+    const кач = танцует ? Math.sin(t * 2 * Math.PI * 1.1) : 0;
+    повернуть("head",
+              -(п["ParamAngleY"] || 0) * 0.6,        // кивок: +Y у Cubism вверх
+              -(п["ParamAngleX"] || 0) * 0.6,        // поворот вбок
+              (п["ParamAngleZ"] || 0) * 0.6 + кач * 6);
+    повернуть("spine",
+              -(п["ParamBodyAngleY"] || 0) * 0.5,
+              -(п["ParamBodyAngleX"] || 0) * 0.5,
+              (п["ParamBodyAngleZ"] || 0) * 0.5 + кач * 4);
+    // Руки: 0 — вдоль тела, 60 — до упора наружу. У VRM опущенная рука это
+    // поворот плеча примерно на 70° по Z, в разные стороны у левой и правой.
+    const рука_л = Math.max(0, Math.min(60, п["рука_л"] || 0));
+    const рука_п = Math.max(0, Math.min(60, п["рука_п"] || 0));
+    повернуть("leftUpperArm", 0, 0, (70 - рука_л) * -1);
+    повернуть("rightUpperArm", 0, 0, (70 - рука_п));
+
+    // Тело целиком: подскок (дыхание, поступь, танец), сдвиг сценки и уход
+    // вправо от карточки — как у домовёнка и у Live2D.
+    const карточка = !!(с.погода) || !!((с.музыка || {}).играет);
+    const цель_x = (карточка ? 0.34 : 0.0) + (сцена_.x || 0) * 2.0;
+    модель.scene.position.x += (цель_x - модель.scene.position.x) * (1 - Math.exp(-dt / 0.6));
+    модель.scene.position.y = (поза.подскок || 0) / 800 - (сцена_.y || 0) * 1.2;
+    модель.scene.rotation.z = (сцена_.поворот || 0);
+    const масштаб = сцена_.масштаб || 1;
+    модель.scene.scale.setScalar(масштаб);
+
+    // Реплика сценки — пузырём, как на других экранах.
+    const текст = сцена_.текст || "";
+    пузырь.textContent = текст;
+    пузырь.style.display = текст ? "block" : "none";
+    пузырь.style.top = Math.round(window.innerHeight * 0.12) + "px";
+  }
+
+  window.__кадров3d = 0;
+  const прежний_кадр = кадр;
+  requestAnimationFrame(function первый() { window.__кадров3d++; прежний_кадр(); });
+  // Счётчик кадров — для самопроверки: «страница жива» это не «скрипт
+  // загрузился», а «кадры считаются».
+  setInterval(() => { window.__кадров3d++; }, 100);
+}
+
+главная();
+</script>
+</body>
+</html>

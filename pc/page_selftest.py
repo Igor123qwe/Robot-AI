@@ -80,6 +80,52 @@ PIXI.live2d = { Live2DModel: { from: async (path) => {
 def check(что, есть, надо):
     итог.append((что, есть == надо, есть, надо))
 
+
+def _пиксели_png(данные: bytes):
+    """(ширина, высота, каналов, строки) из PNG — без чужих библиотек.
+
+    Нужно ровно для одного: посмотреть, что в снимке 3D-страницы и правда
+    есть модель. Pillow ради этого в зависимости не тянем — снимок маленький,
+    а распаковка PNG укладывается в тридцать строк.
+    """
+    import struct
+    import zlib
+    поз, ш, в, цвет, idat = 8, 0, 0, 6, b""
+    while поз < len(данные):
+        длина = struct.unpack(">I", данные[поз:поз + 4])[0]
+        тип, тело = данные[поз + 4:поз + 8], данные[поз + 8:поз + 8 + длина]
+        if тип == b"IHDR":
+            ш, в, _, цвет = struct.unpack(">IIBB", тело[:10])
+        elif тип == b"IDAT":
+            idat += тело
+        поз += 12 + длина
+    сырое = zlib.decompress(idat)
+    каналов = {0: 1, 2: 3, 4: 2, 6: 4}[цвет]
+    шаг = ш * каналов
+    строки, прошлая, i = [], bytearray(шаг), 0
+    for _ in range(в):
+        фильтр = сырое[i]
+        строка = bytearray(сырое[i + 1:i + 1 + шаг])
+        i += 1 + шаг
+        for x in range(шаг):
+            a = строка[x - каналов] if x >= каналов else 0
+            b_ = прошлая[x]
+            c = прошлая[x - каналов] if x >= каналов else 0
+            if фильтр == 1:
+                строка[x] = (строка[x] + a) & 255
+            elif фильтр == 2:
+                строка[x] = (строка[x] + b_) & 255
+            elif фильтр == 3:
+                строка[x] = (строка[x] + (a + b_) // 2) & 255
+            elif фильтр == 4:
+                п = a + b_ - c
+                па, пб, пc = abs(п - a), abs(п - b_), abs(п - c)
+                строка[x] = (строка[x] + (a if па <= пб and па <= пc
+                                          else (b_ if пб <= пc else c))) & 255
+        строки.append(bytes(строка))
+        прошлая = строка
+    return ш, в, каналов, строки
+
 with sync_playwright() as p:
     свой = os.environ.get("KUZYA_BROWSER", "").strip()
     b = None
@@ -520,6 +566,51 @@ with sync_playwright() as p:
           any(т == "error" and "нет ни одной группы" in текст and "shizuku" in текст
               for т, текст in жалобы6), True)
     page6.close()
+
+    # 17. ТРЁХМЕРНЫЙ ПЕРСОНАЖ (3d.html). Здесь заглушек нет вовсе: настоящие
+    # библиотеки из vendor/, настоящая модель VRM (собирается pc/vrm_проба.py:
+    # скелет из обязательных костей, светящийся кубик вместо тела, выражения
+    # со стандартными именами) и настоящий WebGL. Проверять 3D заглушками
+    # бессмысленно: весь смысл в том, доезжает ли картинка до кадра, который
+    # ПК отдаёт роботу, — а это видно только по пикселям снимка.
+    import vrm_проба
+    модель3d = Path(__file__).resolve().parent / "avatar" / "model3d" / "проба.vrm"
+    модель3d.parent.mkdir(parents=True, exist_ok=True)
+    модель3d.write_bytes(vrm_проба.собрать())
+    настройки3d = dict(настройки)
+    настройки3d["движок"] = "3d"
+    настройки3d["модель3d"] = "model3d/проба.vrm"
+    page7 = b.new_page(viewport={"width": 320, "height": 240})
+    ошибки7 = []
+    page7.on("pageerror", lambda e: ошибки7.append("JS: " + str(e)))
+    page7.on("console", lambda m: ошибки7.append(m.text) if m.type == "error" else None)
+    page7.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки3d, ensure_ascii=False),
+                                                      content_type="application/json"))
+    page7.goto(url + "/avatar/3d.html", wait_until="load")
+    try:
+        page7.wait_for_function("window.__готовые3d !== undefined", timeout=20000)
+        готовые3d = page7.evaluate("window.__готовые3d")
+    except Exception:                                # noqa: BLE001
+        готовые3d = {"беда": page7.evaluate("document.getElementById('беда').textContent")[:200]}
+    check("3D: настоящая модель VRM загрузилась, кости и выражения найдены",
+          (sorted(готовые3d.get("кости", []))[:2],
+           "happy" in готовые3d.get("выражения", []),
+           "aa" in готовые3d.get("выражения", [])),
+          (["head", "leftUpperArm"], True, True))
+    page7.wait_for_timeout(1200)
+    check("3D: кадры считаются — страница живая, а не «скрипт загрузился»",
+          page7.evaluate("window.__кадров3d") > 3, True)
+    # Пиксели СНИМКА, а не холста: холст WebGL без preserveDrawingBuffer
+    # читается пустым, и проверка по нему проходила бы даже при чёрном
+    # экране. ПК снимает страницу ровно так же, как здесь.
+    ш, в, к, строки = _пиксели_png(page7.screenshot())
+    свои = sum(1 for стр in строки for x in range(0, ш * к, к)
+               if стр[x + 1] > 60 and стр[x + 1] > стр[x] + 15 and стр[x + 1] > стр[x + 2] + 15)
+    check("3D: модель ВИДНА в снятом кадре — том самом, что уедет роботу",
+          свои > 200, True)
+    check("3D: ошибок страницы нет", not ошибки7, True)
+    page7.close()
+    модель3d.unlink(missing_ok=True)
 
     # 15. Рассеянный взгляд: без человека, сценки и танца — голова и глаза
     # не должны стоять чучелом в одной точке между редкими сценками. Живая
