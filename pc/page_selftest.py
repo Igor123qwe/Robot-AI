@@ -472,6 +472,55 @@ with sync_playwright() as p:
     check("Mao: ошибок страницы нет", not ошибки3, True)
     page3.close()
 
+    # 15. Модель, у которой группы движений названы НЕ ТАК. Библиотека заводит
+    # покой сама, но только из группы с точным именем «Idle»; у готовых
+    # моделей она сплошь и рядом другая, а у части официальных образцов вовсе
+    # без имени. Тогда покоя нет вообще — модель стоит столбом, и на экране
+    # это неотличимо от «наш код ничего не играет». Живая жалоба: «анимация
+    # около нуля» при полностью рабочем конвейере.
+    ЧУЖИЕ_ГРУППЫ = CUBISM_STUB.replace(
+        "motionManager: { definitions: { Idle: [{}], TapBody: [{}], Flick: [{}], Shake: [{}] } },",
+        "motionManager: { groups: { idle: 'Idle' }, definitions: { '': [{}], 'mark_m01': [{}] } },")
+    page5 = b.new_page(viewport={"width": 1280, "height": 800})
+    page5.route("**/live2dcubismcore.min.js", lambda r: r.fulfill(body="", content_type="text/javascript"))
+    page5.route("**/pixi.min.js", lambda r: r.fulfill(body=PIXI_STUB, content_type="text/javascript"))
+    page5.route("**/cubism4.min.js", lambda r: r.fulfill(body=ЧУЖИЕ_ГРУППЫ, content_type="text/javascript"))
+    page5.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки, ensure_ascii=False),
+                                                      content_type="application/json"))
+    жалобы5 = []
+    page5.on("console", lambda m: жалобы5.append((m.type, m.text)))
+    page5.goto(url + "/avatar/", wait_until="load")
+    page5.wait_for_function("!!(window.__listeners && window.__listeners.afterMotionUpdate)", timeout=10000)
+    check("группы названы не так — покой всё равно заведён (из той, что есть)",
+          page5.evaluate("window.__model.internalModel.motionManager.groups.idle"), "")
+    check("…и жест «тап» тоже нашёлся: любое авторское движение лучше столба",
+          page5.evaluate("window.__готовые.движения.человек_пришёл"), "mark_m01")
+    check("…и об этом сказано предупреждением — иначе это молча и невидимо",
+          any(т == "warning" and "нет группы покоя" in текст for т, текст in жалобы5), True)
+    check("kuzya_pc пересылает в журнал и предупреждения страницы, не только ошибки",
+          'm.type in ("error", "warning")' in исходник_pc, True)
+    page5.close()
+
+    # 16. У модели вовсе нет движений — это не «наш код молчит», а «модель
+    # такая»; сказать об этом надо ошибкой, её видно в журнале ПК.
+    БЕЗ_ДВИЖЕНИЙ = CUBISM_STUB.replace(
+        "motionManager: { definitions: { Idle: [{}], TapBody: [{}], Flick: [{}], Shake: [{}] } },",
+        "motionManager: { groups: { idle: 'Idle' }, definitions: {} },")
+    page6 = b.new_page(viewport={"width": 1280, "height": 800})
+    page6.route("**/live2dcubismcore.min.js", lambda r: r.fulfill(body="", content_type="text/javascript"))
+    page6.route("**/pixi.min.js", lambda r: r.fulfill(body=PIXI_STUB, content_type="text/javascript"))
+    page6.route("**/cubism4.min.js", lambda r: r.fulfill(body=БЕЗ_ДВИЖЕНИЙ, content_type="text/javascript"))
+    page6.route("**/config.json", lambda r: r.fulfill(body=json.dumps(настройки, ensure_ascii=False),
+                                                      content_type="application/json"))
+    жалобы6 = []
+    page6.on("console", lambda m: жалобы6.append((m.type, m.text)))
+    page6.goto(url + "/avatar/", wait_until="load")
+    page6.wait_for_function("!!(window.__listeners && window.__listeners.afterMotionUpdate)", timeout=10000)
+    check("нет ни одной группы движений — сказано ошибкой, с советом взять другую модель",
+          any(т == "error" and "нет ни одной группы" in текст and "shizuku" in текст
+              for т, текст in жалобы6), True)
+    page6.close()
+
     # 15. Рассеянный взгляд: без человека, сценки и танца — голова и глаза
     # не должны стоять чучелом в одной точке между редкими сценками. Живая
     # жалоба, из-за которой это появилось: «двигается просто вверх-вниз-
