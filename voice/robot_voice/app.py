@@ -360,7 +360,14 @@ def _setup_logging() -> None:
         datefmt="%H:%M:%S",
         stream=sys.stdout,
     )
-    logging.getLogger("websocket").setLevel(logging.WARNING)
+    # websocket-библиотека пишет своё «[Errno 111] Connection refused —
+    # goodbye» уровнем ERROR на КАЖДУЮ попытку подключения. Пока rosbridge не
+    # поднят, попытки идут вечно, и журнал робота состоял из них целиком —
+    # за ночь десятки тысяч строк, в которых не найти ничего. Про состояние
+    # связи теперь говорим сами (ros.py, _пауза_и_жалоба): один раз и с
+    # последствиями, включая «человека в кадре не вижу». Поэтому её ERROR
+    # глушим до CRITICAL — не теряя своей диагностики, а заменяя чужую.
+    logging.getLogger("websocket").setLevel(logging.CRITICAL)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
