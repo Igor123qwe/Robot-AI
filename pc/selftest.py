@@ -2313,14 +2313,20 @@ def test_scenes() -> None:
     # переводятся в одном месте, рот берётся из группы LipSync модели, жесты
     # в покое есть и не лезут поверх речи/сна/танца/сценки.
     папка = _Path(__file__).resolve().parent / "avatar"
-    check("samples/: Shizuku (Cubism 2) и Mao (Cubism 4) лежат в репозитории со всем нужным",
+    check("samples/: Shizuku (Cubism 2), Mao (Cubism 4) и Mark (Cubism 4) лежат "
+          "в репозитории со всем нужным",
           ((папка / "samples/shizuku/shizuku.model.json").is_file(),
            (папка / "samples/shizuku/moc/shizuku.moc").is_file(),
            (папка / "samples/shizuku/shizuku.physics.json").is_file(),
            (папка / "samples/mao/Mao.model3.json").is_file(),
            (папка / "samples/mao/Mao.moc3").is_file(),
            (папка / "samples/mao/Mao.physics3.json").is_file(),
-           (папка / "samples/README.md").is_file()), (True,) * 7)
+           (папка / "samples/mark/mark_free_t04.model3.json").is_file(),
+           (папка / "samples/mark/mark_free_t04.moc3").is_file(),
+           (папка / "samples/mark/mark_free_t04.physics3.json").is_file(),
+           (папка / "samples/mark/mark_free_t04.cdi3.json").is_file(),
+           (папка / "samples/mark/mark_free_t04.2048/texture_00.png").is_file(),
+           (папка / "samples/README.md").is_file()), (True,) * 12)
     import json
     with open(папка / "config.json", encoding="utf-8") as f:
         общий = json.load(f)
