@@ -822,9 +822,14 @@ def main() -> None:
     speaker.quiet_volume = cfg.quiet_volume
 
     ros = Ros(cfg.rosbridge_url)
-    ros.start()
-    if not ros.wait_connected(timeout=15):
-        log.warning("rosbridge не ответил — еду вслепую, команды движения не пройдут")
+    # ВРЕМЕННО, для поиска SIGSEGV: ROBOT_NO_ROS=1 совсем не трогает ros —
+    # ни start(), ни переподключение. Убрать вместе с остальными ЧЕКПОИНТ-ами.
+    if os.environ.get("ROBOT_NO_ROS") != "1":
+        ros.start()
+        if not ros.wait_connected(timeout=15):
+            log.warning("rosbridge не ответил — еду вслепую, команды движения не пройдут")
+    else:
+        log.info("ЧЕКПОИНТ 0: ros.start() пропущен (ROBOT_NO_ROS=1)")
 
     # Пока робот едет, автообновление не должно перезапускать сервис.
     busy = BusyFlag(ros)
