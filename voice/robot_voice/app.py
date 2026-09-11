@@ -2639,7 +2639,7 @@ def _услышали_стоп(voice: Voice, recognizer, ros) -> bool:
         return False
 
 
-def _failure_phrase(error: Exception) -> str:
+def _failure_phrase(error: Exception, только_пк: bool = False) -> str:
     """Почему не вышло ответить — так, чтобы человек понял, что делать.
 
     Раньше на всё было одно «Что-то пошло не так, повтори»: человек повторял
@@ -2656,6 +2656,14 @@ def _failure_phrase(error: Exception) -> str:
                 "Повторять бесполезно, нужен журнал.")
     name = type(error).__name__
     if "Connection" in name or "Timeout" in name:
+        if только_пк:
+            # Облачный запас выключен хозяином (ROBOT_CLOUD=0), и единственный
+            # собеседник — компьютер. Про интернет говорить нельзя: он есть, а
+            # чинить надо совсем другое — запустить kuzya_pc.py. Человек,
+            # услышавший «я без интернета», полезет в роутер и ничего не найдёт.
+            return ("Компьютер не отвечает, а без него я не разговариваю. "
+                    "Запусти на нём Кузю. Таймеры, время, список и езда "
+                    "работают.")
         return ("Сейчас я без интернета. Таймеры, время, список и езда "
                 "работают, а поговорить не выйдет.")
     if "Authentication" in name or "PermissionDenied" in name:
@@ -3057,7 +3065,16 @@ def _respond(command: str, brain: Brain, voice: Voice,
             _лицо(voice, "огорчён")
             start_speaking()
             if speech:
-                speech.feed(_failure_phrase(e))
+                # Единственный собеседник, и это ПК, — значит запаса нет:
+                # либо хозяин выключил облако (ROBOT_CLOUD=0), либо ключа нет
+                # вовсе. Причина разная, а совет один и тот же — запустить
+                # Кузю на компьютере. getattr: в самопроверке мозг бывает
+                # заглушкой без endpoints, а падать в обработчике падения —
+                # худшее, что можно сделать.
+                точки = list(getattr(brain, "endpoints", ()))
+                только_пк = (len(точки) == 1
+                             and str(getattr(точки[0], "name", "")).startswith("ПК"))
+                speech.feed(_failure_phrase(e, только_пк=только_пк))
         finally:
             if speech:
                 try:

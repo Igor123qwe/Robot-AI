@@ -379,7 +379,13 @@ class Brain:
                 use_cache=False,
                 max_tokens=МЕСТНЫЙ_ПРЕДЕЛ,
             ))
-        if cfg.api_key:
+        if cfg.api_key and not getattr(cfg, "cloud_chat", True):
+            # Запас выключен хозяином (ROBOT_CLOUD=0). Говорим об этом здесь и
+            # сейчас: молчащий робот с полным кошельком и молчащий робот со
+            # сломанным ПК выглядят одинаково, а чинить их надо по-разному.
+            log.info("облачный разговор выключен (ROBOT_CLOUD=0) — только ПК; "
+                     "ключ остаётся для зрения")
+        if cfg.api_key and getattr(cfg, "cloud_chat", True):
             self.endpoints.append(Endpoint(
                 name=cfg.api_base or "api.anthropic.com",
                 client=self._client(cfg.api_key, cfg.api_base,
