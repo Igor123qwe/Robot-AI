@@ -114,17 +114,45 @@ def наша_вина(ошибка: Exception) -> bool:
 CLOUD_CONNECT_SECONDS = 5.0
 
 
+def _httpx_сдк():
+    """Тот httpx, которым пользуется УСТАНОВЛЕННЫЙ anthropic SDK.
+
+    Их два, и они не взаимозаменяемы: SDK 0.x ходит через обычный `httpx`,
+    SDK 1.x — через свой форк `httpx2`, и объект таймаута от «не того»
+    пакета он отвергает на входе (`TypeError: Invalid timeout argument;
+    httpx.Timeout is from the httpx package, but this SDK uses httpx2`) —
+    робот падал на старте, едва свежий venv поставил новый SDK. Оба пакета
+    при этом могут стоять рядом (httpx тянет huggingface-hub), так что
+    выбирать по факту установки нельзя — спрашиваем сам SDK: свой httpx он
+    держит атрибутом `_base_client.httpx` в обеих линейках. Нет SDK или
+    атрибута — берём httpx2 раньше httpx (он бывает установлен только ради
+    SDK 1.x, значит, и SDK там такой); нет ни того ни другого — None.
+    """
+    try:
+        from anthropic import _base_client
+        модуль = getattr(_base_client, "httpx", None)
+        if модуль is not None and hasattr(модуль, "Timeout"):
+            return модуль
+    except Exception:                                   # noqa: BLE001
+        pass
+    for имя in ("httpx2", "httpx"):
+        try:
+            return __import__(имя)
+        except ImportError:
+            continue
+    return None
+
+
 def _timeout(connect: float, total: float = TIMEOUT_SECONDS):
     """Таймаут запроса: связь коротко, чтение — по total.
 
     Без httpx (так бывает в самопроверке, где клиент модели подменён
     заглушкой) отдаём одно число — SDK его тоже понимает.
     """
-    try:
-        import httpx
-    except ImportError:
+    модуль = _httpx_сдк()
+    if модуль is None:
         return total
-    return httpx.Timeout(total, connect=connect)
+    return модуль.Timeout(total, connect=connect)
 
 
 class Thinkless:

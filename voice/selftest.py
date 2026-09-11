@@ -18160,6 +18160,45 @@ def test_endpoints() -> None:
     check("и по умолчанию (без total) — тоже длинный, как у облака",
           _прочитать(brain_mod._timeout(5.0)), TIMEOUT_SECONDS)
 
+    # Чей Timeout — решает установленный SDK, а не то, какой httpx нашёлся
+    # первым. SDK 1.x ходит через форк httpx2 и объект от обычного httpx
+    # отвергает на входе («httpx.Timeout is from the httpx package, but this
+    # SDK uses httpx2») — робот падал на старте, едва свежий venv поставил
+    # новый SDK, хотя обычный httpx стоял рядом (его тянет huggingface-hub).
+    import sys as _sys
+    from anthropic import _base_client as _bc
+
+    class _Таймаут:
+        def __init__(self, total, connect=None):
+            self.read, self.connect = total, connect
+
+    свой = types.SimpleNamespace(Timeout=_Таймаут)
+    чужой = types.SimpleNamespace(Timeout=_Таймаут)
+    было_httpx = _bc.__dict__.get("httpx", None)
+    было_httpx2 = _sys.modules.get("httpx2")
+    try:
+        _bc.httpx = свой
+        t = brain_mod._timeout(2.0, LOCAL_TIMEOUT_SECONDS)
+        check("таймаут — тем httpx, что у SDK, а не первым попавшимся",
+              type(t) is _Таймаут and t.read == LOCAL_TIMEOUT_SECONDS
+              and t.connect == 2.0, True)
+        # SDK без подсказки (старая сборка без атрибута): httpx2 раньше httpx —
+        # он бывает установлен только ради SDK 1.x, значит, и SDK там такой.
+        _bc.httpx = None
+        _sys.modules["httpx2"] = чужой
+        check("нет подсказки от SDK — httpx2 раньше httpx",
+              type(brain_mod._timeout(2.0, LOCAL_TIMEOUT_SECONDS)) is _Таймаут,
+              True)
+    finally:
+        if было_httpx is None:
+            _bc.__dict__.pop("httpx", None)
+        else:
+            _bc.httpx = было_httpx
+        if было_httpx2 is None:
+            _sys.modules.pop("httpx2", None)
+        else:
+            _sys.modules["httpx2"] = было_httpx2
+
     cfg_общий = Config()
     b = brain(pc="с ПК", cloud="из облака")
     check("ПК включён — отвечает он", b.reply("привет", lambda s: None), "с ПК")

@@ -2526,6 +2526,20 @@ def вернуть_недоделанное() -> None:
      '            self._виджеты_было[ключ] = [видно, t, содержимое if видно else None]\n'
      '            было = self._виджеты_было[ключ]',
      "стоит на месте с первого кадра"),
+
+    ("мозг: таймаут больше не спрашивает у SDK его httpx — SDK 1.x получает "
+     "httpx.Timeout вместо httpx2 и падает на старте",
+     "voice/robot_voice/brain.py",
+     '        модуль = getattr(_base_client, "httpx", None)',
+     '        модуль = None',
+     "таймаут — тем httpx, что у SDK"),
+
+    ("мозг: без подсказки от SDK httpx берётся раньше httpx2 — при SDK 1.x "
+     "без атрибута робот снова получает «не тот» Timeout",
+     "voice/robot_voice/brain.py",
+     '    for имя in ("httpx2", "httpx"):',
+     '    for имя in ("httpx", "httpx2"):',
+     "нет подсказки от SDK — httpx2 раньше httpx"),
 ]
 
 
