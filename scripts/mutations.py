@@ -2540,6 +2540,22 @@ def вернуть_недоделанное() -> None:
      '    for имя in ("httpx2", "httpx"):',
      '    for имя in ("httpx", "httpx2"):',
      "нет подсказки от SDK — httpx2 раньше httpx"),
+
+    ("зрение: детекции снова слушаем «reliable» — подписка есть, «Subscribed» "
+     "в журнале есть, а человека в кадре робот не видит никогда",
+     "voice/robot_voice/ros.py",
+     'ДЕТЕКТОРЫ_QOS = {"reliability": "best_effort"}',
+     'ДЕТЕКТОРЫ_QOS = {"reliability": "reliable"}',
+     "детекции просим «best effort»"),
+
+    ("зрение: QoS у подписки на людей забыт — при загрузке мост опять успеет "
+     "раньше детектора и останется «reliable» навсегда",
+     "voice/robot_voice/ros.py",
+     '                    "throttle_rate": 50, "qos": ДЕТЕКТОРЫ_QOS})\n'
+     '        # Жесты.',
+     '                    "throttle_rate": 50})\n'
+     '        # Жесты.',
+     "детекции просим «best effort»"),
 ]
 
 
