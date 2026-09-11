@@ -2576,6 +2576,17 @@ def вернуть_недоделанное() -> None:
      "    if основной.exists():\n"
      "        return основной",
      "каталог появился — переходим на него"),
+
+    ("доставка: правки лица снова никого не перезапускают — код приезжает с "
+     "GitHub, а служба крутит старый: «починил, а не помогло»",
+     "scripts/update.sh",
+     "if echo \"$CHANGED\" | grep -qE '^face/[^/]+\\.py$'; then\n"
+     "  RESTART=\"$RESTART robot-face\"\n"
+     "fi",
+     "if false; then\n"
+     "  RESTART=\"$RESTART robot-face\"\n"
+     "fi",
+     "правка лица поднимает лицо"),
 ]
 
 
