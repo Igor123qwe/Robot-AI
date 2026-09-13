@@ -21130,6 +21130,101 @@ def test_video() -> None:
         check("поиск ограничен своим таймаутом, а не дефолтом yt-dlp",
               опции_видел[-1].get("socket_timeout"), video_mod.ТАЙМАУТ)
 
+    # --- YouTube не отвечает: быстро и честно, а не 82 секунды «не нашёл» ---
+    #
+    # Живой случай: YouTube из дома не отвечает, yt-dlp упёрся в десять секунд
+    # и повторял снова и снова — «ответ 82.4 с», голосовой цикл стоял, микрофон
+    # выбросил 2500 кадров, и в конце человек услышал «Не нашёл: мультики».
+    # Комментарий в video.py знал про повторы и не ограничивал их — то самое
+    # «написано, но не сделано». Подделка ставится в sys.modules независимо от
+    # того, стоит ли yt-dlp: здесь проверяется наш срок, а не его наличие.
+    import sys as _sys
+    import time as _time
+    import types as _types
+
+    опции_сети: list[dict] = []
+
+    def _подделка(extract):
+        class _YDL:
+            def __init__(self, опции=None, *a, **kw) -> None:
+                опции_сети.append(опции or {})
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a) -> None:
+                return None
+
+            extract_info = staticmethod(extract)
+        return _types.SimpleNamespace(YoutubeDL=_YDL)
+
+    был_модуль = _sys.modules.get("yt_dlp")
+    был_срок = video_mod.ТАЙМАУТ_ВСЕГО
+    try:
+        # Повторы — в ноль, все три: не ответил с первого раза — не ответит и
+        # с восьмого.
+        _sys.modules["yt_dlp"] = _подделка(lambda з, download=False: {"entries": []})
+        video_mod.search("что-нибудь")
+        check("повторов у yt-dlp нет: retries, extractor_retries, fragment_retries",
+              tuple(опции_сети[-1].get(к) for к in
+                    ("retries", "extractor_retries", "fragment_retries")), (0, 0, 0))
+
+        # Срок на весь поиск: yt-dlp завис — отвечаем по сроку, а не когда
+        # он соизволит. Срок укорочен до полсекунды, зависание — три.
+        video_mod.ТАЙМАУТ_ВСЕГО = 0.5
+
+        def _зависло(з, download=False):
+            _time.sleep(3.0)
+            return {"entries": [{"id": "zzz", "title": "поздно"}]}
+
+        _sys.modules["yt_dlp"] = _подделка(_зависло)
+        начали = _time.monotonic()
+        try:
+            итог = video_mod.search("мультики")
+        except video_mod.Недоступен:
+            итог = "Недоступен"
+        check("YouTube не отвечает — Недоступен, а не список и не «не нашёл»",
+              итог, "Недоступен")
+        check("…и ответ пришёл по сроку, а не когда yt-dlp доделал",
+              _time.monotonic() - начали < 2.0, True)
+
+        # Сетевая ошибка от самого yt-dlp — тоже «недоступен», а не «не нашёл».
+        def _обрыв(з, download=False):
+            raise RuntimeError("Unable to download API page: Read timed out.")
+
+        _sys.modules["yt_dlp"] = _подделка(_обрыв)
+        try:
+            итог = video_mod.search("мультики")
+        except video_mod.Недоступен:
+            итог = "Недоступен"
+        check("обрыв сети от yt-dlp — Недоступен", итог, "Недоступен")
+
+        # А просто пусто — по-прежнему пустой список: искали, не нашли.
+        _sys.modules["yt_dlp"] = _подделка(lambda з, download=False: {"entries": []})
+        check("пустая выдача — пустой список, не ошибка", video_mod.search("ничего"), [])
+    finally:
+        video_mod.ТАЙМАУТ_ВСЕГО = был_срок
+        if был_модуль is not None:
+            _sys.modules["yt_dlp"] = был_модуль
+        else:
+            _sys.modules.pop("yt_dlp", None)
+
+    # Лицо отвечает человеку РАЗНЫМИ словами: «не нашёл» зовёт
+    # переформулировать, «не отвечает» — проверить сеть.
+    from robot_voice import face as _face_mod
+    был_search = video_mod.search
+    try:
+        def _нет_сети(что, сколько=8):
+            raise video_mod.Недоступен("YouTube не ответил за 15 с")
+        video_mod.search = _нет_сети
+        лицо_без_сети = _face_mod.Лицо(часы=time.monotonic,
+                                      файл=str(Path(tempfile.mkdtemp()) / "в.json"))
+        check("YouTube не отвечает — так и говорим, а не «не нашёл»",
+              лицо_без_сети.видео_начать("мультики"),
+              "YouTube не отвечает — видео включить не могу.")
+    finally:
+        video_mod.search = был_search
+
     # --- инструменты: play_video виден модели, управление — нет -----------
     видео_вызовы: list[str] = []
     видео = types.SimpleNamespace(
