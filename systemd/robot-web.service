@@ -1,6 +1,9 @@
 [Unit]
 Description=Robot-AI: веб-пульт и прокси камеры (порт 8000)
 After=network.target
+# Пульт с кнопкой СТОП. Тот же довод, что у моста: лимит перезапусков — это
+# исчезающая страховка.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

@@ -1,0 +1,244 @@
+diff --git a/src/open_llm_vtuber/agent/stateless_llm/robot_bridge_llm.py b/src/open_llm_vtuber/agent/stateless_llm/robot_bridge_llm.py
+new file mode 100644
+index 0000000..79e8db5
+--- /dev/null
++++ b/src/open_llm_vtuber/agent/stateless_llm/robot_bridge_llm.py
+@@ -0,0 +1,58 @@
++"""Провайдер-заглушка для Open-LLM-VTuber: не думает — спрашивает у робота.
++
++КУДА КЛАСТЬ (в дереве Open-LLM-VTuber): рядом с ollama_llm.py, claude_llm.py —
++    src/open_llm_vtuber/agent/stateless_llm/robot_bridge_llm.py
++
++Дальше — три правки в самом Open-LLM-VTuber (иначе conf.yaml не пройдёт
++проверку настроек и провайдер не найдётся): см. pc/ollv_bridge/README.md.
++
++ЧТО ДЕЛАЕТ. Вместо вызова настоящей модели опрашивает мост на ПК
++(pc/ollv_bridge.py в этом репозитории — тот же сервер и порт, что /tts и
++/avatar/state): что сейчас говорит робот. И просто пересказывает это слово
++в слово, с тегом эмоции вроде [joy] впереди — его вырежет и превратит в
++выражение модели их собственный live2d_model.py, без нашего участия.
++
++Разговор с этим провайдером начинает не человек, а их штатный сигнал
++ai-speak-signal («персонажу есть что сказать») — pc/ollv_bridge.py шлёт
++его сам, как только у робота готова новая фраза. Тот текст, что придёт
++сюда в `messages` (обычно "Please say something." — их проактивная
++подсказка), эта заглушка не читает: у неё уже есть, что сказать, от
++настоящего мозга робота (voice/robot_voice/brain.py).
++"""
++
++from __future__ import annotations
++
++from typing import Any, AsyncIterator, Dict, List
++
++import httpx
++from loguru import logger
++
++from .stateless_llm_interface import StatelessLLMInterface
++
++
++class RobotBridgeLLM(StatelessLLMInterface):
++    def __init__(self, bridge_url: str = "http://127.0.0.1:4000", timeout: float = 3.0) -> None:
++        # Тот же адрес и порт, что кормит /tts и /avatar/state на ПК —
++        # значение "--port" из запуска kuzya_pc.py.
++        self.bridge_url = bridge_url.rstrip("/")
++        self.timeout = timeout
++
++    async def chat_completion(
++        self,
++        messages: List[Dict[str, Any]],
++        system: str = None,
++        tools: List[Dict[str, Any]] = None,
++    ) -> AsyncIterator[str]:
++        try:
++            async with httpx.AsyncClient(timeout=self.timeout) as client:
++                ответ = await client.get(f"{self.bridge_url}/ollv/line")
++                данные = ответ.json()
++        except Exception as e:                       # noqa: BLE001
++            logger.warning(f"RobotBridgeLLM: мост недоступен ({e})")
++            return
++        текст = (данные or {}).get("текст") or ""
++        if not текст:
++            # Сигнал пришёл, а мост уже пуст (фраза устарела, гонка при
++            # старте) — молчим, а не выдумываем, что сказать.
++            return
++        yield текст
+diff --git a/src/open_llm_vtuber/agent/stateless_llm_factory.py b/src/open_llm_vtuber/agent/stateless_llm_factory.py
+index c5d8112..f13acc3 100644
+--- a/src/open_llm_vtuber/agent/stateless_llm_factory.py
++++ b/src/open_llm_vtuber/agent/stateless_llm_factory.py
+@@ -9,6 +9,7 @@ from .stateless_llm.stateless_llm_with_template import (
+ from .stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleLLM
+ from .stateless_llm.ollama_llm import OllamaLLM
+ from .stateless_llm.claude_llm import AsyncLLM as ClaudeLLM
++from .stateless_llm.robot_bridge_llm import RobotBridgeLLM
+ 
+ 
+ class LLMFactory:
+@@ -49,6 +50,8 @@ class LLMFactory:
+                 template=kwargs.get("template"),
+                 project_id=kwargs.get("project_id"),
+             )
++        if llm_provider == "robot_bridge_llm":
++            return RobotBridgeLLM(bridge_url=kwargs.get("bridge_url"))
+         if llm_provider == "ollama_llm":
+             return OllamaLLM(
+                 model=kwargs.get("model"),
+diff --git a/src/open_llm_vtuber/config_manager/agent.py b/src/open_llm_vtuber/config_manager/agent.py
+index b257d60..921239a 100644
+--- a/src/open_llm_vtuber/config_manager/agent.py
++++ b/src/open_llm_vtuber/config_manager/agent.py
+@@ -27,6 +27,7 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
+         "deepseek_llm",
+         "groq_llm",
+         "mistral_llm",
++        "robot_bridge_llm",
+     ] = Field(..., alias="llm_provider")
+ 
+     faster_first_response: Optional[bool] = Field(True, alias="faster_first_response")
+diff --git a/src/open_llm_vtuber/config_manager/stateless_llm.py b/src/open_llm_vtuber/config_manager/stateless_llm.py
+index 5521d3a..b2e45fe 100644
+--- a/src/open_llm_vtuber/config_manager/stateless_llm.py
++++ b/src/open_llm_vtuber/config_manager/stateless_llm.py
+@@ -229,6 +229,23 @@ class LlamaCppConfig(StatelessLLMBaseConfig):
+     }
+ 
+ 
++class RobotBridgeLLMConfig(StatelessLLMBaseConfig):
++    """Configuration for RobotBridgeLLM — не думает, спрашивает у робота."""
++
++    bridge_url: str = Field("http://127.0.0.1:4000", alias="bridge_url")
++    interrupt_method: Literal["system", "user"] = Field(
++        "user", alias="interrupt_method"
++    )
++
++    DESCRIPTIONS: ClassVar[dict[str, Description]] = {
++        **StatelessLLMBaseConfig.DESCRIPTIONS,
++        "bridge_url": Description(
++            en="Address of pc/ollv_bridge.py on the robot's PC (same host:port as /tts)",
++            zh="",
++        ),
++    }
++
++
+ class StatelessLLMConfigs(I18nMixin, BaseModel):
+     """Pool of LLM provider configurations.
+     This class contains configurations for different LLM providers."""
+@@ -249,6 +266,9 @@ class StatelessLLMConfigs(I18nMixin, BaseModel):
+     claude_llm: ClaudeConfig | None = Field(None, alias="claude_llm")
+     llama_cpp_llm: LlamaCppConfig | None = Field(None, alias="llama_cpp_llm")
+     mistral_llm: MistralConfig | None = Field(None, alias="mistral_llm")
++    robot_bridge_llm: RobotBridgeLLMConfig | None = Field(
++        None, alias="robot_bridge_llm"
++    )
+ 
+     DESCRIPTIONS: ClassVar[dict[str, Description]] = {
+         "stateless_llm_with_template": Description(
+@@ -282,4 +302,7 @@ class StatelessLLMConfigs(I18nMixin, BaseModel):
+         "llama_cpp_llm": Description(
+             en="Configuration for local Llama.cpp", zh="本地Llama.cpp配置"
+         ),
++        "robot_bridge_llm": Description(
++            en="Configuration for RobotBridgeLLM (Robot-AI bridge)", zh=""
++        ),
+     }
+diff --git a/src/open_llm_vtuber/config_manager/tts.py b/src/open_llm_vtuber/config_manager/tts.py
+index 9822bff..cb37636 100644
+--- a/src/open_llm_vtuber/config_manager/tts.py
++++ b/src/open_llm_vtuber/config_manager/tts.py
+@@ -680,6 +680,19 @@ class CartesiaTTSConfig(I18nMixin):
+     }
+ 
+ 
++class RobotBridgeTTSConfig(I18nMixin):
++    """Configuration for RobotBridgeTTS — забирает уже готовый звук с ПК."""
++
++    bridge_url: str = Field("http://127.0.0.1:4000", alias="bridge_url")
++
++    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
++        "bridge_url": Description(
++            en="Address of pc/ollv_bridge.py on the robot's PC (same host:port as /tts)",
++            zh="",
++        ),
++    }
++
++
+ class TTSConfig(I18nMixin):
+     """Configuration for Text-to-Speech."""
+ 
+@@ -702,6 +715,7 @@ class TTSConfig(I18nMixin):
+         "elevenlabs_tts",
+         "cartesia_tts",
+         "piper_tts",
++        "robot_bridge_tts",
+     ] = Field(..., alias="tts_model")
+ 
+     azure_tts: Optional[AzureTTSConfig] = Field(None, alias="azure_tts")
+@@ -726,6 +740,9 @@ class TTSConfig(I18nMixin):
+     elevenlabs_tts: ElevenLabsTTSConfig | None = Field(None, alias="elevenlabs_tts")
+     cartesia_tts: CartesiaTTSConfig | None = Field(None, alias="cartesia_tts")
+     piper_tts: Optional[PiperTTSConfig] = Field(None, alias="piper_tts")
++    robot_bridge_tts: Optional["RobotBridgeTTSConfig"] = Field(
++        None, alias="robot_bridge_tts"
++    )
+ 
+     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
+         "tts_model": Description(
+diff --git a/src/open_llm_vtuber/tts/robot_bridge_tts.py b/src/open_llm_vtuber/tts/robot_bridge_tts.py
+new file mode 100644
+index 0000000..459333e
+--- /dev/null
++++ b/src/open_llm_vtuber/tts/robot_bridge_tts.py
+@@ -0,0 +1,38 @@
++"""TTS-заглушка для Open-LLM-VTuber: не синтезирует — забирает готовый звук.
++
++КУДА КЛАСТЬ (в дереве Open-LLM-VTuber):
++    src/open_llm_vtuber/tts/robot_bridge_tts.py
++
++ЗАЧЕМ. Голос уже синтезирован — тот же самый WAV, что в этот момент звучит
++из колонки робота (pc/kuzya_pc.py, обработчик /tts). Синтезировать его
++ЕЩЁ РАЗ значит вдвое нагрузить видеокарту и получить ДВА РАЗНЫХ звука,
++которые разойдутся по времени с тем, что человек слышит вживую. Этот
++провайдер просто забирает тот же WAV с моста (pc/ollv_bridge.py) —
++Open-LLM-VTuber сам посчитает по нему огибающую громкости и синхронизирует
++рот, ему для этого не нужно ничего, кроме файла.
++"""
++
++from __future__ import annotations
++
++import requests
++from loguru import logger
++
++from .tts_interface import TTSInterface
++
++
++class TTSEngine(TTSInterface):
++    def __init__(self, bridge_url: str = "http://127.0.0.1:4000", timeout: float = 5.0) -> None:
++        self.bridge_url = bridge_url.rstrip("/")
++        self.timeout = timeout
++
++    def generate_audio(self, text: str, file_name_no_ext: str | None = None) -> str | None:
++        file_name = self.generate_cache_file_name(file_name_no_ext, "wav")
++        try:
++            ответ = requests.get(f"{self.bridge_url}/ollv/audio", timeout=self.timeout)
++            ответ.raise_for_status()
++        except Exception as e:                       # noqa: BLE001
++            logger.error(f"RobotBridgeTTS: мост недоступен ({e})")
++            return None
++        with open(file_name, "wb") as f:
++            f.write(ответ.content)
++        return file_name
+diff --git a/src/open_llm_vtuber/tts/tts_factory.py b/src/open_llm_vtuber/tts/tts_factory.py
+index 1fd5f50..780ee6d 100644
+--- a/src/open_llm_vtuber/tts/tts_factory.py
++++ b/src/open_llm_vtuber/tts/tts_factory.py
+@@ -211,6 +211,10 @@ class TTSFactory:
+                 normalize_audio=kwargs.get("normalize_audio"),
+                 use_cuda=kwargs.get("use_cuda"),
+             )
++        elif engine_type == "robot_bridge_tts":
++            from .robot_bridge_tts import TTSEngine as RobotBridgeTTSEngine
++
++            return RobotBridgeTTSEngine(bridge_url=kwargs.get("bridge_url"))
+         else:
+             raise ValueError(f"Unknown TTS engine type: {engine_type}")
+ 
