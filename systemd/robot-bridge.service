@@ -1,6 +1,9 @@
 [Unit]
 Description=Robot-AI: rosbridge websocket (порт 9090)
 After=network.target robot-base.service
+# По мосту ходит кнопка СТОП и сторож мёртвой руки. Бросить его после пяти
+# быстрых падений — значит оставить робота без обеих страховок до перезагрузки.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

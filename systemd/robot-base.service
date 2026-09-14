@@ -1,6 +1,9 @@
 [Unit]
 Description=Robot-AI: узел шасси WHEELTEC
 After=network.target
+# Пять быстрых падений подряд (USB шасси моргнул) — и systemd бросил бы
+# перезапускать насовсем; колёса при этом держат последнюю скорость.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

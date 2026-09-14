@@ -86,6 +86,32 @@ def describe_tomorrow(data: dict) -> str:
     return phrase + "."
 
 
+GEO = "https://geocoding-api.open-meteo.com/v1/search"
+
+
+def find_city(name: str) -> tuple[str, float, float] | None:
+    """Координаты города по названию. None — не нашли.
+
+    Нужно, чтобы широту и долготу не приходилось прописывать руками в файле
+    настроек: человек говорит «я живу в Калининграде», и этого достаточно.
+    На живом роботе иначе выходило глупо — он вызывал погоду и отвечал «я не
+    знаю, где мы находимся», хотя город ему только что назвали вслух.
+    """
+    query = urllib.parse.urlencode({"name": name, "count": 1,
+                                    "language": "ru", "format": "json"})
+    try:
+        with urllib.request.urlopen(f"{GEO}?{query}", timeout=TIMEOUT) as resp:
+            найдено = (json.loads(resp.read()) or {}).get("results") or []
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log.warning("поиск города не ответил: %s", e)
+        return None
+    if not найдено:
+        return None
+    город = найдено[0]
+    return (город.get("name") or name,
+            float(город["latitude"]), float(город["longitude"]))
+
+
 def fetch(lat: float, lon: float) -> dict | None:
     """Ходит в open-meteo. None — не дозвонились, и это нормально."""
     query = urllib.parse.urlencode({
