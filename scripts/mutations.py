@@ -1387,6 +1387,14 @@ def вернуть_недоделанное() -> None:
      "        except RobotGone as e:",
      "без трассировки"),
 
+    # --- движение: хвост stderr ffmpeg не теряется --------------------------
+    ("движение: хвост stderr возвращается наперегонки со сливом — «поток "
+     "оборвался» без причины",
+     "voice/robot_voice/motion.py",
+     "            слив.join(timeout=1.0)\n        return bytes(хвост)",
+     "            pass\n        return bytes(хвост)",
+     "хвост stderr ffmpeg сохранён"),
+
     # --- видео: Rutube по умолчанию, прямой HLS для mpv -----------------------
     ("видео: умолчание снова YouTube — из дома не отвечает",
      "voice/robot_voice/video.py",

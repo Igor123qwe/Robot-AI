@@ -204,7 +204,8 @@ class Движение:
                         pass
                     return
 
-        threading.Thread(target=сливать, name="движение-stderr", daemon=True).start()
+        слив = threading.Thread(target=сливать, name="движение-stderr", daemon=True)
+        слив.start()
         threading.Thread(target=сторожить, name="движение-сторож", daemon=True).start()
         было = b""
         try:
@@ -226,4 +227,11 @@ class Движение:
                 proc.wait(timeout=5)
             except Exception:                   # noqa: BLE001
                 pass
+            # Дождаться слива, а не возвращать хвост наперегонки с ним. ffmpeg
+            # свои последние слова пишет перед самой смертью; кадры при этом
+            # уже кончились, и без ожидания «поток оборвался» уходил в журнал
+            # ПУСТЫМ — ровно тогда, когда причина нужнее всего. Ждём недолго:
+            # после kill и wait труба закрыта с той стороны, и слив упирается
+            # в конец файла сразу.
+            слив.join(timeout=1.0)
         return bytes(хвост)
