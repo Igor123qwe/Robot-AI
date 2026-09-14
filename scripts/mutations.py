@@ -1387,6 +1387,43 @@ def вернуть_недоделанное() -> None:
      "        except RobotGone as e:",
      "без трассировки"),
 
+    # --- видео: Rutube по умолчанию, прямой HLS для mpv -----------------------
+    ("видео: умолчание снова YouTube — из дома не отвечает",
+     "voice/robot_voice/video.py",
+     'ИСТОЧНИК = (os.environ.get("ROBOT_VIDEO_SOURCE", "rutube").strip().lower()\n            or "rutube")',
+     'ИСТОЧНИК = (os.environ.get("ROBOT_VIDEO_SOURCE", "youtube").strip().lower()\n            or "youtube")',
+     "по умолчанию Rutube"),
+
+    ("видео: взрослое и прямые эфиры Rutube не отсеиваются",
+     "voice/robot_voice/video.py",
+     '        if not страница or запись.get("is_adult") or запись.get("is_livestream"):',
+     '        if not страница:',
+     "взрослое и эфиры отсеяны"),
+
+    ("видео: обрыв сети Rutube выдаётся за пустой список",
+     "voice/robot_voice/video.py",
+     "    except (urllib.error.URLError, TimeoutError, OSError) as e:\n"
+     "        raise Недоступен(f\"{ИМЯ_ИСТОЧНИКА}: {e}\") from None",
+     "    except (urllib.error.URLError, TimeoutError, OSError) as e:\n"
+     "        return {}",
+     "обрыв сети в _читать_json"),
+
+    ("видео: без m3u8 в ответе mpv получает пустоту вместо страницы",
+     "voice/robot_voice/video.py",
+     '        log.warning("видео: в ответе Rutube нет m3u8 (%s) — отдаю mpv страницу",\n'
+     '                    str(данные)[:120])\n'
+     '        return страница',
+     '        log.warning("видео: в ответе Rutube нет m3u8 (%s) — отдаю mpv страницу",\n'
+     '                    str(данные)[:120])\n'
+     '        return ""',
+     "нет m3u8 — страница"),
+
+    ("экран: прямой HLS всё равно гоняется через yt-dlp",
+     "face/videoplayer.py",
+     '            команда.append("--ytdl=no")',
+     '            pass',
+     "без yt-dlp"),
+
     # --- видео: YouTube не отвечает — быстро и честно -------------------------
     ("видео: повторы yt-dlp снова не ограничены — полторы минуты молчания",
      "voice/robot_voice/video.py",
@@ -1408,7 +1445,7 @@ def вернуть_недоделанное() -> None:
 
     ("лицо: «YouTube не отвечает» не отличают от «не нашёл»",
      "voice/robot_voice/face.py",
-     '            return "YouTube не отвечает — видео включить не могу."',
+     '            return f"{video_api.ИМЯ_ИСТОЧНИКА} не отвечает — видео включить не могу."',
      '            return f"Не нашёл: {что}."',
      "так и говорим, а не «не нашёл»"),
 

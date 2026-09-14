@@ -12236,6 +12236,14 @@ def test_лицо_робота() -> None:
           any(a.startswith("--input-ipc-server=") for a in команда), True)
     check("mpv: сама ссылка — последним словом команды",
           команда[-1], "https://www.youtube.com/watch?v=zzz")
+    # Прямой HLS (Rutube через api/play/options): mpv играет сам, yt-dlp не
+    # нужен и не должен вмешиваться — иначе секунды ожидания, а при
+    # сломанном yt-dlp и отказ вместо ролика.
+    прямой = пр.команда("https://video.rutube.ru/a/playlist.m3u8", 50)
+    check("прямой m3u8 — без yt-dlp и с referer Rutube",
+          ("--ytdl=no" in прямой, "--referrer=https://rutube.ru/" in прямой), (True, True))
+    check("а страница ролика — через ytdl_hook, как раньше",
+          "--ytdl=no" in команда, False)
     команда_без_устройства = f.videoplayer.Проигрыватель().команда("http://x", 10)
     check("устройство не задано — ключ --audio-device не добавляется зря",
           any("--audio-device" in a for a in команда_без_устройства), False)
@@ -21066,8 +21074,13 @@ def test_video() -> None:
     test_лицо_робота — там же, где остальное про экран робота. Здесь —
     поиск (video.py, без сети), регистрация инструментов и голосовые правила.
     """
-    section("видео (YouTube)")
+    section("видео (Rutube и YouTube)")
     from robot_voice import video as video_mod
+
+    # Путь YouTube через yt-dlp живёт за флагом; его проверки идут в этом
+    # режиме, а умолчание (Rutube) — своим блоком ниже.
+    был_источник = video_mod.ИСТОЧНИК
+    video_mod.ИСТОЧНИК = "youtube"
 
     # --- поиск: без сети, без выдуманного результата -----------------------
     check("пустой запрос — пустой список, а не выдумка", video_mod.search(""), [])
@@ -21221,9 +21234,92 @@ def test_video() -> None:
                                       файл=str(Path(tempfile.mkdtemp()) / "в.json"))
         check("YouTube не отвечает — так и говорим, а не «не нашёл»",
               лицо_без_сети.видео_начать("мультики"),
-              "YouTube не отвечает — видео включить не могу.")
+              f"{video_mod.ИМЯ_ИСТОЧНИКА} не отвечает — видео включить не могу.")
     finally:
         video_mod.search = был_search
+    video_mod.ИСТОЧНИК = был_источник
+
+    # --- Rutube: умолчание. Форма API — из разборщика Rutube в yt-dlp -----
+    # Сеть подменена целиком (_читать_json): проверяется разбор ответа, отсев
+    # и то, что mpv получает прямой m3u8, а не страницу. Настоящий Rutube из
+    # песочницы недоступен — прокси не пускает; первый живой запуск покажет.
+    check("по умолчанию Rutube, и искать им можно без yt-dlp",
+          (video_mod.ИСТОЧНИК, video_mod.possible()), ("rutube", True))
+    # Дальше — про сам путь Rutube, независимо от умолчания: сломанное
+    # умолчание обязано уронить ОДНУ проверку выше, а не весь блок.
+    video_mod.ИСТОЧНИК = "rutube"
+    было_чтение = video_mod._читать_json
+    запросы: list[str] = []
+
+    def _rutube(url):
+        запросы.append(url)
+        if "api/search/video" in url:
+            return {"results": [
+                {"id": "a" * 32, "title": "Смешарики", "video_url": "https://rutube.ru/video/" + "a" * 32 + "/"},
+                {"id": "b" * 32, "title": "взрослое", "video_url": "https://rutube.ru/video/" + "b" * 32 + "/", "is_adult": True},
+                {"id": "c" * 32, "title": "эфир", "video_url": "https://rutube.ru/video/" + "c" * 32 + "/", "is_livestream": True},
+                {"id": "d" * 32, "title": "без адреса"},
+                {"id": "e" * 32, "title": "Фиксики", "video_url": "https://rutube.ru/video/" + "e" * 32 + "/"},
+            ]}
+        if "api/play/options/" + "a" * 32 in url:
+            return {"video_balancer": {"default": "https://cdn/x.mpd",
+                                       "m3u8": "https://video.rutube.ru/a/playlist.m3u8"}}
+        return {}
+
+    video_mod._читать_json = _rutube
+    try:
+        найдено = video_mod.search("мультики", сколько=8)
+        check("взрослое и эфиры отсеяны, без адреса пропущено, порядок сохранён",
+              найдено, [("https://rutube.ru/video/" + "a" * 32 + "/", "Смешарики"),
+                        ("https://rutube.ru/video/" + "e" * 32 + "/", "Фиксики")])
+        # Срезом, не индексом: если в сеть не ходили вовсе, сторож обязан
+        # сказать это, а не рухнуть с IndexError.
+        первый = (запросы + [""])[0]
+        check("искали по открытому API с запросом в адресе",
+              "api/search/video" in первый and "query=" in первый, True)
+        check("«сколько» режет список", len(video_mod.search("мультики", сколько=1)), 1)
+        check("прямой адрес — m3u8 из video_balancer",
+              video_mod.прямой_адрес("https://rutube.ru/video/" + "a" * 32 + "/"),
+              "https://video.rutube.ru/a/playlist.m3u8")
+        check("нет m3u8 — страница ролика, а не пустота",
+              video_mod.прямой_адрес("https://rutube.ru/video/" + "e" * 32 + "/"),
+              "https://rutube.ru/video/" + "e" * 32 + "/")
+        n = len(запросы)
+        check("чужой адрес — отдаём как есть, в сеть не ходим",
+              (video_mod.прямой_адрес("https://www.youtube.com/watch?v=zzz"), len(запросы)),
+              ("https://www.youtube.com/watch?v=zzz", n))
+
+        def _обрыв(url):
+            raise video_mod.Недоступен("Rutube: timed out")
+        video_mod._читать_json = _обрыв
+        try:
+            итог = video_mod.search("мультики")
+        except video_mod.Недоступен:
+            итог = "Недоступен"
+        check("Rutube не отвечает — Недоступен, а не пустой список", итог, "Недоступен")
+        check("прямой адрес при обрыве — страница, mpv попробует сам",
+              video_mod.прямой_адрес("https://rutube.ru/video/" + "a" * 32 + "/"),
+              "https://rutube.ru/video/" + "a" * 32 + "/")
+    finally:
+        video_mod._читать_json = было_чтение
+
+    # Сама сеть: обрыв urllib — Недоступен, а не «не нашёл».
+    import urllib.error as _ue
+    import urllib.request as _ur
+    был_urlopen = _ur.urlopen
+
+    def _нет_сети(*a, **kw):
+        raise _ue.URLError("timed out")
+    _ur.urlopen = _нет_сети
+    try:
+        try:
+            итог = video_mod._читать_json(video_mod.RUTUBE_ПОИСК)
+        except video_mod.Недоступен:
+            итог = "Недоступен"
+        check("обрыв сети в _читать_json — Недоступен", итог, "Недоступен")
+    finally:
+        _ur.urlopen = был_urlopen
+    video_mod.ИСТОЧНИК = был_источник
 
     # --- инструменты: play_video виден модели, управление — нет -----------
     видео_вызовы: list[str] = []
