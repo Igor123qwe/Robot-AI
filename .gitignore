@@ -36,3 +36,6 @@ models/
 # 3D-аватар: своя модель VRM (десятки мегабайт, своя лицензия) — как и Live2D,
 # кладётся вручную, см. pc/avatar/README.md
 pc/avatar/model3d/
+
+# Рабочие копии (git worktree) параллельных правок Claude Code — не часть репозитория.
+.claude/worktrees/
