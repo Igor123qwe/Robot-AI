@@ -33,6 +33,8 @@ ALARM = "будильник"
 # Сколько раз повторять объявление, если его никто не слышал, и с каким шагом.
 RING_TRIES = 3
 RING_RETRY = 45.0
+# Приставка к напоминанию, сработавшему, пока сервиса не было.
+ОПОЗДАЛ = "Пока меня не было: "
 # Говорить было нечем — ПК выключен, а голос робота это голос ПК (робот
 # работает только в паре с ним). Такой таймер не «прозвонил в пустоту», он
 # не прозвонил вовсе — и ждёт ПК, повторяя попытку, сколько ещё не поздно
@@ -369,12 +371,15 @@ class Timers:
             item = self._items.pop(label, None)
             if item is not None:
                 item[0].cancel()
-            if item is not None or paused is not None:
+            # Звонит прямо сейчас (объявление идёт с отпущенным замком) — его
+            # тоже отменяем: иначе повтор после объявления воскрешал его.
+            звонит = label in self._tries
+            if item is not None or paused is not None or звонит:
                 self._messages.pop(label, None)
                 self._tries.pop(label, None)
                 self._первый_звонок.pop(label, None)
                 self._save()
-            return item is not None or paused is not None
+            return item is not None or paused is not None or звонит
         finally:
             if not _locked:
                 self._lock.release()
@@ -476,7 +481,15 @@ class Timers:
         # вкладка закрыта, звук выключен — или ПК нет вовсе (тогда announce
         # отвечает −1: говорить было нечем). Прозвонить в пустоту и забыть —
         # это потерянный таймер на духовке, поэтому повторяем.
-        первый = self._первый_звонок.setdefault(label, time.monotonic())
+        with self._lock:
+            if label not in self._tries:
+                # Отменили, пока звонил: и времени первого звонка не заводим,
+                # иначе следующий будильник с тем же именем «звенел» бы с
+                # первой секунды.
+                self._первый_звонок.pop(label, None)
+                log.info("таймер %r отменили, пока он звонил", label)
+                return
+            первый = self._первый_звонок.setdefault(label, time.monotonic())
         без_пк = heard is not None and heard < 0
         ещё = tries < RING_TRIES or (
             без_пк and time.monotonic() - первый < STALE_SECONDS)
@@ -567,11 +580,15 @@ class Timers:
         for label in late:
             # Сработал, пока сервиса не было. Молчать нельзя: человек ждал.
             said = messages.get(label) or _ring(label)
-            текст = f"Пока меня не было: {said[0].lower()}{said[1:]}"
-            heard = self._announce(текст)
-            if heard is not None and heard < 0:
-                # Говорить нечем — ПК нет. Обычным звонком с повтором: как
-                # только ПК вернётся, напоминание прозвучит.
+            # Перезапуск при молчащем ПК бывает не один (автообновление — раз
+            # в пару минут): приставку не наращиваем.
+            текст = (said if said.startswith(ОПОЗДАЛ)
+                     else f"{ОПОЗДАЛ}{said[0].lower()}{said[1:]}")
+            heard = self._announce(текст, loud=True)
+            if heard is not None and heard <= 0:
+                # Никто не услышал (вкладка закрыта) или говорить нечем (ПК
+                # нет) — обычным звонком с повтором, как у _fire: дальше
+                # число попыток и срок ожидания ПК решает он.
                 self.add(label, RING_RETRY, текст)
 
 
