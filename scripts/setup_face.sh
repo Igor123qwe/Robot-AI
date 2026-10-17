@@ -68,6 +68,29 @@ if [ ! -f "$FONT" ]; then
   exit 1
 fi
 
+# numpy — для шара из точек (face/orb.py): с ним полторы тысячи точек и все
+# механики, без него 260 точек и только главные. Из APT, а не с PyPI:
+# системный python3-numpy собран под эту плату и эту libc, а колёса numpy с
+# PyPI в сентябре 2026 роняли venv голоса SIGILL'ом. Пробуем в отдельном
+# процессе и с вычислением, а не одним импортом: битое ядро numpy падало
+# именно на первом вычислении, а SIGILL не ловится ничем. Лицо проверяет то
+# же самое само при каждом запуске — так что без numpy оно не упадёт, а
+# нарисует шар беднее и скажет об этом в журнал.
+numpy_ok() {
+  python3 -c "import numpy as n; a = n.arange(64, dtype=n.float32); print(float(n.sin(a).sum() + (a @ a)))" >/dev/null 2>&1
+}
+if numpy_ok; then
+  echo "==> numpy для шара уже стоит"
+else
+  echo "==> ставлю python3-numpy из APT (шар: полторы тысячи точек вместо 260)"
+  sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 python3-numpy || true
+  if numpy_ok; then
+    echo "    numpy встал"
+  else
+    echo "!! numpy не встал или падает — шар будет беднее (260 точек), но будет"
+  fi
+fi
+
 echo "==> права на экран"
 # DRM (/dev/dri/*) и фреймбуфер выдаются группами video и render. Служба
 # работает без входа в систему, а logind свои списки выдаёт только вошедшим —

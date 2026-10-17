@@ -1108,6 +1108,30 @@ def test_avatar() -> None:
         check("а поза — уже посчитана той же логикой, что и на экране "
               "робота (говорит → рот приоткрыт хоть иногда)",
               "рот" in данные.get("поза", {}), True)
+        # Режим шара — по тем же правилам, что у робота (face/orb_rules.py):
+        # «рад» и «говорит» разом — это речь (речь сильнее эмоции).
+        check("в состоянии для страницы — режим шара по общим правилам",
+              (данные.get("шар") or {}).get("режим"), "речь")
+        # Касание экрана робота, когда там шар с ПК: странице — где (доли) и
+        # номер, сценаристу — один такт, как на роботе.
+        запрос = urllib.request.Request(url + "/avatar/touch", method="POST",
+                                        data=json.dumps({"куда": "голова", "x": 0.6, "y": 0.3}).encode())
+        urllib.request.urlopen(запрос, timeout=5).read()
+        with urllib.request.urlopen(url + "/avatar/state", timeout=5) as r:
+            после = json.loads(r.read().decode("utf-8"))
+        with urllib.request.urlopen(url + "/avatar/state", timeout=5) as r:
+            ещё_раз = json.loads(r.read().decode("utf-8"))
+        check("касание с робота доходит до страницы шара: куда, где и номер",
+              ((после.get("касание_шара") or {}).get("куда"), (после.get("касание_шара") or {}).get("x"),
+               (после.get("касание_шара") or {}).get("номер", 0) >= 1), ("голова", 0.6, True))
+        check("…а сценаристу касание — один такт, не бесконечная щекотка",
+              (после.get("касание"), ещё_раз.get("касание")), ("голова", None))
+        # И сами правила — оттуда же, а не копией в странице.
+        import orb_rules as _правила
+        with urllib.request.urlopen(url + "/avatar/orb_rules.json", timeout=5) as r:
+            check("страница шара получает правила робота, а не держит свою копию",
+                  json.loads(r.read().decode("utf-8")),
+                  json.loads(json.dumps(_правила.для_страницы(), ensure_ascii=False)))
 
         # Своё — в config.local.json поверх общего config.json: путь к модели
         # у каждого свой, а правка общего файла ломала git pull на живом ПК.
@@ -2530,11 +2554,18 @@ def test_scenes() -> None:
         врем.mkdir()
         (врем / "config.json").write_text(json.dumps({"модель": "", "модель3d": ""}),
                                           encoding="utf-8")
+        # По умолчанию движок — шар (orb.html), и ему модель не нужна вовсе:
+        # лицо для робота есть сразу, без единой строчки настроек.
+        check("ничего не настроено — движок шар, снимать есть что (модель не нужна)",
+              kuzya_pc.модель_настроена(врем), (True, "шар (pc/avatar/orb.html)"))
+        # Дальше — про персонажа, которого возвращают нарочно.
+        (врем / "config.local.json").write_text(json.dumps({"движок": "live2d"}),
+                                                encoding="utf-8")
         check("нет ни своей, ни общей модели — съёмку не с чего начинать",
               kuzya_pc.модель_настроена(врем), (False, ""))
 
         (врем / "config.local.json").write_text(
-            json.dumps({"модель": "виджет.model.json"}), encoding="utf-8")
+            json.dumps({"движок": "live2d", "модель": "виджет.model.json"}), encoding="utf-8")
         check("своя модель вписана, но файла ещё нет на диске — тоже не старт",
               kuzya_pc.модель_настроена(врем), (False, "виджет.model.json"))
 
@@ -2546,7 +2577,7 @@ def test_scenes() -> None:
         # существует где-то на диске: страница его всё равно не получит
         # (сервер наружу из avatar/ не отдаёт).
         (врем / "config.local.json").write_text(
-            json.dumps({"модель": "../секрет.txt"}), encoding="utf-8")
+            json.dumps({"движок": "live2d", "модель": "../секрет.txt"}), encoding="utf-8")
         check("путь наружу из папки аватара — «нет модели», хотя файл и существует",
               kuzya_pc.модель_настроена(врем), (False, "../секрет.txt"))
 
@@ -2631,12 +2662,14 @@ def test_scenes() -> None:
     выбор = _Path(_tf.mkdtemp())
     (выбор / "config.local.json").write_text('{"движок": "3d"}', encoding="utf-8")
     какая_3d = kuzya_pc.страница_аватара(выбор)
+    (выбор / "config.local.json").write_text('{"движок": "live2d"}', encoding="utf-8")
+    какая_live2d = kuzya_pc.страница_аватара(выбор)
     (выбор / "config.local.json").write_text('{"движок": "ерунда"}', encoding="utf-8")
     какая_ерунда = kuzya_pc.страница_аватара(выбор)
-    check("движок выбирается в config.local.json; незнакомое слово и отсутствие файла — "
-          "это Live2D, а не пустой экран",
-          (какая_3d, какая_ерунда, kuzya_pc.страница_аватара(_Path(_tf.mkdtemp()))),
-          ("3d.html", "", ""))
+    check("движок выбирается в config.local.json; по умолчанию, при незнакомом слове и без "
+          "файла — шар (ему не нужно ничего), а не пустой экран",
+          (какая_3d, какая_live2d, какая_ерунда, kuzya_pc.страница_аватара(_Path(_tf.mkdtemp()))),
+          ("3d.html", "", "orb.html", "orb.html"))
     check("kuzya_pc снимает ту страницу, которую выбрали, а не всегда Live2D",
           "/avatar/{страница_аватара()}" in исходник_pc, True)
     # Съёмка headless-браузером не должна стартовать «на всякий случай»:
@@ -4356,6 +4389,96 @@ def test_вкус_в_доме_переменился() -> None:
     # не «передумал», а «сломался»: человек увидит это раньше любой метрики.
     последние = {и for когда, и in сыграно if когда >= 14 * 86400}
     check("…не выбросив при этом половину библиотеки", len(последние) >= 40, True)
+
+
+def test_шар_пк() -> None:
+    """Шар страницы (pc/avatar/orb.html) и шар робота (face/orb.py) — один шар.
+
+    Робот кладёт свои часы, строку и карточки поверх кадра с ПК, а когда ПК
+    пропадает, рисует шар сам — с той же секунды. Разойдись у них центр,
+    радиус, кольцо сна или отход от карточки — шар прыгал бы на экране при
+    каждой смене источника, а кольцо сна легло бы на цифры часов. Поведение
+    (режимы, палитры, жесты) у них общее через orb_rules.json и проверено
+    выше; здесь — числа раскладки, которые страница держит у себя.
+
+    Браузер не нужен: страница читается текстом, робот — через ast (pygame
+    на ПК нет). Живую страницу в настоящем Chromium гоняет page_selftest.py.
+    """
+    section("шар на ПК — те же числа, что у шара робота")
+    import ast
+    import json
+    import re
+    корень = Path(__file__).resolve().parent.parent
+    страница = (корень / "pc" / "avatar" / "orb.html").read_text(encoding="utf-8")
+
+    def константы(путь: Path) -> dict:
+        дерево = ast.parse(путь.read_text(encoding="utf-8"))
+        итог = {}
+        for узел in дерево.body:
+            if isinstance(узел, ast.Assign) and len(узел.targets) == 1 \
+                    and isinstance(узел.targets[0], ast.Name):
+                try:
+                    итог[узел.targets[0].id] = ast.literal_eval(узел.value)
+                except ValueError:
+                    pass
+        return итог
+
+    робот = константы(корень / "face" / "orb.py")
+    лицо = константы(корень / "face" / "face.py")
+
+    def js(имя: str):
+        м = re.search(r"(?:const |, )" + имя + r" = (\[[^\]]*\]|[^,;\n]+)", страница)
+        if not м:
+            return None
+        текст = м.group(1).strip()
+        if текст.startswith("["):
+            return tuple(float(x) for x in текст.strip("[]").split(","))
+        return float(текст)
+
+    for имя in ("РАДИУС", "ЦЕНТР_Y", "ЦЕНТР_Y_ВО_СНЕ", "С_КАРТОЧКОЙ", "НИЗ_ШАРА",
+                "ПЕРСПЕКТИВА", "НАКЛОН_ОСИ"):
+        check(f"шар ПК: {имя} как у робота", js(имя), float(робот[имя]))
+    check("шар ПК: кольцо сна — те же полуоси, что у робота (вокруг цифр, не по ним)",
+          js("КОЛЬЦО_СНА"), tuple(float(x) for x in робот["КОЛЬЦО_СНА"]))
+    for имя in ("ПОЛЯ", "КАРТОЧКА_ШИРИНА"):
+        check(f"шар ПК: {имя} — та же раскладка карточек, что у лица робота",
+              js(имя), float(лицо[имя]))
+    фон = re.search(r"const ФОН = \[0x(..) / 255, 0x(..) / 255, 0x(..) / 255\]", страница)
+    check("шар ПК: фон тот же, что у лица робота",
+          tuple(int(x, 16) for x in фон.groups()) if фон else None, tuple(лицо["ФОН"]))
+    check("шар ПК: правила и состояние — с сервера ПК, своей копии таблиц нет",
+          ('fetch("orb_rules.json"' in страница, 'fetch("state"' in страница,
+           '"сон":        dict(' in страница), (True, True, False))
+
+    # Каждый файл из importmap — на диске, вместе с тем, что он сам тянет:
+    # без интернета страница берёт всё из vendor/, и пропавший файл — это
+    # пустой экран робота без единого слова.
+    карта = json.loads(re.search(r'<script type="importmap">(.*?)</script>', страница, re.S).group(1))
+    папка = корень / "pc" / "avatar"
+    нет = [путь for путь in карта["imports"].values() if not (папка / путь).is_file()]
+    for путь in карта["imports"].values():
+        файл = папка / путь
+        if файл.is_file():
+            for отн in re.findall(r"from '(\.\.?/[^']+)'", файл.read_text(encoding="utf-8")):
+                if not (файл.parent / отн).resolve().is_file():
+                    нет.append(f"{путь} → {отн}")
+    check("шар ПК: всё из importmap лежит в vendor/ (и то, что оно тянет)", нет, [])
+    check("шар ПК: чужой код — со строками об авторских правах (THIRD_PARTY.md)",
+          all(с in (папка / "THIRD_PARTY.md").read_text(encoding="utf-8")
+              for с in ("Copyright (c) 2026 Ship Notes", "three.js authors",
+                        "Permission is hereby granted")), True)
+
+    # Фигуры: общие из правил и свои у ПК — у каждой есть номер в шейдере.
+    import orb_rules as _правила
+    номера = dict(re.findall(r'"([а-яё]+)": (\d+)', страница.split("const ФИГУРА = {")[1].split("};")[0]))
+    свои = re.search(r"const ФИГУРЫ_ПК = \[([^\]]+)\]", страница).group(1)
+    свои = re.findall(r'"([а-яё]+)"', свои)
+    check("шар ПК: у каждой фигуры (общей и своей) есть номер в шейдере",
+          [ф for ф in list(_правила.ФИГУРЫ) + свои if ф not in номера], [])
+    for номер in sorted(set(номера.values()), key=int):
+        if номер != "6":                  # сердце зовётся отдельно, shape(6, …)
+            check(f"шар ПК: фигура №{номер} нарисована в шейдере",
+                  f"if (id == {номер})" in страница, True)
 
 
 def main() -> int:
