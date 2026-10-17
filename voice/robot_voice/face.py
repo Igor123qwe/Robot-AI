@@ -698,9 +698,13 @@ class Лицо:
         if т is None:
             return []
         try:
-            идут = [{"имя": имя, "осталось": int(round(сек))}
+            звенят = getattr(т, "звенят", None)
+            звенят = звенят() if callable(звенят) else set()
+            идут = [{"имя": имя, "осталось": int(round(сек)),
+                     **({"звенит": True} if имя in звенят else {})}
                     for имя, сек in т.remaining().items()]
-            идут.sort(key=lambda з: з["осталось"])
+            # Звенящий — первым: это то, что надо видеть прямо сейчас.
+            идут.sort(key=lambda з: (not з.get("звенит"), з["осталось"]))
             стоят = [{"имя": имя, "осталось": int(round(сек)), "пауза": True}
                      for имя, сек in getattr(т, "paused", dict)().items()]
             return (идут + стоят)[:3]

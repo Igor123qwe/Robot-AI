@@ -35,7 +35,7 @@ from .notes import Notes
 from .people import People
 from .ros import Ros
 from .state import State
-from .stt import Recognizer, Remote
+from .stt import Remote
 from .follow import Следование
 from .tof import Дальномер
 from . import motion
@@ -298,6 +298,8 @@ class Voice:
     def say(self, text: str, *, loud: bool = False, on_sound=None) -> int:
         """Говорит и возвращает, сколько слушателей реально услышали.
 
+        −1 — говорить было нечем: ПК нет, а голос робота — это голос ПК.
+
         on_sound зовётся в миг, когда пошёл ПЕРВЫЙ звук, а не когда реплика
         отзвучала. Разница между этими моментами — вся длина реплики, и
         секундомер, меряющий второе вместо первого, показывает не задержку, а
@@ -306,15 +308,30 @@ class Voice:
         """
         if not text:
             return 0
+        может = getattr(self.speaker, "может_говорить", None)
+        if может is not None and not может():
+            # Голос робота — это голос ПК, а его сейчас нет: робот молчит.
+            # Микрофон не глушим и «говорю» на лицо не пишем — звука не
+            # будет, а глухота на время несказанной фразы — это пропущенный
+            # «стоп». −1 — «говорить было нечем» (не путать с 0, «никто не
+            # слушал»): таймер по нему ждёт ПК и прозвонит, когда тот вернётся.
+            log.info("робот (молча, ПК нет): %s", text)
+            return -1
         with self._lock, self.quiet(text):
             # Лицу — что произносим: строка «говорю» и текст под ней. И
             # обязательно снять по выходу, иначе на экране повиснет реплика,
             # которая давно отзвучала, — а это и есть замершее лицо.
             _лицо(self, "говорю", text)
             try:
-                return self.speaker.say(text, loud=loud, on_sound=on_sound)
+                слышали = self.speaker.say(text, loud=loud, on_sound=on_sound)
             finally:
                 _лицо(self, "сказал")
+        # ПК мог пропасть прямо на этой фразе: до неё голос считался живым, а
+        # /tts не ответил. Это тоже «говорить было нечем», а не «никто не
+        # слушал»: иначе будильник с выключенным ПК сгорал за три звонка.
+        if слышали <= 0 and может is not None and not может():
+            return -1
+        return слышали
 
     def heard(self, text: str) -> None:
         self._show("heard", text)
@@ -643,6 +660,10 @@ class Watchdog:
 
     Микрофон: если телефон уснул или Wi-Fi моргнул, робот молчит, и снаружи
     это неотличимо от «обиделся». Состояние уходит в пульт строкой.
+
+    Про ПК сторож НЕ говорит ничего: робот работает только в паре с ним, и
+    пропавший ПК — это просто тишина, а не новость вслух (раньше сторож здесь
+    объявлял, что ПК пропал и робот справляется своими силами).
     """
 
     LEVELS = ((11.1, "Батарея меньше половины."),
@@ -650,16 +671,13 @@ class Watchdog:
               (CUTOFF_VOLT, "Батарея почти пустая, ехать я больше не буду."))
 
     def __init__(self, ros, voice: Voice, listener: Listener,
-                 period: float = 30.0, recognizer=None, brain=None) -> None:
+                 period: float = 30.0) -> None:
         self.ros = ros
         self.voice = voice
         self.listener = listener
         self.period = period
-        self.recognizer = recognizer
-        self.brain = brain
         self._said: set[float] = set()
         self._mic_was: bool | None = None
-        self._запас_был: str | None = None
         self._stop = threading.Event()
 
     def start(self) -> None:
@@ -673,7 +691,6 @@ class Watchdog:
             try:
                 self._battery()
                 self._mic()
-                self._запасной_путь()
             except Exception:
                 log.exception("наблюдатель споткнулся")
 
@@ -685,59 +702,17 @@ class Watchdog:
         self._said = {v for v in self._said if volt <= v}
         for level, phrase in self.LEVELS:
             if volt <= level and level not in self._said:
-                self._said.add(level)
-                log.info("батарея %.1f В — предупреждаю", volt)
-                self.voice.say(phrase)
+                # Порог считаем сказанным, только если его УСЛЫШАЛИ: без ПК
+                # робот молчит, и предупреждение прозвучит, когда ПК вернётся,
+                # а не пропадёт насовсем.
+                # Повторяем только «говорить было нечем» (−1, ПК нет). «Никто
+                # не слушал» (0, вкладка пульта закрыта) — сказано: иначе
+                # предупреждение синтезировалось бы каждые полминуты, глуша
+                # микрофон, пока не зарядят.
+                if self.voice.say(phrase) >= 0:
+                    self._said.add(level)
+                    log.info("батарея %.1f В — предупредил", volt)
                 break
-
-    def _запасной_путь(self) -> None:
-        """Сказать, что робот работает не в полную силу.
-
-        Запасные пути есть у каждого звена, и это хорошо — но проходил их
-        робот молча. Снаружи ухудшение выглядит как «стал тупить»: отвечает
-        медленнее, хуже слышит, а почему — видно только в журнале по ssh.
-        Про синтез не говорим: там запасной путь слышно и так, голос меняется.
-        """
-        беды = []
-        if self.recognizer is not None and getattr(
-                self.recognizer, "сам_разбираю", False):
-            беды.append("разбираю речь сам")
-        мозг = self.brain
-        если_запасной = (мозг is not None and мозг.ответил
-                         and мозг.endpoints and мозг.ответил != мозг.endpoints[0].name)
-        if если_запасной:
-            беды.append(f"отвечаю через {мозг.ответил}")
-        стало = "; ".join(беды)
-        if стало == self._запас_был:
-            return
-        # Первый заход при живом роботе — молчим: сказать «всё хорошо» тому,
-        # кто ничего не спрашивал, незачем.
-        впервые = self._запас_был is None
-        было_плохо = bool(self._запас_был)
-        self._запас_был = стало
-        if стало:
-            log.info("работаю на запасном: %s", стало)
-            self.voice.status(f"на запасном пути: {стало}")
-            # ВСЛУХ — ТОЛЬКО НА ПЕРЕХОДЕ «БЫЛО ХОРОШО → СТАЛО ПЛОХО», а не на
-            # каждой смене состава бед. Разница видна на живом журнале:
-            #
-            #   23:14:31 робот: Отвечаю на запасных силах, ПК не отзывается…
-            #   23:15:51 робот: Отвечаю на запасных силах, ПК не отзывается…
-            #
-            # Между ними отвалилось ещё одно звено — распознавание речи, — и
-            # строка состояния изменилась. Для робота это была новость, для
-            # человека — то же самое во второй раз. Звеньев, зависящих от ПК,
-            # три, значит и объявлений было бы три подряд.
-            #
-            # Человеку важно одно: ПК не отвечает, будет медленнее. Услышав
-            # это, он либо включит ПК, либо нет; повторять ему нечего.
-            # Подробный состав идёт в пульт и в журнал, где он и нужен.
-            if not впервые and not было_плохо:
-                self.voice.say("ПК не отвечает, я работаю сам — "
-                               "буду отвечать медленнее.")
-        elif not впервые:
-            log.info("вернулся на основной путь")
-            self.voice.status("всё на своих местах")
 
     def _mic(self) -> None:
         online = self.listener.pump.alive
@@ -847,14 +822,11 @@ def main() -> None:
 
     cfg = Config()
     cfg.check()
-    log.info("модель %s через %s, effort %s, микрофон %s, динамик %s",
-             cfg.model, cfg.api_base or "api.anthropic.com",
-             cfg.effort or "не задан", cfg.audio_source, cfg.audio_out)
+    log.info("микрофон %s, динамик %s", cfg.audio_source, cfg.audio_out)
     _звуковые_карты(cfg)
     if cfg.local_api_base:
-        log.info("основной собеседник — ПК: %s через %s, %s",
-                 cfg.local_model, cfg.local_api_base,
-                 "облако остаётся про запас" if cfg.api_key else "облака нет")
+        log.info("собеседник — только ПК: %s через %s (без ПК робот молчит)",
+                 cfg.local_model, cfg.local_api_base)
     # Часы робота видны сразу: от них зависят будильники, напоминания и тихие
     # часы. На свежем образе время обычно в UTC, и «разбуди в семь» окажется
     # на три часа мимо — а понять это по поведению трудно.
@@ -866,8 +838,7 @@ def main() -> None:
     # Настроенное голосом переживает перезапуск: автообновление случается
     # каждые две минуты, и громкость не должна возвращаться сама.
     state = State(cfg.data_dir / "settings.json")
-    speaker = Speaker(cfg.piper_model_path,
-                      audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint,
+    speaker = Speaker(audio_out=cfg.audio_out, web_endpoint=cfg.web_endpoint,
                       volume=float(state.get("volume", cfg.volume)),
                       cache_dir=cfg.data_dir / "фразы",
                       pc_url=cfg.tts_url, pc_voice=cfg.pc_voice,
@@ -885,23 +856,16 @@ def main() -> None:
     busy = BusyFlag(ros)
     busy.start()
 
-    def local_recognizer() -> Recognizer:
-        return Recognizer(cfg.whisper_model, cfg.language,
-                          beam_size=cfg.whisper_beam)
-
+    # Распознавание — только на ПК: робот работает в паре с ним и никак
+    # иначе. Нет адреса ПК — робот не слушает (но и не падает: служба,
+    # упавшая на настройке, перезапускалась бы systemd каждые десять секунд,
+    # а «Кузя, стоп» детектор имени ловит и без ПК).
     if cfg.stt_url:
         log.info("распознавание на ПК: %s", cfg.stt_url)
-        recognizer = Remote(cfg.stt_url, local_recognizer)
-        # Своё распознавание поднимаем заранее и в фоне. Раньше оно грузилось
-        # в тот самый миг, когда ПК замолчал, — то есть когда человек уже ждёт
-        # ответа, и робот вместо ответа надолго замолкал. Память под модель
-        # тратится теперь всегда: это размен полутора сотен мегабайт на минуту
-        # немоты в единственный важный момент. ROBOT_WARM_LOCAL_STT=0 вернёт
-        # прежнее поведение тем, кому память дороже.
-        if cfg.warm_local_stt:
-            threading.Thread(target=recognizer.прогреть, daemon=True).start()
     else:
-        recognizer = local_recognizer()
+        log.error("ROBOT_PC_URL не задан — робот работает только в паре с ПК "
+                  "и без него не слушает")
+    recognizer = Remote(cfg.stt_url)
 
     listener = Listener(
         make_source(cfg.audio_source, cfg.phone_url, cfg.sample_rate,
@@ -1012,9 +976,7 @@ def main() -> None:
     # Дальномер отдаём и глазам: он даёт зрению то, чего у одного глаза нет
     # и взяться ему неоткуда, — настоящие метры. Модель по картинке видит,
     # что стул ближе стены, но «сорок сантиметров» сказать не может.
-    глаза = Глаза(pc_url=cfg.pc_url, api_key=cfg.api_key,
-                  api_base=cfg.api_base, model=cfg.model,
-                  vision_model=cfg.vision_model, tof=дальномер)
+    глаза = Глаза(pc_url=cfg.pc_url, tof=дальномер)
     # Лицо на экране. Собирается здесь, потому что ему нужны все, у кого оно
     # спрашивает: колёса и батарея (ros), музыка (player), где дом (погода).
     # Взгляд ему отдаст глазомер ниже — он создаётся позже.
@@ -1530,7 +1492,7 @@ def main() -> None:
     глаза.учёт = brain.записать_расход
 
     # Робот сам скажет, что садится и что оглох: смотреть на пульт некому.
-    watch = Watchdog(ros, voice, listener, recognizer=recognizer, brain=brain)
+    watch = Watchdog(ros, voice, listener)
     watch.start()
 
     def shutdown(_sig, _frm) -> None:
@@ -1563,8 +1525,9 @@ def main() -> None:
         # репозитории что-то поменялось. Здороваться на каждый перезапуск —
         # это здороваться весь день.
         log.info("недавно уже здоровался (%.0f мин назад) — молчу", since_greet / 60)
-    else:
-        voice.say(f"{greeting} на связи.")
+    elif voice.say(f"{greeting} на связи.") >= 0:
+        # Без ПК робот молчит, и «на связи» не прозвучит (−1) — тогда
+        # поздоровается при следующем запуске. «Никто не слушал» — сказано.
         state.set("greeted_at", time.time())
     timers.restore()
 
@@ -1878,9 +1841,9 @@ def _about_people(command: str, who: str, voice, people, meeting) -> bool:
             voice.say("Голос твой я ещё не запомнил. "
                       "Поговори со мной немного, и запомню сам.")
         elif people.nameless(who):
-            meeting.asking = True
-            meeting.спросили_кого = who
-            voice.say("Голос твой я уже узнаю. А как тебя зовут?")
+            if voice.say("Голос твой я уже узнаю. А как тебя зовут?") > 0:
+                meeting.asking = True
+                meeting.спросили_кого = who
         else:
             voice.say(f"Я тебя и так узнаю, {who}.")
         return True
@@ -1889,9 +1852,9 @@ def _about_people(command: str, who: str, voice, people, meeting) -> bool:
         if not who:
             voice.say("Пока не узнаю тебя по голосу — мало тебя слышал.")
         elif people.nameless(who):
-            meeting.asking = True
-            meeting.спросили_кого = who
-            voice.say("Голос узнаю, а имени не знаю. Как тебя зовут?")
+            if voice.say("Голос узнаю, а имени не знаю. Как тебя зовут?") > 0:
+                meeting.asking = True
+                meeting.спросили_кого = who
         else:
             voice.say(f"Ты {who}.")
         return True
@@ -2100,7 +2063,7 @@ class Turn:
                                   **self.про)
 
 
-def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
+def _listen_loop(cfg: Config, listener: Listener, recognizer: Remote,
                  brain: Brain, voice: Voice, tools: list,
                  addressed: Addressed, ros=None, people: People | None = None,
                  player=None, навыки=None) -> None:
@@ -2142,13 +2105,11 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
         try:
             # Кусок, нарезанный по длине, а не по паузе: в комнате говорят не
             # умолкая. Разбирать его стоит — обращение к роботу может оказаться
-            # внутри, — но только пока распознаёт ПК: он успевает за десятую долю
-            # длины. Когда ПК замолчал и робот разбирает сам, двадцать секунд
-            # звука превращаются в минуту немоты, и в эту минуту не проходит
-            # ничего, включая «стоп». Тогда честнее выбросить.
+            # внутри, — но только пока ПК на связи: до молчащего ПК слать
+            # двадцать секунд звука незачем, фраза всё равно пропадёт.
             срез_комнаты = listener.long_chunk
-            if срез_комнаты and getattr(recognizer, "сам_разбираю", False):
-                log.info("длинный кусок, а разбираю сам — пропускаю, чтобы не онеметь")
+            if срез_комнаты and getattr(recognizer, "пк_молчит", False):
+                log.info("длинный кусок, а ПК молчит — пропускаю")
                 continue
             # 44 байта заголовка WAV, дальше моно по два байта на отсчёт.
             turn = Turn(cfg.silence_ms / 1000.0,
@@ -2158,6 +2119,10 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             # лишним, а для едущего робота эта разница — лишний метр.
             мгновенный = bool(getattr(listener, "instant", ""))
             text = listener.instant if мгновенный else recognizer.transcribe(wav)
+            if text and not мгновенный:
+                # ПК распознал — значит жив: голосу незачем досиживать свою
+                # паузу (до минуты), отвечая молча на живом ПК.
+                _пк_ответил(voice)
             turn.recognized()
             # Уверенность, говорящий и метка слепка — боковые поля распознавания, и
             # пишутся они ТОЛЬКО внутри transcribe. На мгновенном приказе его не
@@ -2206,6 +2171,10 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                     if закрыть:
                         log.info("не разбираю подряд и имени не слышу — "
                                  "закрываю окно разговора")
+                        awake_until = 0.0
+                    elif _ии_молчит(brain):
+                        # ИИ на ПК молчит — робот тоже: «не расслышал» звало
+                        # бы повторить вопрос, на который никто не ответит.
                         awake_until = 0.0
                     else:
                         voice.say("Не расслышал.")
@@ -2303,8 +2272,13 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             voice.heard(command or text)
 
             if not command:
-                # Позвали и замолчали — откликаемся и ждём продолжения.
-                voice.say("Да?")
+                # Позвали и замолчали — откликаемся и ждём продолжения. Окно
+                # открываем и при молчащем ИИ (таймер, «стоп», музыка — без
+                # него), но «Да?» не звучит: звать к разговору некому.
+                if _ии_молчит(brain):
+                    log.info("позвали по имени, ИИ на ПК молчит — не откликаюсь")
+                else:
+                    voice.say("Да?")
                 awake_until = time.monotonic() + cfg.session_seconds
                 _лицо(voice, "слушаю")
                 last_talk = brain.last_talk = time.monotonic()
@@ -2402,6 +2376,14 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
             answered = pending.consume(command, match, voice)
             if answered:
                 pass                    # это был ответ на вопрос робота
+            elif (match is not None and match.tool in БОЛТОВНЯ
+                    and _ии_молчит(brain)):
+                # «Привет», «спасибо», «что ты умеешь» робот знает и без
+                # модели, но при молчащем ИИ это была бы вежливость робота,
+                # который не ответит ни на один вопрос. Молчим целиком.
+                log.info("болтовня (%s), а ИИ на ПК молчит — молчу", match.tool)
+                awake_until = 0.0
+                continue
             elif match is not None and match.tool in by_name:
                 _run_direct(by_name[match.tool], match.args, voice, pending, turn)
                 undo.remember(match.tool, match.args)
@@ -2445,16 +2427,23 @@ def _listen_loop(cfg: Config, listener: Listener, recognizer: Recognizer,
                 if turn is not None:
                     turn.про_что(разобрал="модель")
                 _лицо(voice, "думаю")
-                _respond(command, brain, voice, recognizer, ros, turn, addressed,
-                         cfg.max_sentences)
-
+                if not _respond(command, brain, voice, recognizer, ros, turn,
+                                addressed, cfg.max_sentences):
+                    # ИИ на ПК не ответил — робот молчит. Окно разговора не
+                    # держим: иначе вся болтовня комнаты без имени шла бы в
+                    # мёртвый мозг. «Слушаю» на лицо не пишем, имени не
+                    # спрашиваем — звать к разговору, которого нет, незачем.
+                    awake_until = 0.0
+                    continue
 
             # Поговорили несколько раз, а как зовут — так и не знаем. Спросим
             # один раз: раньше навязчиво, позже глупо — человек уже всё рассказал.
             if meeting.time_to_ask(who, people):
-                meeting.asking = True
-                meeting.спросили_кого = who
-                voice.say("Кстати, мы так и не познакомились. Как тебя зовут?")
+                # Ждём имени, только если вопрос ПРОЗВУЧАЛ: иначе следующая
+                # фраза человека («расскажи анекдот») ушла бы в имя.
+                if voice.say("Кстати, мы так и не познакомились. Как тебя зовут?") > 0:
+                    meeting.asking = True
+                    meeting.спросили_кого = who
 
             # Окно отсчитываем от конца ответа, а не от начала: иначе длинная
             # реплика робота съедала бы всё время, отведённое на продолжение.
@@ -2719,38 +2708,54 @@ def _услышали_стоп(voice: Voice, recognizer, ros) -> bool:
         return False
 
 
-def _failure_phrase(error: Exception, только_пк: bool = False) -> str:
-    """Почему не вышло ответить — так, чтобы человек понял, что делать.
+def _пк_ответил(voice) -> None:
+    """ПК только что ответил (распознал фразу) — голос с ПК снова в деле.
 
-    Раньше на всё было одно «Что-то пошло не так, повтори»: человек повторял
-    и получал то же самое. При телефоне-микрофоне и двойном NAT отвалившийся
-    интернет — обычное дело, и сказать об этом честно полезнее.
+    Голос откладывает ПК после осечки до минуты и сам об этом не узнает,
+    пока пауза не кончится. Робот при этом слышит и понимает, но отвечает
+    молча — на живом ПК. Чужой успех — лучший повод перестать ждать.
+    """
+    remote = getattr(getattr(voice, "speaker", None), "remote", None)
+    ожил = getattr(remote, "пк_ответил", None)
+    if callable(ожил):
+        try:
+            ожил()
+        except Exception:                       # noqa: BLE001
+            log.debug("голос не принял весть о живом ПК", exc_info=True)
+
+
+# Что робот умеет сказать сам, без модели, но только из вежливости: при
+# молчащем ИИ на ПК он это не говорит (см. Brain.ии_молчит).
+БОЛТОВНЯ = ("small_talk", "abilities")
+
+
+def _ии_молчит(brain) -> bool:
+    """Brain.ии_молчит — и для заглушек, у которых его нет."""
+    проба = getattr(brain, "ии_молчит", None)
+    try:
+        return bool(проба()) if callable(проба) else False
+    except Exception:                       # noqa: BLE001
+        return False
+
+
+def _failure_phrase(error: Exception) -> str:
+    """Что сказать, когда ответить не вышло. Почти всегда — ничего.
+
+    Робот работает только в паре с ПК (решение хозяина, октябрь 2026). ПК
+    выключен, его модель не запущена, не скачана, занята или не успела —
+    робот молчит: ни «компьютер не отвечает», ни «я без интернета», ни «что-то
+    пошло не так». Раньше каждая такая фраза звучала на каждый вопрос.
+
+    Говорим одно: что сломан САМ робот — модель жива и отвергла наш запрос
+    как неправильный. Это не про пропавший ПК, а про ошибку в коде, и
+    повторять вопрос бесполезно — человеку надо это знать.
     """
     from .brain import наша_вина
 
-    # Наша собственная ошибка в запросе. Раньше она попадала в последнюю ветку
-    # и человек слышал «повтори» — повторял, и получал то же самое, потому что
-    # повтор тут не помогает никогда.
     if наша_вина(error):
         return ("Я сломан внутри: модель не принимает мой запрос. "
                 "Повторять бесполезно, нужен журнал.")
-    name = type(error).__name__
-    if "Connection" in name or "Timeout" in name:
-        if только_пк:
-            # Облачный запас выключен хозяином (ROBOT_CLOUD=0), и единственный
-            # собеседник — компьютер. Про интернет говорить нельзя: он есть, а
-            # чинить надо совсем другое — запустить kuzya_pc.py. Человек,
-            # услышавший «я без интернета», полезет в роутер и ничего не найдёт.
-            return ("Компьютер не отвечает, а без него я не разговариваю. "
-                    "Запусти на нём Кузю. Таймеры, время, список и езда "
-                    "работают.")
-        return ("Сейчас я без интернета. Таймеры, время, список и езда "
-                "работают, а поговорить не выйдет.")
-    if "Authentication" in name or "PermissionDenied" in name:
-        return "Модель меня не пускает — похоже, ключ. Проверь настройки."
-    if "RateLimit" in name:
-        return "Модель занята, попробуй через минуту."
-    return "Что-то пошло не так, повтори."
+    return ""
 
 
 def _caught_stop(wav: bytes, recognizer, ros) -> bool:
@@ -2783,8 +2788,12 @@ def _caught_stop(wav: bytes, recognizer, ros) -> bool:
 
 def _respond(command: str, brain: Brain, voice: Voice,
              recognizer=None, ros=None, turn=None, addressed=None,
-             предел_фраз: int = 2) -> None:
+             предел_фраз: int = 2) -> bool:
     """Отвечает вслух, проговаривая предложения по мере генерации.
+
+    Возвращает False, если ИИ на ПК не ответил вовсе и робот промолчал:
+    главный цикл тогда не держит окно разговора и не заводит знакомство —
+    спрашивать имя у человека, которому только что не ответили, нелепо.
 
     С одним исключением: если человек велел ехать, ответ придерживается до
     конца хода. Причина в живом случае. На «метр вперёд и метр назад» домашняя
@@ -2811,6 +2820,8 @@ def _respond(command: str, brain: Brain, voice: Voice,
     придержать = (intents.просят_ехать(command) or нельзя_ехать
                   or intents.просят_музыку(command))
     buffer = SentenceBuffer()
+    # ИИ не ответил вовсе и робот промолчал — для главного цикла (см. выше).
+    промолчал = False
     # Хвост снимаем в момент, когда робот собирается заговорить: дальше в нём
     # будет уже его собственный голос, и искать в этом «стоп» бессмысленно.
     unheard = b""
@@ -2845,7 +2856,9 @@ def _respond(command: str, brain: Brain, voice: Voice,
 
         def start_speaking() -> None:
             nonlocal speaking, unheard
-            if not speaking:
+            # Говорить нечем (ПК молчит) — микрофон не глушим: глухота на
+            # несказанную реплику — это пропущенный «стоп».
+            if not speaking and speech is not None:
                 if recognizer is not None and ros is not None:
                     unheard = voice.listener.unheard()
                 stack.enter_context(voice.quiet())
@@ -2960,10 +2973,8 @@ def _respond(command: str, brain: Brain, voice: Voice,
             # сравнивало услышанное с пустотой.
             start_speaking()
             говорю(sentence)
-            if not speech:
-                # Синтеза нет (piper не встал) — звука не будет, и текст на
-                # экран ставим здесь: больше некому.
-                _лицо(voice, "говорю", sentence)
+            # Звука нет (ПК не отвечает) — и на экране реплики нет: робот
+            # молчит целиком, а не беззвучно «говорит» строкой.
             if turn is not None and not первая_фраза[0]:
                 первая_фраза[0] = True
                 # Отдельно от «первого токена» и отдельно от «синтеза».
@@ -3008,10 +3019,10 @@ def _respond(command: str, brain: Brain, voice: Voice,
             # отвечает за секунду и даром, но потолок у неё свой, и человек
             # это слышит раньше любого автомата. Решение платить принимает он,
             # вслух и осознанно, а не классификатор, который сам ошибается.
-            smart, command = intents.wants_smart(command)
-            if smart:
-                log.info("просили умного — иду в облако")
-            said = brain.reply(command, on_text, smart)
+            # «Подумай хорошо» звал облако. Облака больше нет — собеседник
+            # один, ПК; приставку просто снимаем, чтобы модель её не читала.
+            _, command = intents.wants_smart(command)
+            said = brain.reply(command, on_text)
             tail = buffer.flush()
             if tail:
                 if придержать:
@@ -3138,23 +3149,40 @@ def _respond(command: str, brain: Brain, voice: Voice,
                 # повторит его на «что ты сказал».
                 said = ""
         except Exception as e:
-            log.exception("не смог ответить")
-            # Не ответил — лицу огорчение. Гаснет само через несколько
-            # секунд (face.ГАСНУТ_ЧЕРЕЗ), а до того честно показывает, что
-            # робот не справился, а не «спокоен» поверх фразы про сбой.
-            _лицо(voice, "огорчён")
-            start_speaking()
-            if speech:
-                # Единственный собеседник, и это ПК, — значит запаса нет:
-                # либо хозяин выключил облако (ROBOT_CLOUD=0), либо ключа нет
-                # вовсе. Причина разная, а совет один и тот же — запустить
-                # Кузю на компьютере. getattr: в самопроверке мозг бывает
-                # заглушкой без endpoints, а падать в обработчике падения —
-                # худшее, что можно сделать.
-                точки = list(getattr(brain, "endpoints", ()))
-                только_пк = (len(точки) == 1
-                             and str(getattr(точки[0], "name", "")).startswith("ПК"))
-                speech.feed(_failure_phrase(e, только_пк=только_пк))
+            фраза = _failure_phrase(e)
+            if not фраза:
+                from .brain import пк_недоступен
+                if пк_недоступен(e):
+                    # ПК или его модель недоступны — робот молчит. Без следа
+                    # исключения в журнале: это не авария, а выключенный ПК.
+                    log.warning("не смог ответить: %s — молчу", e)
+                else:
+                    # А это поломка самого робота, не ПК: вслух молчим так
+                    # же, но в журнал — со всей трассировкой, иначе она
+                    # неотличима от выключенного ПК.
+                    log.exception("не смог ответить — поломка робота, не ПК")
+                if not getattr(brain, "позвал", None):
+                    промолчал = True
+                # Если модель успела тронуть колёса В ЭТОМ ХОДУ (первый круг
+                # «поехали» уходит в езду сразу, второй упал) — встаём тихо:
+                # вести робота, которому некому ответить, незачем. Чужую
+                # езду — следование, начатое раньше, пульт — не трогаем:
+                # сбой вопроса про погоду не повод бросать человека.
+                поехали_сейчас = bool(set(getattr(brain, "позвал", None) or ())
+                                      & set(intents.ПОЕХАЛ))
+                if (поехали_сейчас and ros is not None
+                        and getattr(ros, "moving", False)):
+                    try:
+                        ros.stop_motion()
+                    except Exception:           # noqa: BLE001
+                        log.exception("не остановил езду после сбоя ответа")
+            else:
+                log.exception("не смог ответить")
+                # Сломан сам робот — лицу огорчение (гаснет само), и фраза.
+                _лицо(voice, "огорчён")
+                start_speaking()
+                if speech:
+                    speech.feed(фраза)
         finally:
             if speech:
                 try:
@@ -3206,3 +3234,4 @@ def _respond(command: str, brain: Brain, voice: Voice,
             # Разбивка — последней строкой хода, когда все засечки на месте.
             if turn is not None:
                 turn.разложить()
+    return not промолчал

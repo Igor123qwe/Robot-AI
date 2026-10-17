@@ -1,23 +1,17 @@
-"""Синтез речи — Piper. Куда его выводить, зависит от того, что подключено.
+"""Голос робота — синтез на домашнем ПК. Куда звук выводить, решает audio_out.
 
-  local   — сразу в aplay. Piper запускается один раз на реплику, читает stdin
-            построчно и отдаёт сырой звук, поэтому робот начинает говорить, не
-            дожидаясь, пока Claude допишет ответ. Так будет, когда приедет
-            динамик SOTAMIA.
+  local   — в свой динамик через aplay: звук ПК приходит по предложениям и
+            начинает звучать, не дожидаясь, пока модель допишет ответ.
   browser — реплика собирается в WAV и уходит в веб-сервер робота, а играет её
-            браузер с открытым пультом. Временно, пока своего динамика нет:
-            IP Webcam умеет отдавать звук, но не принимать.
+            браузер с открытым пультом.
 
-В режиме browser реплика синтезируется по предложениям и уходит в пульт по
-мере готовности. Раньше она копилась целиком и синтез начинался только после
-последнего слова модели — то есть вся потоковая машинерия не давала ничего, а
-две-три секунды синтеза честно ждали своей очереди за десятью секундами
-генерации. Пульт умеет очередь клипов, сервер хранит последние двенадцать.
+Своего синтеза у робота нет (раньше был piper): робот работает только в паре
+с ПК, решение хозяина, октябрь 2026. ПК не отвечает — робот молчит.
 
-Плата за это — Piper поднимается чаще. Поэтому здесь же кэш готовых фраз:
-правила отвечают одними и теми же словами («Не расслышал.», «Остановился.»,
-«Да?»), и синтезировать их заново каждый раз — это полторы секунды на пустом
-месте, причём в самых частых ответах.
+Реплика синтезируется по предложениям и уходит по мере готовности: две-три
+секунды синтеза не ждут своей очереди за десятью секундами генерации. Частые
+фразы правил («Не расслышал.», «Остановился.», «Да?») ПК озвучивает один раз,
+дальше они берутся из кэша на роботе — пока ПК жив (см. RemoteVoice.raw).
 """
 
 from __future__ import annotations
@@ -28,9 +22,7 @@ import json
 import logging
 import queue
 import re
-import shutil
 import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -100,19 +92,15 @@ def scale(raw: bytes, volume: float) -> bytes:
 def пересчитать_частоту(raw: bytes, из: int, в: int) -> bytes:
     """Моно S16 с частоты `из` на частоту `в`. Линейная интерполяция.
 
-    ЗАЧЕМ. Динамик у робота один, а источников звука в одной реплике два:
-    ПК отдаёт 24000 Гц, свой piper — 22050 (частота модели). aplay
-    открывается один раз на реплику, с частотой ПК, — и когда ПК замолкал
-    посреди фразы, хвост от своего piper уходил в ту же трубу как есть.
-    Звук на 22050 отсчётов в секунду, проигранный как 24000, — это голос
-    на восемь процентов выше и быстрее, и рот на экране (on_pcm) при этом
-    получал не ту частоту. Со стороны: «на второй фразе Кузя вдруг
-    зачирикал».
+    ЗАЧЕМ. aplay открывается один раз на реплику, с частотой ПК на тот миг,
+    а частота может смениться посреди реплики (на ПК перезапустили сервер
+    с другим голосом). Звук на чужой частоте в той же трубе — голос выше и
+    быстрее, и рот на экране (on_pcm) получает не ту частоту. Когда-то так
+    звучал запасной piper (22050 против 24000 у ПК): «на второй фразе Кузя
+    вдруг зачирикал».
 
-    Линейной интерполяции для речи в динамик хватает: разница частот
-    восемь процентов, и ни один слушатель её артефактов не отличит от
-    самого piper. Ни scipy, ни audioop (в 3.13 его нет) — только numpy,
-    который здесь и так есть.
+    Линейной интерполяции для речи в динамик хватает. Ни scipy, ни audioop
+    (в 3.13 его нет) — только numpy, который здесь и так есть.
     """
     if из == в or not raw or из <= 0 or в <= 0:
         return raw
@@ -192,23 +180,24 @@ class PhraseCache:
 
 
 PC_CONNECT = 2.0
-PC_READ = 20.0
-# Насколько отворачиваемся от ПК, когда он не озвучил. Раньше здесь было
-# глухих шестьдесят секунд на любую осечку — и одна сетевая икота посреди
-# разговора переводила робота на свой piper на минуту вперёд. Голоса разные:
-# на ПК мужской silero, свой piper женский, — и человек слышал, как посреди
-# разговора «прорезается другой голос», не понимая почему.
-#
-# Поэтому лесенкой: первая осечка стоит пять секунд, дальше вдвое. Выключенный
-# ПК за три-четыре фразы всё равно доберётся до минуты, а короткий сбой связи
-# обойдётся одной фразой чужим голосом вместо двадцати.
+# Фраза на ПК синтезируется за доли секунды. Дольше восьми не ждём: всё это
+# время голос робота занят, а микрофон приглушён, — и полуживой ПК делал бы
+# робота глухим на двадцать секунд на каждой фразе.
+PC_READ = 8.0
+# Насколько отворачиваемся от ПК, когда он не озвучил: лесенкой, первая
+# осечка — пять секунд, дальше вдвое, до минуты. Своего голоса у робота нет
+# (робот работает только в паре с ПК), поэтому это не «сколько говорить
+# чужим голосом», а «сколько не стучаться в выключенный компьютер».
 PC_DOWN_FIRST = 5.0
 PC_DOWN = 60.0
 
-# Как часто переспрашивать ПК, каким голосом он говорит. Меняется это редко —
-# только когда человек перезапускает сервер с другим --voice, — а стоит вопрос
-# один короткий запрос по домашней сети.
-ГОЛОС_ПЕРЕСПРОС = 300.0
+# Как часто переспрашивать ПК, каким голосом он говорит, — заодно это и
+# проверка, что он жив: готовые фразы берутся из кэша без сети, и без такого
+# вопроса робот говорил бы ими и при выключенном ПК.
+ГОЛОС_ПЕРЕСПРОС = 60.0
+# Сколько после последнего ответа ПК верим, что он жив, и берём готовые
+# фразы из кэша. Дольше — сначала спросим сам ПК.
+ЖИВ_СВЕЖО = 90.0
 
 
 class RemoteVoice:
@@ -221,9 +210,10 @@ class RemoteVoice:
     На ПК стоит silero: ударения расставляет сам, различает омографы и
     поднимает интонацию на вопросе. Считает быстрее реального времени.
 
-    Отступление обязательно. ПК выключают, и робот от этого не должен неметь:
-    не ответил — переходим на свой piper и ненадолго туда не ходим. Ровно так
-    же устроено распознавание, и по той же причине.
+    Своего голоса у робота нет: робот работает только в паре с ПК (решение
+    хозяина, октябрь 2026). ПК не озвучил — фраза не звучит, а к ПК робот
+    ненадолго не стучится. Раньше здесь был запасной piper — женский голос
+    посреди мужского, с объявлением, что ПК пропал.
 
     Кэш заводится не сразу, а после первого настоящего ответа, и назван по
     голосу, которым ПК ответил НА САМОМ ДЕЛЕ. Раньше он назывался по тому, что
@@ -244,12 +234,28 @@ class RemoteVoice:
         self.rate = self.RATE
         self._down_until = 0.0
         self._осечек = 0
+        # Когда ПК в последний раз ответил (синтезом или на /health).
+        self._жив_в = float("-inf")
         # Каким голосом ПК отвечает на самом деле. Пусто — ещё не спрашивали.
         self.голос = ""
         self._голос_в = 0.0
 
     def alive(self) -> bool:
         return time.monotonic() >= self._down_until
+
+    def пк_ответил(self) -> None:
+        """ПК ответил на другое (распознал фразу) — паузу снимаем сразу."""
+        if self._down_until > time.monotonic():
+            log.info("ПК снова отвечает — голос с ПК возвращается")
+        self._down_until = 0.0
+        self._осечек = 0
+        self._жив_в = time.monotonic()
+
+    def _осечка(self, что: str, e: Exception) -> None:
+        self._осечек += 1
+        пауза = min(PC_DOWN, PC_DOWN_FIRST * 2 ** (self._осечек - 1))
+        self._down_until = time.monotonic() + пауза
+        log.warning("ПК не %s (%s) — молчу, к ПК не хожу %.0f с", что, e, пауза)
 
     def _принять(self, имя: str) -> None:
         """Запоминает голос ПК и перенастраивает под него кэш."""
@@ -293,21 +299,31 @@ class RemoteVoice:
             with urllib.request.urlopen(self.base + "/health",
                                         timeout=PC_CONNECT) as resp:
                 сведения = json.loads(resp.read() or b"{}") or {}
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            # Не смогли — не беда: голос выяснится из заголовка первого же
-            # настоящего синтеза. Отворачиваться от ПК из-за этого нельзя.
-            log.debug("не спросил у ПК про голос: %s", e)
+        except (urllib.error.HTTPError, ValueError) as e:
+            # Ответил, но не то, — значит, ПК жив: голос просто не узнали.
+            log.debug("ПК на /health ответил непонятно (%s)", e)
+            self._жив_в = time.monotonic()
             return
+        except (urllib.error.URLError, OSError) as e:
+            # ПК не ответил даже на /health — значит, выключен: готовые
+            # фразы из кэша больше не звучат (своего голоса нет, а кэш — это
+            # голос ПК), пока ПК не ответит снова.
+            self._осечка("ответил на /health", e)
+            return
+        self._жив_в = time.monotonic()
         self._принять(str(сведения.get("голос_чей") or ""))
 
     def raw(self, text: str) -> bytes | None:
-        """Сырой звук фразы. None — ПК не смог, говорим сами."""
+        """Сырой звук фразы. None — ПК не смог, и фраза не прозвучит."""
         if not self.alive():
             return None
         self._переспросить()
         # До первого ответа ПК мы не знаем, каким голосом он говорит, и брать
-        # из кэша нельзя: там может лежать прошлый голос.
-        if self.cache is not None and self.голос:
+        # из кэша нельзя: там может лежать прошлый голос. И давно молчащему
+        # ПК не верим: готовая фраза из кэша при выключенном ПК — это робот,
+        # говорящий без ПК.
+        if (self.cache is not None and self.голос
+                and time.monotonic() - self._жив_в < ЖИВ_СВЕЖО):
             got = self.cache.get(text)
             if got is not None:
                 return got
@@ -325,12 +341,10 @@ class RemoteVoice:
                 self.rate = w.getframerate()
                 pcm = w.readframes(w.getnframes())
         except (urllib.error.URLError, OSError, wave.Error, EOFError) as e:
-            self._осечек += 1
-            пауза = min(PC_DOWN, PC_DOWN_FIRST * 2 ** (self._осечек - 1))
-            self._down_until = time.monotonic() + пауза
-            log.warning("ПК не озвучил (%s) — говорю своим голосом %.0f с", e, пауза)
+            self._осечка("озвучил", e)
             return None
         self._осечек = 0
+        self._жив_в = time.monotonic()
         log.debug("ПК озвучил за %.2f с: %r", time.monotonic() - started, text[:60])
         if self.cache is not None and self.голос:
             self.cache.put(text, pcm)
@@ -356,13 +370,12 @@ class ПервыйЗвук:
 
     Нужна измерителю задержки (app.Turn), и без неё самое дорогое звено не
     видно вовсе. Снаружи заметно только, когда текст ОТДАЛИ синтезу, — а от
-    этого момента до первого сэмпла в динамике проходит холодный старт piper,
-    сам синтез и дорога до колонки. Пока это не измерено, «робот тормозит»
-    чинится наугад.
+    этого момента до первого сэмпла в динамике проходит синтез на ПК и
+    дорога до колонки. Пока это не измерено, «робот тормозит» чинится наугад.
 
-    Общий предок у трёх видов реплики (свой piper, синтез на ПК, браузер): все
-    три обязаны отвечать на один и тот же вопрос одинаково, иначе цифры из
-    журнала нельзя будет сравнивать между режимами.
+    Общий предок у двух видов реплики (свой динамик и браузер): оба обязаны
+    отвечать на один и тот же вопрос одинаково, иначе цифры из журнала нельзя
+    будет сравнивать между режимами.
     """
 
     def __init__(self) -> None:
@@ -409,164 +422,24 @@ class ПервыйЗвук:
             log.debug("лицо не взяло текст фразы", exc_info=True)
 
 
-class Speech(ПервыйЗвук):
-    """Одна реплика робота в динамик. Предложения докидываются по мере генерации."""
-
-    def __init__(self, piper_cmd: list[str], sample_rate: int,
-                 volume: float = 1.0, device: str = "") -> None:
-        super().__init__()
-        self._cancelled = False
-        self._rate = int(sample_rate)
-        self._piper = subprocess.Popen(
-            piper_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        aplay = aplay_cmd(sample_rate, device)
-        self._pump: threading.Thread | None = None
-        try:
-            if volume >= 0.999:
-                # Обычный случай: piper пишет прямо в aplay, Python не при делах.
-                self._aplay = subprocess.Popen(
-                    aplay, stdin=self._piper.stdout, stderr=subprocess.DEVNULL)
-                # Дескриптор нужен только aplay — иначе он не увидит EOF.
-                self._piper.stdout.close()
-            else:
-                # Тише — значит звук надо потрогать по дороге.
-                self._aplay = subprocess.Popen(
-                    aplay, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                self._pump = threading.Thread(
-                    target=self._transfer, args=(volume,), daemon=True)
-                self._pump.start()
-        except OSError:
-            # aplay не встал (нет программы, занята карта) — piper к этому
-            # моменту уже запущен и с моделью в памяти. Без этого он
-            # оставался жить сиротой: сто мегабайт и ядро процессора на
-            # каждую несостоявшуюся реплику, пока сервис не перезапустят.
-            try:
-                self._piper.kill()
-                self._piper.wait(timeout=5)
-            except (OSError, subprocess.SubprocessError):
-                pass
-            raise
-
-    def _transfer(self, volume: float) -> None:
-        broken = False
-        try:
-            while True:
-                chunk = self._piper.stdout.read(4096)
-                if not chunk:
-                    break
-                self.звук_пошёл()
-                # Тихий режим — единственный путь своего piper, где звук
-                # проходит через Python: рот на экране получает его здесь.
-                self.под_рот(chunk, self._rate)
-                self._aplay.stdin.write(scale(chunk, volume))
-        except (BrokenPipeError, ValueError, OSError) as e:
-            broken = True
-            log.warning("звук до динамика не дошёл: %s", e)
-        finally:
-            # Закрыть надо в любом случае: иначе aplay ждёт EOF, а piper —
-            # свободного места в трубе, и close() честно висит две минуты.
-            for pipe in (self._aplay.stdin, self._piper.stdout if broken else None):
-                try:
-                    if pipe is not None:
-                        pipe.close()
-                except OSError:
-                    pass
-
-    def feed(self, sentence: str) -> None:
-        sentence = speakable(sentence)
-        if not sentence or self._piper.stdin is None or self._cancelled:
-            return
-        try:
-            self._piper.stdin.write((sentence + "\n").encode())
-            self._piper.stdin.flush()
-        except (BrokenPipeError, ValueError, OSError):
-            log.warning("piper: процесс закрылся раньше времени")
-            return
-        self.фраза_пошла(sentence)
-        if self._pump is None:
-            # На полной громкости piper пишет прямо в aplay, минуя Python, и
-            # первый сэмпл нам не виден. Отмечаем момент отдачи текста и
-            # называем вещи своими именами: настоящий звук будет чуть позже.
-            # Гонять звук через Python ради засечки нельзя — это его главный
-            # тракт, и лишний прыжок в нём дороже любой цифры в журнале.
-            self.звук_пошёл()
-
-    def cancel(self) -> None:
-        """«Замолчи» на своём динамике: обрываем piper и aplay, не дожидаясь.
-
-        Раньше у этой реплики не было способа замолчать вовсе: hush()
-        считал прерывание и выходил, а piper с aplay договаривали всё, что
-        им скормили, до точки. «Кузя, стоп» посреди длинного рассказа на
-        своём динамике не значило ничего — обрывалось только в браузере.
-
-        Убить, а не закрыть stdin: закрытый stdin — это «договори и
-        выходи», а в трубе между piper и aplay уже лежат секунды звука.
-        Убитый aplay бросает буфер карты, и тишина наступает сразу.
-        """
-        self._cancelled = True
-        try:
-            if self._piper.stdin is not None:
-                self._piper.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-        for proc in (self._piper, self._aplay):
-            try:
-                proc.kill()
-            except OSError:
-                pass
-
-    def close(self) -> int:
-        """Дожидается, пока всё сказанное действительно прозвучит.
-
-        Возвращает 1: динамик у робота свой, слушателя искать не надо.
-        После cancel() возвращается сразу: процессы уже убиты, и wait ниже
-        не ждёт ни секунды.
-        """
-        try:
-            if self._piper.stdin is not None:
-                self._piper.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-        for name, proc in (("piper", self._piper), ("aplay", self._aplay)):
-            try:
-                # Тридцати секунд хватает самой длинной реплике. Больше ждать
-                # нельзя: всё это время робот глухой и немой.
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                # Зависший процесс держит звуковую карту, и следующая реплика
-                # её уже не откроет. Лучше убить, чем онеметь навсегда.
-                log.warning("%s завис — убиваю", name)
-                proc.kill()
-                proc.wait(timeout=5)
-        if self._pump is not None:
-            self._pump.join(timeout=5)
-        return 1
-
-
 class RemoteSpeech(ПервыйЗвук):
-    """Реплика в свой динамик, но синтезированная на ПК.
+    """Реплика в свой динамик, синтезированная на ПК.
 
-    Отличие от Speech только в источнике звука: там piper пишет в трубу сам,
-    здесь готовые куски приходят по сети и мы кладём их в aplay. Синтез идёт в
+    Готовые куски приходят по сети, и мы кладём их в aplay. Синтез идёт в
     своём потоке — иначе он встал бы поперёк чтения ответа модели.
 
-    Если ПК замолчал посреди реплики, доканчиваем своим piper: человек услышит
-    смену голоса, но это несравнимо лучше оборванной на полуслове фразы.
+    ПК замолчал посреди реплики — остаток не звучит: своего голоса у робота
+    нет (раньше доканчивал свой piper, чужим голосом).
     """
 
-    def __init__(self, remote: RemoteVoice, fallback_cmd: list[str],
-                 volume: float = 1.0, device: str = "",
-                 own_rate: int = 22050) -> None:
+    def __init__(self, remote: RemoteVoice, volume: float = 1.0,
+                 device: str = "") -> None:
         super().__init__()
         self.remote = remote
-        self.fallback_cmd = fallback_cmd
         self.volume = volume
-        # Частота своего piper — та, что у модели голоса. Запасной путь
-        # отдаёт звук на ней, а aplay открыт на частоте ПК: разницу
-        # пересчитываем, см. пересчитать_частоту.
-        self.own_rate = int(own_rate)
+        # Сколько предложений реально ушло в динамик: ни одного — значит,
+        # реплику никто не слышал, и таймер прозвонит ещё раз.
+        self.прозвучало = 0
         # Частота, на которой ОТКРЫТ aplay, — снимок на момент запуска.
         # RemoteVoice.raw переписывает remote.rate по каждому ответу ПК, а
         # труба в aplay уже открыта и частоту сменить не может: всё, что в
@@ -615,19 +488,17 @@ class RemoteSpeech(ПервыйЗвук):
             if self._cancelled:
                 continue
             pcm = self.remote.raw(sentence)
-            # Частота — того, кто синтезировал: у ПК своя, у piper своя.
-            rate = int(self.remote.rate) if pcm is not None else self.own_rate
-            if pcm is None:
-                pcm = self._own(sentence)
             if not pcm or self._cancelled:
                 continue
-            # В aplay — только на его частоте: он открыт один раз на реплику.
-            pcm = пересчитать_частоту(pcm, rate, self._rate)
+            # В aplay — только на его частоте: он открыт один раз на реплику,
+            # а ПК (сменили голос) может ответить на другой.
+            pcm = пересчитать_частоту(pcm, int(self.remote.rate), self._rate)
             self.под_рот(pcm, self._rate)
             try:
                 self.фраза_пошла(sentence)
                 self._aplay.stdin.write(scale(pcm, self.volume))
                 self._aplay.stdin.flush()
+                self.прозвучало += 1
                 self.звук_пошёл()
             except (BrokenPipeError, ValueError, OSError) as e:
                 if not self._cancelled:
@@ -638,21 +509,10 @@ class RemoteSpeech(ПервыйЗвук):
         except OSError:
             pass
 
-    def _own(self, sentence: str) -> bytes:
-        """Запасной синтез своим piper, когда ПК недоступен."""
-        try:
-            return subprocess.run(
-                self.fallback_cmd, input=sentence.encode(), stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, timeout=120, check=True).stdout
-        except (OSError, subprocess.SubprocessError) as e:
-            log.warning("и свой piper не смог (%s)", e)
-            return b""
-
     def close(self) -> int:
         self._queue.put(None)
         # После «замолчи» ждать поток незачем: он может висеть в запросе к
-        # ПК или в своём piper, и всё, что он принесёт, всё равно
-        # выбрасывается. Секунда — и отпускаем; поток фоновый, доживёт сам.
+        # ПК, и всё, что он принесёт, всё равно выбрасывается. Секунда — и отпускаем; поток фоновый, доживёт сам.
         self._worker.join(timeout=1.0 if self._cancelled else 120)
         try:
             self._aplay.wait(timeout=30)
@@ -660,7 +520,7 @@ class RemoteSpeech(ПервыйЗвук):
             log.warning("aplay завис — убиваю")
             self._aplay.kill()
             self._aplay.wait(timeout=5)
-        return 1
+        return 1 if self.прозвучало else 0
 
 
 class WebSpeech(ПервыйЗвук):
@@ -670,16 +530,12 @@ class WebSpeech(ПервыйЗвук):
     модели, и выигрыша от потоковости не было бы вовсе.
     """
 
-    def __init__(self, piper_cmd: list[str], sample_rate: int, endpoint: str,
-                 volume: float = 1.0, cache: "PhraseCache | None" = None,
+    def __init__(self, endpoint: str, volume: float = 1.0,
                  remote: "RemoteVoice | None" = None) -> None:
         super().__init__()
-        self.piper_cmd = piper_cmd
-        self.sample_rate = sample_rate
         self.endpoint = endpoint
         self.volume = volume
-        self.cache = cache
-        # Голос с ПК, если он там поднят. Свой piper остаётся запасным.
+        # Голос с ПК. Другого нет: не озвучил ПК — фраза не звучит.
         self.remote = remote
 
         self._queue: queue.Queue = queue.Queue()
@@ -737,13 +593,10 @@ class WebSpeech(ПервыйЗвук):
                 return
             if self._cancelled:
                 continue
-            try:
-                raw, rate = self._synthesize(sentence)
-            except (OSError, subprocess.SubprocessError):
-                log.exception("piper не смог синтезировать %r", sentence)
+            готово = self._synthesize(sentence)
+            if готово is None or self._cancelled:
                 continue
-            if self._cancelled:
-                continue
+            raw, rate = готово
             # Рот по звуку — и в браузерном режиме тоже: звук здесь в руках
             # целиком, а этот режим у робота по умолчанию.
             self.под_рот(raw, rate)
@@ -779,38 +632,20 @@ class WebSpeech(ПервыйЗвук):
         t.daemon = True
         t.start()
 
-    def _synthesize(self, text: str) -> tuple[bytes, int]:
-        """Звук фразы и его частота. Сначала ПК, потом свой piper.
+    def _synthesize(self, text: str) -> tuple[bytes, int] | None:
+        """Звук фразы с ПК и его частота. None — ПК не озвучил, фраза молчит.
 
-        Каждый путь засекается и пишется в журнал. Три источника звука стоят
-        разного, и разница между ними — не проценты, а разы: кэш отдаёт готовое
-        мгновенно, ПК считает быстрее реального времени, а свой piper на A55
-        поднимается заново НА КАЖДОЕ ПРЕДЛОЖЕНИЕ и каждый раз грузит голосовую
-        модель с нуля. Пока это не в журнале, спорить о том, где теряется
-        секунда, можно бесконечно.
+        Засекается и пишется в журнал: ПК или кэш его голоса — разница в
+        разы, и без журнала спорить, где теряется секунда, можно вечно.
         """
+        if self.remote is None:
+            return None
         начало = time.monotonic()
-        if self.remote is not None:
-            pcm = self.remote.raw(text)
-            if pcm is not None:
-                self._засечь("ПК", начало, text)
-                return scale(pcm, self.volume), self.remote.rate
-        raw = None
-        if self.cache is not None:
-            raw = self.cache.get(text)
-        if raw is not None:
-            self._засечь("кэш", начало, text)
-        if raw is None:
-            raw = subprocess.run(
-                self.piper_cmd, input=text.encode(), stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, timeout=120, check=True,
-            ).stdout
-            self._засечь("свой piper", начало, text)
-            if self.cache is not None:
-                # В кэш кладём звук полной громкости: тише сделаем на выходе,
-                # иначе ночная громкость завела бы вторую копию каждой фразы.
-                self.cache.put(text, raw)
-        return scale(raw, self.volume), self.sample_rate
+        pcm = self.remote.raw(text)
+        if pcm is None:
+            return None
+        self._засечь("ПК", начало, text)
+        return scale(pcm, self.volume), self.remote.rate
 
     @staticmethod
     def _засечь(откуда: str, начало: float, text: str) -> None:
@@ -845,33 +680,37 @@ class WebSpeech(ПервыйЗвук):
 
 
 class Speaker:
-    def __init__(self, model_path: Path, *, audio_out: str = "local",
+    """Голос робота — это голос ПК, и только он.
+
+    Робот работает только в паре с ПК (решение хозяина, октябрь 2026). Нет
+    адреса ПК или ПК не отвечает — робот молчит: ни своего piper, ни
+    объявлений о том, что ПК пропал. Будильник и таймер в такую минуту не
+    теряются — say вернёт «никто не слышал», и они прозвонят снова.
+    """
+
+    def __init__(self, *, audio_out: str = "local",
                  web_endpoint: str = "http://127.0.0.1:8000/speak",
                  volume: float = 1.0, cache_dir: Path | None = None,
                  pc_url: str = "", pc_voice: str = "",
                  spk_device: str = "") -> None:
-        self.model_path = model_path
         self.audio_out = audio_out
         self.web_endpoint = web_endpoint
         self.spk_device = spk_device
-        self.cache = (PhraseCache(cache_dir, model_path.name)
-                      if cache_dir is not None else None)
-        # Голос с ПК. Кэш у него свой: частота и тембр другие, и путать их
-        # звуком от piper нельзя — робот заговорил бы чужим голосом на удвоенной
-        # скорости.
+        # Голос с ПК; кэш — его готовых фраз («Да?», «Остановился.»).
         self.remote = None
         if pc_url:
             self.remote = RemoteVoice(
                 pc_url, pc_voice,
                 PhraseCache(cache_dir, f"пк-{pc_voice or 'голос'}")
                 if cache_dir is not None else None)
+        else:
+            log.error("адреса ПК нет — робот молчит: своего голоса у него нет")
         # Что произносится прямо сейчас — чтобы «замолчи» успело перехватить
         # то, что ещё не ушло в пульт или не отзвучало в динамике. Во ВСЕХ
         # режимах: раньше запоминалась только браузерная реплика, и на
         # своём динамике «замолчи» не обрывало ничего.
         self._current: ПервыйЗвук | None = None
-        self.enabled = True
-        self.sample_rate = 22050
+        self.enabled = self.remote is not None
         # Громкость 0.1–1.0. Меняется голосом и на ночь.
         self.volume = volume
         # Ночью тише: спрашиваем у настроек, наступили ли тихие часы.
@@ -884,29 +723,17 @@ class Speaker:
         self.last_said = ""
         # Сколько раз реплику обрывали на полуслове. Растёт в hush.
         self.hushes = 0
-        # Кому отдавать звук под рот на экране (лицо). Только там, где звук
-        # проходит через Python: piper напрямую в aplay нам не виден.
+        # Кому отдавать звук под рот на экране (лицо).
         self.on_pcm: Callable[[bytes, int], None] | None = None
 
-        self.piper = _find_piper()
-        if self.piper is None:
-            log.error("piper не установлен — робот будет молчать (текст в логе)")
-            self.enabled = False
-            return
-        if not model_path.exists():
-            log.error("нет голоса %s — робот будет молчать", model_path)
-            self.enabled = False
-            return
 
-        cfg = model_path.with_suffix(".onnx.json")
-        if cfg.exists():
-            try:
-                self.sample_rate = json.loads(cfg.read_text())["audio"]["sample_rate"]
-            except (ValueError, KeyError):
-                log.warning("не разобрал %s, беру 22050 Гц", cfg.name)
+    def может_говорить(self) -> bool:
+        """Есть ли сейчас чем говорить: ПК задан и не отворачивались от него.
 
-    def _cmd(self) -> list[str]:
-        return [self.piper, "--model", str(self.model_path), "--output-raw"]
+        Голосу робота (Voice.say) это нужно ДО речи: незачем глушить микрофон
+        и писать на лицо «говорю», если звука не будет.
+        """
+        return self.remote is not None and self.remote.alive()
 
     def effective_volume(self) -> float:
         """Насколько громко говорить прямо сейчас."""
@@ -927,8 +754,8 @@ class Speaker:
         отправил и молчать сам по себе не начнёт. Поэтому просим пульт
         бросить очередь.
 
-        На своём динамике (local) реплика — это piper и aplay, и обрывает
-        их cancel() у текущей реплики. Раньше здесь стоял выход по режиму
+        На своём динамике (local) реплика — это aplay со звуком ПК, и
+        обрывает её cancel() у текущей реплики. Раньше здесь стоял выход по режиму
         ДО cancel, и «Кузя, стоп» на своём динамике не значило ничего:
         счётчик рос, а робот договаривал рассказ до конца.
         """
@@ -961,26 +788,18 @@ class Speaker:
         loud — не приглушать: будильник и таймер человек ставил сам, и они
         должны звучать в полную громкость даже в тихие часы.
         """
-        if not self.enabled:
+        if not self.может_говорить():
             return None
         volume = 1.0 if loud else self.effective_volume()
         if self.audio_out == "browser":
-            speech = WebSpeech(self._cmd(), self.sample_rate, self.web_endpoint,
-                               volume, cache=self.cache, remote=self.remote)
+            speech = WebSpeech(self.web_endpoint, volume, remote=self.remote)
         else:
             try:
-                if self.remote is not None and self.remote.alive():
-                    speech = RemoteSpeech(self.remote, self._cmd(), volume,
-                                          self.spk_device,
-                                          own_rate=self.sample_rate)
-                else:
-                    speech = Speech(self._cmd(), self.sample_rate, volume,
-                                    self.spk_device)
+                speech = RemoteSpeech(self.remote, volume, self.spk_device)
             except OSError:
-                log.exception("не смог запустить piper/aplay")
+                log.exception("не смог запустить aplay")
                 return None
-        # Рот по звуку — во всех режимах, где звук проходит через Python
-        # (в Speech на полной громкости он идёт мимо, и on_pcm там молчит).
+        # Рот по звуку — звук ПК проходит через Python в обоих режимах.
         speech.on_pcm = self.on_pcm
         self._current = speech
         return speech
@@ -1001,31 +820,19 @@ class Speaker:
         if speech is not None and on_sound is not None:
             speech.on_sound = on_sound
         if speech is None:
-            # Синтеза нет вовсе (не встал piper): повторять нечего и незачем,
-            # поэтому не притворяемся, что реплику потеряли по дороге.
-            return 1
+            # Говорить нечем — ПК нет. Честно: никто не слышал. Таймер по
+            # этому прозвонит ещё раз, когда ПК вернётся, а не забудет.
+            return 0
         for sentence in split_sentences(text):
             speech.feed(sentence)
         слышали = speech.close()
         # Запоминаем как сказанное только то, что прозвучало целиком. Раньше
-        # поле заполнялось ДО синтеза: не встал piper — «повтори» повторяло
+        # поле заполнялось ДО синтеза: не было звука — «повтори» повторяло
         # фразу, которой человек не слышал, а оборванная «замолчи» репликой
-        # возвращалась из небытия.
-        if self.hushes == было_прерываний:
+        # возвращалась из небытия. Не прозвучало ничего — тоже не сказано.
+        if self.hushes == было_прерываний and слышали > 0:
             self.last_said = text
         return слышали
-
-
-def _find_piper() -> str | None:
-    """Ищет piper сначала в текущем venv, потом в PATH.
-
-    Сервис запускается как .venv/bin/python, а venv/bin в PATH при этом нет —
-    поэтому одного shutil.which недостаточно.
-    """
-    local = Path(sys.executable).with_name("piper")
-    if local.exists():
-        return str(local)
-    return shutil.which("piper")
 
 
 def _as_wav(raw: bytes, rate: int) -> bytes:

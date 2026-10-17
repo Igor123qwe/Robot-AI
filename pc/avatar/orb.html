@@ -9,14 +9,15 @@
   ШАР ИЗ ТОЧЕК — ЛИЦО РОБОТА, КОТОРОЕ РИСУЕТ ПК.
 
   Страницу снимает headless-браузер (pc/kuzya_pc.py, Съёмка) и шлёт роботу
-  кадрами; робот кладёт поверх свои часы, строку и карточки. Поэтому здесь
-  только шар — на том же фоне, на том же месте и того же размера, что и у
-  шара, который робот рисует сам, когда ПК нет (face/orb.py). Что шар делает
-  в каком состоянии, какие у режима числа и цвета, какой жест у какого
-  повода сценки — не здесь, а в face/orb_rules.py: страница берёт это
-  JSON'ом (orb_rules.json), чтобы два шара не разошлись. Здесь — КАК это
-  выглядит на видеокарте: десяток тысяч точек вместо полутора, у каждой
-  своя пружина и инерция, фигуры, течения, свечение.
+  кадрами; робот кладёт поверх свои часы, строку и карточки. Своего лица
+  робот не рисует вовсе: нет кадров отсюда — нет и лица. Поэтому здесь
+  только шар — на том же фоне и на том же месте, где робот ищет его под
+  пальцем (face/orb_rules.py, РАСКЛАДКА). Что шар делает в каком
+  состоянии, какие у режима числа и цвета, какой жест у какого повода
+  сценки — тоже не здесь, а в face/orb_rules.py: страница берёт это
+  JSON'ом (orb_rules.json). Здесь — КАК это выглядит на видеокарте:
+  десяток тысяч точек, у каждой своя пружина и инерция, фигуры, течения,
+  свечение.
 
   Не с нуля. Взято и переработано из открытых проектов (все — MIT; строки
   об авторских правах и текст лицензии — в THIRD_PARTY.md рядом):
@@ -46,9 +47,10 @@
   canvas { display: block; position: fixed; left: 0; top: 0; }
   #пузырь {
     position: fixed; left: 0; top: 0; box-sizing: border-box;
-    padding: 0.6vh 1.5vw; border-radius: 1.6vh;
+    padding: 1vh 1.5vw; border-radius: 1.6vh;
     background: #161d27; color: #c7d3dd;
-    font: 3.5vh/1.3 "DejaVu Sans", "Segoe UI", Arial, sans-serif;
+    /* Как у робота: его 0.035 H — высота заглавной, а кегль — 0.035/0.72 H. */
+    font: 4.86vh/1.3 "DejaVu Sans", "Segoe UI", Arial, sans-serif;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
     opacity: 0; transition: opacity 0.25s ease-out; will-change: transform, opacity;
@@ -87,6 +89,11 @@ function показать(текст) {
 
 // --- ручки адреса --------------------------------------------------------------
 const адрес = new URLSearchParams(location.search);
+// робот=1 — эти кадры уходят на экран робота (так открывает Съёмка в
+// kuzya_pc.py). Там служебных надписей не бывает — ни «нет связи», ни
+// «пробую снова»: решение хозяина. Текст беды остаётся в консоли (её Съёмка
+// пишет в журнал ПК) и в самом элементе — для проверок.
+if (адрес.get("робот") === "1") беда.style.display = "none";
 const ТЕСТ = адрес.get("тест") === "1";
 const ЗЕРНО = Number(адрес.get("зерно")) || 7;
 // Рисуем на каждый кадр браузера (60 Гц), а не реже: Съёмка берёт каждый
@@ -109,10 +116,10 @@ function случай_из(зерно) {
 }
 const случай = случай_из(ЗЕРНО);
 
-// --- то, что совпадает с шаром робота (face/orb.py) ------------------------------
+// --- раскладка: та же, что в face/orb_rules.py (РАСКЛАДКА) ----------------------
 // Радиус и центр — в долях высоты; кольцо сна — в радиусах; низ — где
-// начинается строка состояния. Числа те же, иначе шар прыгал бы на экране,
-// когда ПК пропадает и робот рисует сам.
+// начинается строка состояния. Числа те же, иначе робот искал бы шар под
+// пальцем не там, где он нарисован (сверяет pc/selftest.py, test_шар_пк).
 const ФОН = [0x0b / 255, 0x0f / 255, 0x14 / 255];
 const РАДИУС = 0.30, ЦЕНТР_Y = 0.43, ЦЕНТР_Y_ВО_СНЕ = 0.50;
 const С_КАРТОЧКОЙ = 0.86;
@@ -191,7 +198,7 @@ function hsv(h, s, v) {
 const огр = (x, a, b) => Math.max(a, Math.min(b, x));
 const число = (x, по) => (typeof x === "number" && Number.isFinite(x) ? x : по);
 const гладко = (x) => { x = огр(x, 0, 1); return x * x * (3 - 2 * x); };
-// Ход превращения: туда за «перетекание», держим, обратно (как face/orb.py).
+// Ход превращения: туда за «перетекание», держим, обратно.
 function перетекание(возраст, длится) {
   if (возраст < 0 || возраст >= длится) return 0;
   const п = правила.перетекание || 1.3;
@@ -220,6 +227,15 @@ for (let i = 0; i < 12; i++) for (let j = i + 1; j < 12; j++) {
 }
 const f = (x) => (Number.isInteger(x) ? x.toFixed(1) : String(x));
 
+// Угол часов и даты робота — правее 0.66 W и выше 0.155 H: робот рисует их
+// поверх кадра, и точки под цифрами читались бы мусором (разлёт при сборе,
+// вихрь, рой, светлячки долетали туда). Во сне часы посередине, и там кольцо
+// — uClockOut = 1 − сон. Нужен uScreen и uClockOut в шейдере, куда вставлен.
+const УГОЛ_ЧАСОВ = /* glsl */`
+float clockMask(vec2 px) {
+  return uClockOut * smoothstep(0.645 * uScreen.x, 0.66 * uScreen.x, px.x)
+       * (1.0 - smoothstep(0.155 * uScreen.y, 0.17 * uScreen.y, px.y));
+}`;
 const ОБЩЕЕ = /* glsl */`
 #define PI 3.141592653589793
 #define TAU 6.283185307179586
@@ -445,7 +461,9 @@ void main() {
   vec3 n = dot(pos, pos) > 1e-8 ? normalize(pos) : b.xyz;
   // Сбор: разлёт волной — обращённые к человеку срываются первыми.
   float a = uKickAge - (1.0 - dot(n, uFront)) * 0.5 * 0.35;
-  if (a >= 0.0 && a < uDt) vel += (n + 1.1 * (hash3(b.w * 97.0) - 0.5)) * (2.6 + 2.2 * b.w) * uKickPower;
+  // Сила — как у робота прежде (2.0 + 1.6 s, разброс 0.55): сильнее точки
+  // долетали до углов экрана и ложились на часы с датой.
+  if (a >= 0.0 && a < uDt) vel += (n + 0.55 * (hash3(b.w * 97.0) - 0.5)) * (2.0 + 1.6 * b.w) * uKickPower;
   // Вздрог: сжался — и распахнулся.
   if (uJoltAge >= 0.0 && uJoltAge < uDt) vel -= n * 1.6;
   if (uJoltAge >= 0.09 && uJoltAge - uDt < 0.09) vel += n * (2.2 + 1.5 * b.w);
@@ -476,7 +494,7 @@ const ТОЧКИ_ВЕРШИНЫ = /* glsl */`
 uniform sampler2D tPos, tVel;
 uniform mat3 uRot;
 uniform vec2 uCenter, uScreen, uSquash;
-uniform float uR, uPersp, uSize, uSphere, uBottom;
+uniform float uR, uPersp, uSize, uSphere, uBottom, uClockOut;
 uniform float uMouth, uSpeech, uListen, uDance, uBeat, uBeatPhase, uNoise;
 uniform float uPhSpeech, uPhSpeech2, uPhListen, uPhNoise1, uPhNoise2, uPhNoise3;
 uniform vec4 uTouch;          // где коснулись (оси экрана) и сколько прошло
@@ -489,6 +507,7 @@ uniform float uHot, uSyllAge;
 attribute vec2 ref;
 varying vec3 vCol;
 ${ОБЩЕЕ}
+${УГОЛ_ЧАСОВ}
 #ifdef ANALYTIC
 uniform float uKickAge, uKickPower, uJoltAge;
 uniform vec3 uFront;
@@ -560,10 +579,12 @@ void main() {
   w += n * dr * uSphere;
   w.y -= 0.18 * uSag * uSphere * pow(max(0.0, -n.y), 2.0);
 
-  // Капель: нижние точки отрываются и падают, тая (снег — медленнее, качаясь).
+  // Капель: редкие нижние точки отрываются и падают, тая (снег — медленнее,
+  // качаясь). Редкие — одна из восьми: падай весь низ разом, под шаром
+  // вставала сплошная шторка, а не капли. И каждая со своей скоростью.
   float drop = 1.0;
-  if (uDropAge >= 0.0 && n.y < -0.80) {
-    float path = fract(uFrame * 0.0 + (uDropAge * (0.45 / uDropSlow)) + s * 3.0);
+  if (uDropAge >= 0.0 && n.y < -0.60 && fract(s * 13.0) < 0.12) {
+    float path = fract(uDropAge * (0.45 * (0.7 + 0.6 * fract(s * 7.0)) / uDropSlow) + s * 3.0);
     float force = sin(PI * clamp(uDropAge / uDropLen, 0.0, 1.0));
     w.y -= 0.55 * path * force;
     w.x += (uDropSlow > 1.5 ? 0.06 * sin(path * 9.0 + s * 20.0) : 0.0) * force;
@@ -638,6 +659,7 @@ void main() {
   c *= mix(1.0, 0.5, textW);
   // Ниже места шара — строка состояния и субтитры робота: туда не светим.
   c *= 1.0 - smoothstep(uBottom - 14.0, uBottom, px.y);
+  c *= 1.0 - clockMask(px);
   vCol = c;
 
   float size = uSize * (0.75 + 1.25 * depth) * pf;
@@ -666,10 +688,11 @@ const ЛИНИИ_ВЕРШИНЫ = /* glsl */`
 uniform sampler2D tPos;
 uniform mat3 uRot;
 uniform vec2 uCenter, uScreen, uSquash;
-uniform float uR, uPersp, uBottom, uNoise, uPhNoise1, uPhNoise2, uPhNoise3, uSphere, uSag;
+uniform float uR, uPersp, uBottom, uNoise, uPhNoise1, uPhNoise2, uPhNoise3, uSphere, uSag, uClockOut;
 uniform sampler2D tBase;
 attribute vec2 ref, other;
 varying float vDepth, vKeep;
+${УГОЛ_ЧАСОВ}
 void main() {
   vec3 lp = texture2D(tPos, ref).xyz;
   vec3 w = uRot * lp;
@@ -689,7 +712,8 @@ void main() {
   vec2 px = vec2(uCenter.x + w.x * uR * pf, uCenter.y - w.y * uR * pf);
   gl_Position = vec4(px.x / uScreen.x * 2.0 - 1.0, 1.0 - px.y / uScreen.y * 2.0, 0.0, 1.0);
   vDepth = clamp((w.z + 1.0) * 0.5, 0.0, 1.0);
-  vKeep = (1.0 - smoothstep(uBottom - 14.0, uBottom, px.y)) * (1.0 - smoothstep(0.14, 0.32, len));
+  vKeep = (1.0 - smoothstep(uBottom - 14.0, uBottom, px.y)) * (1.0 - smoothstep(0.14, 0.32, len))
+        * (1.0 - clockMask(px));
 }
 `;
 const ЛИНИИ_ПИКСЕЛИ = /* glsl */`
@@ -727,15 +751,15 @@ varying vec2 vUv;
 void main() {
   // Ниже места шара — строка робота: ни свечения, ни ореола туда.
   float y = (1.0 - vUv.y) * uScreen.y;
-  float низ = 1.0 - smoothstep(uBottom - 14.0, uBottom, y);
+  float bottomMask = 1.0 - smoothstep(uBottom - 14.0, uBottom, y);
   vec3 c = texture2D(tScene, vUv).rgb * uExpo;
-  if (uBloom > 0.0) c += texture2D(tBloom, vUv).rgb * uBloom * низ;
+  if (uBloom > 0.0) c += texture2D(tBloom, vUv).rgb * uBloom * bottomMask;
   c = 1.0 - exp(-c * 1.45);
   vec2 q = (vec2(vUv.x * uScreen.x, y) - uCenter) / uR;
   float disc = exp(-dot(q, q) * 0.9);
   float rr = (length(q / uRing) - 1.0) * 4.0;
   float ring = exp(-rr * rr) * 0.6;
-  vec3 halo = uHaloCol * mix(disc, ring, uHaloSleep) * uHaloK * низ;
+  vec3 halo = uHaloCol * mix(disc, ring, uHaloSleep) * uHaloK * bottomMask;
   // Пол-ступени шума против полос: свечение — плавный градиент, а в восьми
   // битах (и потом в JPEG) он ложится лесенкой.
   float dz = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
@@ -802,6 +826,7 @@ const UТ = {
   uCenter: { value: new THREE.Vector2(W / 2, H * ЦЕНТР_Y) }, uScreen: { value: new THREE.Vector2(W, H) },
   uSquash: { value: new THREE.Vector2(1, 1) }, uR: { value: РАДИУС * H }, uPersp: { value: ПЕРСПЕКТИВА },
   uSize: { value: 3 }, uSphere: { value: 1 }, uBottom: { value: НИЗ_ШАРА * H },
+  uClockOut: { value: 1 },
   uMouth: { value: 0 }, uSpeech: { value: 0 }, uListen: { value: 0 }, uDance: { value: 0 },
   uBeat: { value: 0 }, uBeatPhase: { value: 0 }, uNoise: { value: 0.02 },
   uPhSpeech: { value: 0 }, uPhSpeech2: { value: 0 }, uPhListen: { value: 0 },
@@ -1120,6 +1145,9 @@ let взгляд_x = 0, взгляд_y = 0, cx = W / 2, cy = H * ЦЕНТР_Y, �
 let первый = true;
 let эффекты = [];                  // {вид, t0, где, длится}
 let сцена_была = "", эмоция_была = "", касание_было = null, режим_был = "";
+// Сколько шар ещё спит — с прошлого кадра (сбор на пробуждении, см. ниже), и
+// сколько ему ещё держаться лицом к нам после сна (см. лицом_сна).
+let сон_был = 0, лицом_сна = 0;
 let фигур_было = Math.floor(случай() * 5);
 let сюжет = null, сюжет_след = 6 + случай() * 6;
 let кадров = 0;
@@ -1201,6 +1229,9 @@ function события_из_состояния() {
   if (ключ !== сцена_была && сц.когда && (правила.события || {})[сц.когда]) {
     const вид = правила.события[сц.когда];
     let где = null;
+    // Проснулся — кольцо само собирается в шар; разлёт поверх этого сбора
+    // рвал его на облако до часов с датой (сценка «проснулся» → «сбор»).
+    if (вид === "сбор" && сон_был > 0.1) { сцена_была = ключ; return события_дальше(); }
     if (вид === "гладят") где = [0, 0.85, 0.53];
     else if (вид === "тычок") где = [0, -0.45, 0.89];
     событие(вид, где);
@@ -1209,9 +1240,14 @@ function события_из_состояния() {
     if (вид === "капель") снег = сц.когда === "снег";
   }
   сцена_была = ключ;
-  const эмоция = с.эмоция || "спокоен";
-  if (эмоция_была === "сплю" && эмоция !== "сплю") событие("сбор");
-  эмоция_была = эмоция;
+  события_дальше();
+}
+
+function события_дальше() {
+  // Пробуждение — без сбора: кольцо собирается в шар само, лицом к нам
+  // (лицом_сна), и это и есть «собрался». Разлёт поверх него давал белый
+  // столб ребром кольца и облако до часов с датой.
+  эмоция_была = с.эмоция || "спокоен";
   // Касание с робота: новый номер — новая волна. Сервер держит касание две
   // секунды (опрос раз в 100 мс), и одно касание видно здесь много раз —
   // по номеру оно и одно.
@@ -1349,6 +1385,7 @@ function обновить(dt) {
     if (р !== цель && веса[р] < 1e-4) delete веса[р];
   }
   const сон = веса["сон"] || 0;
+  сон_был = сон;
 
   const сц = с.сцена || {};
   const п = Object.assign({}, сц.параметры || {});
@@ -1384,7 +1421,7 @@ function обновить(dt) {
   рот_мин = Math.min(рот, рот_мин + dt * 2.0);
   if (с.говорит && рот - рот_мин > 0.2 && t - слог_t0 > 0.15) { слог_t0 = t; рот_мин = рот; }
 
-  // Голова и взгляд — как у робота (face/orb.py, _общие).
+  // Голова и взгляд — из позы сценки и взгляда на человека.
   const рад = (x) => x * Math.PI / 180;
   const голова_x = рад(число(п.ParamAngleX, 0)) * 0.8 + рад(число(п.ParamBodyAngleX, 0)) * 0.4;
   const голова_y = рад(число(п.ParamAngleY, 0)) * 0.6 + рад(число(п.ParamBodyAngleY, 0)) * 0.3;
@@ -1427,7 +1464,11 @@ function обновить(dt) {
   const [ат, эт] = возраст("текст");
   const ход_т = Math.max(ач !== null ? перетекание(ач, длится("часы")) : 0,
                          ат !== null ? перетекание(ат, эт.длится) : 0);
-  const лицом = Math.max(сон, ход_с, ход_т, ЛИЦОМ.has(имя_ф) ? ход_ф : 0);
+  // После сна шар держится лицом к нам, пока кольцо собирается в шар, и
+  // только потом снова крутится. Иначе он разворачивался ребром, пока
+  // точки ещё на кольце, — на экране вставал белый столб.
+  лицом_сна = Math.max(сон, лицом_сна * Math.exp(-dt / 0.5));
+  const лицом = Math.max(лицом_сна, ход_с, ход_т, ЛИЦОМ.has(имя_ф) ? ход_ф : 0);
 
   qa.setFromAxisAngle(ОСЬ_Z, крен);
   qb.setFromAxisAngle(ОСЬ_X, НАКЛОН_ОСИ + тангаж);
@@ -1517,7 +1558,7 @@ function обновить(dt) {
   const [асб0] = возраст("сбор");
   const асб = асб0 !== null && асб0 >= СЖАТИЕ_ПЕРЕД ? асб0 - СЖАТИЕ_ПЕРЕД : null;
   if (асб0 !== null && асб0 < СЖАТИЕ_ПЕРЕД) U.uRadius.value *= 1 - 0.12 * гладко(асб0 / СЖАТИЕ_ПЕРЕД);
-  if (асб !== null) жёсткость *= 0.35 + 0.65 * гладко(асб / 1.4);
+  if (асб !== null) жёсткость *= 0.7 + 0.3 * гладко(асб / 1.4);
   жёсткость *= 1 - 0.75 * рой;
   течение += 1.25 * рой;
   const морф = Math.max(ход_ф, ход_с, ход_т);
@@ -1617,6 +1658,7 @@ function обновить(dt) {
   UТ.uFlash.value = (асб !== null ? 0.35 * Math.exp(-асб / 0.5) : 0) + 0.25 * удар_пульса;
   UТ.uBright.value = смесь("яркость") * (асб !== null && асб < 0.3 ? 1.1 : 1);
   UТ.uSleepBoost.value = 0.8 * сон;
+  UТ.uClockOut.value = 1 - сон;
   UТ.uHot.value = 1;
   UТ.uSyllAge.value = с.говорит && t - слог_t0 < 0.6 ? t - слог_t0 : -1;
 
@@ -1631,10 +1673,12 @@ function обновить(dt) {
   UТ.uRainbow.value = ард !== null ? Math.sin(Math.PI * ард / длится("радуга")) * 0.85 : 0;
   UТ.uSparkCol.value.set(...цвет(правила.искра));
 
-  // Линии созвездия: думает — сеть мыслей; сюжет — созвездие.
-  const линии = Math.max(0.55 * (веса["дума"] || 0), огибающая("созвездие")) * сфера;
+  // Линии созвездия: думает — сеть мыслей; сюжет — созвездие. Линии в
+  // WebGL всегда в пиксель толщиной, и при 0.3 их не было видно с полутора
+  // метров вовсе (замер: в кадре после JPEG +6 уровней яркости): ярче.
+  const линии = Math.max(0.7 * (веса["дума"] || 0), огибающая("созвездие")) * сфера;
   сим.линии.visible = линии > 0.01 && !сим.без_пружин;
-  сим.линии.material.uniforms.uAlpha.value = 0.30 * линии;
+  сим.линии.material.uniforms.uAlpha.value = 0.8 * линии;
   сим.линии.material.uniforms.uCol.value.set(...смешать(ца, цб, 0.5));
 
   // Свечение вокруг: цвет шара; во сне — кольцом вокруг часов.
