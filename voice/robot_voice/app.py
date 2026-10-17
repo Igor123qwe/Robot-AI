@@ -39,7 +39,7 @@ from .stt import Remote
 from .follow import Следование
 from .tof import Дальномер
 from . import motion
-from .tools import CUTOFF_VOLT, Timers, build_tools
+from .tools import CUTOFF_VOLT, НЕ_РАЗГЛЯДЕЛ, Timers, build_tools
 from .tts import SentenceBuffer, Speaker
 from .wake import clean_token, make_spotter, sounds_like_wake
 from .yandex import Music
@@ -2600,6 +2600,9 @@ def _run_direct(tool, args: dict, voice: Voice, pending: Pending | None = None,
     # Инструмент вызываем до заглушения микрофона: движение стартует сразу, и
     # эти доли секунды робот ещё слышит комнату.
     answer = tool(args)
+    if answer == НЕ_РАЗГЛЯДЕЛ:
+        # Это указание модели, а не реплика: без ПК-зрения робот молчит.
+        answer = ""
     # А ВОТ ЗДЕСЬ РОБОТ МОГ ОГЛОХНУТЬ НА СЕКУНДЫ, И ЭТО НАДО ЛОВИТЬ.
     #
     # Инструмент движения возвращается не сразу: Ros._пустить ждёт, пока
