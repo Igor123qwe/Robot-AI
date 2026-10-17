@@ -1073,8 +1073,23 @@ def test_stt_confidence() -> None:
             код = e.code
         check("прогрев не кончился — /stt сразу 503, а не ждёт замка", код, 503)
         whisper.прогревается = False
+        # Прогрев снимает признак САМ, даже если модель не встала: иначе /stt
+        # отвечал бы 503 вечно, и робот, слышащий только через ПК, оглох бы
+        # насовсем. Зовём настоящий warm() с падающей загрузкой модели.
+        def не_встала():
+            raise RuntimeError("модель не встала")
+
+        w = Whisper("tiny")
+        w._load = не_встала
+        w.warm()
+        g = kuzya_pc.GigaAM()
+        g._load = не_встала
+        try:
+            g.warm()
+        except RuntimeError:
+            pass
         check("и прогрев сам снимает этот признак, даже если модель не встала",
-              (Whisper.прогревается, kuzya_pc.GigaAM.прогревается), (False, False))
+              (w.прогревается, g.прогревается), (False, False))
     finally:
         srv.shutdown()
 
