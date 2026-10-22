@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import struct
 import subprocess
 import threading
@@ -120,6 +121,21 @@ def _чем_услышит_себя(фраза: str | None) -> set[str]:
     return глушим
 
 
+def _приманки(фраза: str | None) -> tuple[str, ...]:
+    """Слова своей реплики — в словарь уха перебиваний, соперниками командам.
+
+    Зачем — в wake.грамматика_перебивания. Здесь только форма: строчные, одни
+    буквы (дефис и тире режут слово: «летят-летят» — это «летят»), и каждое
+    слово с «ё» ещё и через «е» — каким его держит словарь модели, отсюда не
+    видно, а лишнее Vosk просто пропустит.
+    """
+    слова: set[str] = set()
+    for слово in re.findall(r"[а-яё]+", (фраза or "").lower()):
+        слова.add(слово)
+        слова.add(слово.replace("ё", "е"))
+    return tuple(sorted(слова))
+
+
 # --------------------------------------------------------------------------
 # Источники
 # --------------------------------------------------------------------------
@@ -139,14 +155,34 @@ class LocalSource:
     проверить руками через arecord/aplay, не поднимая робота.
     """
 
-    def __init__(self, sample_rate: int, device: str = "") -> None:
+    def __init__(self, sample_rate: int, device: str = "",
+                 канал: str = "") -> None:
         self.sample_rate = sample_rate
         self.frame_len = sample_rate * FRAME_MS // 1000
         self.device = device.strip() or "default"
+        # Какой канал карты слушать (ROBOT_MIC_CHANNEL). None — как было
+        # всегда: `-c 1`, и plug сводит каналы карты в один сам.
+        #
+        # ЗАЧЕМ. ReSpeaker Lite отдаёт по USB два канала, и чем именно каждый
+        # из них является, зависит от прошивки XMOS: обычно один — звук после
+        # эхоподавления, другой — нет. Свёрнутые в моно, они делят эхо
+        # пополам вместо того, чтобы убрать его, и робот слышит себя — а ухо
+        # перебиваний ловит в своём же голосе «подожди» и «хватит». Какой
+        # канал чистый, на этой плате не написано; поэтому умолчание НЕ
+        # меняется вслепую, а выбор — одной строкой проверки в voice/README.md
+        # («Какой канал слушать»).
+        канал = str(канал or "").strip()
+        self.канал = int(канал) if канал.isdigit() else None
+        if канал and self.канал is None:
+            log.warning("ROBOT_MIC_CHANNEL=%s — это не номер канала, слушаю "
+                        "все каналы вместе, как раньше", канал)
+        self.каналов = 1 if self.канал is None else max(2, self.канал + 1)
 
     def frames(self) -> Iterator[np.ndarray]:
-        cmd = ["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1",
+        cmd = ["arecord", "-q", "-t", "raw", "-f", "S16_LE",
+               "-c", str(self.каналов),
                "-r", str(self.sample_rate), "-D", self.device]
+        байт = self.frame_len * 2 * self.каналов
         log.info("аудио: слушаю %s", self.device)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
@@ -171,9 +207,9 @@ class LocalSource:
         threading.Thread(target=сторожить, daemon=True).start()
         try:
             while True:
-                buf = proc.stdout.read(self.frame_len * 2)
+                buf = proc.stdout.read(байт)
                 живо[0] = time.monotonic()
-                if len(buf) < self.frame_len * 2:
+                if len(buf) < байт:
                     # Ругань arecord тащим в текст ошибки: без неё «источник
                     # пропал» не отличить от «нет такой карты», и человек
                     # ищет обрыв связи там, где опечатка в имени устройства.
@@ -182,7 +218,11 @@ class LocalSource:
                     raise ConnectionError(
                         f"arecord замолчал ({self.device})"
                         + (f": {беда.splitlines()[-1]}" if беда else ""))
-                yield np.frombuffer(buf, dtype="<i2")
+                кадр = np.frombuffer(buf, dtype="<i2")
+                if self.канал is not None:
+                    # Кадры чередуются по каналам: L R L R… Берём свой.
+                    кадр = кадр.reshape(-1, self.каналов)[:, self.канал].copy()
+                yield кадр
         finally:
             proc.kill()
             try:
@@ -329,9 +369,10 @@ class BrowserSource:
 
 
 def make_source(audio_source: str, phone_url: str, sample_rate: int,
-                web_url: str = "http://127.0.0.1:8000", mic_device: str = ""):
+                web_url: str = "http://127.0.0.1:8000", mic_device: str = "",
+                mic_channel: str = ""):
     if audio_source == "local":
-        return LocalSource(sample_rate, mic_device)
+        return LocalSource(sample_rate, mic_device, mic_channel)
     if audio_source == "browser":
         return BrowserSource(web_url, sample_rate)
     return PhoneSource(phone_url, sample_rate)
@@ -770,6 +811,8 @@ class Listener:
 
         1. Словарь ровно из слов перебивания плюс «[unk]». Десяток слов вместо
            тысяч — и возможность честно сказать «это не из моего словаря».
+           Плюс слова самой реплики ПРИМАНКАМИ: «[unk]» эху не соперник, и
+           «рождения» становилось «подожди» (wake.грамматика_перебивания).
         2. Слово, которое робот СЕЙЧАС произносит, к перебиванию не годится.
            Без этой проверки рассказ про умения останавливал бы сам себя: в
            нём есть строка «могу остановиться по слову стоп». Проверено на
@@ -813,11 +856,39 @@ class Listener:
         пик = max(пик_кадров) if пик_кадров else 0.0
         return пик >= фон * self.МОЛЧИ_ГРОМЧЕ_ФОНА
 
+    def _слух_для(self, говорю: str, старый, недавние):
+        """Новое ухо перебиваний — с приманками реплики, как она есть сейчас.
+
+        ЗАЧЕМ ЗАНОВО. Длинный ответ глушит микрофон ещё до первого слова
+        модели, а предложения дописываются в «говорю» по мере синтеза. Ухо,
+        собранное один раз при запуске, знало бы приманки только той реплики,
+        что была на тот миг, — то есть на ходовом пути никаких. Ровно эту
+        ошибку однажды уже сделали со снимком своих слов (см. проверку в
+        _слушать_перебивание), и повторять её здесь незачем.
+
+        НЕДАВНИЙ ЗВУК — ЗАНОВО В НОВОЕ УХО. «Стоп» человека может прийтись как
+        раз на стык предложений: начало слова услышало старое ухо, конец —
+        новое, и целиком его не услышал бы никто. Перегнать в новое ухо
+        последние доли секунды — дешевле, чем потерять «стоп».
+
+        Не собралось — слушаем старым: ухо без свежих приманок лучше глухоты.
+        """
+        try:
+            слух = self.spotter.слух_для_перебивания(_приманки(говорю))
+        except Exception:                       # noqa: BLE001
+            log.exception("перебивание: новое ухо не собралось — слушаю прежним")
+            return старый
+        for кадр in недавние:
+            слух.AcceptWaveform(кадр.tobytes())
+        return слух
+
     def _слушать_перебивание(self) -> None:
         import json as _json
 
+        # Для какой реплики собран словарь уха. См. _слух_для.
+        слышу_для = self.говорю
         try:
-            слух = self.spotter.слух_для_перебивания()
+            слух = self.spotter.слух_для_перебивания(_приманки(слышу_для))
         except Exception:                       # noqa: BLE001
             log.exception("перебивание не поднялось — слушать не буду")
             return
@@ -827,12 +898,18 @@ class Listener:
         # принимается в момент, когда Vosk уже выдал слово, а громкая гласная
         # могла прозвучать на несколько кадров раньше. См. ОКНО_ПИКА_КАДРОВ.
         пик_кадров: deque[float] = deque(maxlen=self.ОКНО_ПИКА_КАДРОВ)
+        # Те же последние кадры — чтобы новое ухо не начинало с пустого места.
+        недавние: deque[np.ndarray] = deque(maxlen=self.ОКНО_ПИКА_КАДРОВ)
         while not self._барж_стоп.is_set() and self._muted.is_set():
             кадры, курсор = self.pump.свежие(курсор)
             if not кадры:
                 self._барж_стоп.wait(0.05)
                 continue
             for кадр in кадры:
+                if self.говорю != слышу_для:
+                    слышу_для = self.говорю
+                    слух = self._слух_для(слышу_для, слух, недавние)
+                недавние.append(кадр)
                 пик_кадров.append(_громкость(кадр))
                 if слух.AcceptWaveform(кадр.tobytes()):
                     текст = _json.loads(слух.Result()).get("text", "")

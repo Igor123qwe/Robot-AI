@@ -21,8 +21,14 @@ import urllib.parse
 import urllib.request
 
 from . import ru
+from .repeat_log import Беда
 
 log = logging.getLogger(__name__)
+
+# Погода без интернета не отвечала часами, и журнал получал строку в минуту
+# (лицо переспрашивает её само). Сказать один раз, напоминать редко, отметить
+# возвращение — см. repeat_log.
+_беда = Беда(log)
 
 URL = "https://api.open-meteo.com/v1/forecast"
 TIMEOUT = 8
@@ -158,7 +164,9 @@ def _сходить(lat: float, lon: float) -> dict | None:
     })
     try:
         with urllib.request.urlopen(f"{URL}?{query}", timeout=TIMEOUT) as resp:
-            return json.loads(resp.read())
+            data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, ValueError) as e:
-        log.warning("погода не ответила: %s", e)
+        _беда.случилась(f"погода не ответила: {e}")
         return None
+    _беда.прошла("погода снова отвечает")
+    return data

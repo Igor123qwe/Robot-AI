@@ -878,13 +878,19 @@ def _звуковые_карты(cfg) -> None:
         log.warning("ROBOT_MIC_DEVICE=%s ни на что не влияет: микрофон взят "
                     "из %s. Нужен ROBOT_AUDIO_SOURCE=local",
                     cfg.mic_device, cfg.audio_source)
+    if getattr(cfg, "mic_channel", "") and cfg.audio_source != "local":
+        log.warning("ROBOT_MIC_CHANNEL=%s ни на что не влияет: микрофон взят "
+                    "из %s. Нужен ROBOT_AUDIO_SOURCE=local",
+                    cfg.mic_channel, cfg.audio_source)
     if cfg.spk_device and cfg.audio_out != "local":
         log.warning("ROBOT_SPK_DEVICE=%s ни на что не влияет: звук уходит "
                     "в %s. Нужен ROBOT_AUDIO_OUT=local",
                     cfg.spk_device, cfg.audio_out)
     if cfg.audio_source == "local" or cfg.audio_out == "local":
-        log.info("звуковые карты: слушаю %s, говорю в %s",
+        log.info("звуковые карты: слушаю %s (%s), говорю в %s",
                  cfg.mic_device or "ту, что по умолчанию",
+                 f"канал {cfg.mic_channel}" if getattr(cfg, "mic_channel", "")
+                 else "все каналы вместе",
                  cfg.spk_device or "ту, что по умолчанию")
 
 
@@ -941,7 +947,8 @@ def main() -> None:
     listener = Listener(
         make_source(cfg.audio_source, cfg.phone_url, cfg.sample_rate,
                     web_url=cfg.web_endpoint.rsplit("/speak", 1)[0],
-                    mic_device=cfg.mic_device),
+                    mic_device=cfg.mic_device,
+                    mic_channel=getattr(cfg, "mic_channel", "")),
         sample_rate=cfg.sample_rate,
         vad_level=cfg.vad_level,
         silence_ms=cfg.silence_ms,
