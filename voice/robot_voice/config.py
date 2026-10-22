@@ -98,6 +98,11 @@ class Config:
     # проверяются руками, не поднимая робота.
     mic_device: str = field(default_factory=lambda: _env("ROBOT_MIC_DEVICE", ""))
     spk_device: str = field(default_factory=lambda: _env("ROBOT_SPK_DEVICE", ""))
+    # Какой канал микрофона слушать: «0», «1»… Пусто — все каналы, сведённые
+    # в моно, как было всегда. У ReSpeaker Lite каналов два, и после
+    # эхоподавления обычно только один из них; какой — проверяется одной
+    # строкой из voice/README.md («Какой канал слушать»), не на глаз.
+    mic_channel: str = field(default_factory=lambda: _env("ROBOT_MIC_CHANNEL", ""))
 
     # Куда играть МУЗЫКУ. Пусто — туда же, куда голос, и обычно так и надо.
     #

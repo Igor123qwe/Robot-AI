@@ -139,14 +139,34 @@ class LocalSource:
     проверить руками через arecord/aplay, не поднимая робота.
     """
 
-    def __init__(self, sample_rate: int, device: str = "") -> None:
+    def __init__(self, sample_rate: int, device: str = "",
+                 канал: str = "") -> None:
         self.sample_rate = sample_rate
         self.frame_len = sample_rate * FRAME_MS // 1000
         self.device = device.strip() or "default"
+        # Какой канал карты слушать (ROBOT_MIC_CHANNEL). None — как было
+        # всегда: `-c 1`, и plug сводит каналы карты в один сам.
+        #
+        # ЗАЧЕМ. ReSpeaker Lite отдаёт по USB два канала, и чем именно каждый
+        # из них является, зависит от прошивки XMOS: обычно один — звук после
+        # эхоподавления, другой — нет. Свёрнутые в моно, они делят эхо
+        # пополам вместо того, чтобы убрать его, и робот слышит себя — а ухо
+        # перебиваний ловит в своём же голосе «подожди» и «хватит». Какой
+        # канал чистый, на этой плате не написано; поэтому умолчание НЕ
+        # меняется вслепую, а выбор — одной строкой проверки в voice/README.md
+        # («Какой канал слушать»).
+        канал = str(канал or "").strip()
+        self.канал = int(канал) if канал.isdigit() else None
+        if канал and self.канал is None:
+            log.warning("ROBOT_MIC_CHANNEL=%s — это не номер канала, слушаю "
+                        "все каналы вместе, как раньше", канал)
+        self.каналов = 1 if self.канал is None else max(2, self.канал + 1)
 
     def frames(self) -> Iterator[np.ndarray]:
-        cmd = ["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1",
+        cmd = ["arecord", "-q", "-t", "raw", "-f", "S16_LE",
+               "-c", str(self.каналов),
                "-r", str(self.sample_rate), "-D", self.device]
+        байт = self.frame_len * 2 * self.каналов
         log.info("аудио: слушаю %s", self.device)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
@@ -171,9 +191,9 @@ class LocalSource:
         threading.Thread(target=сторожить, daemon=True).start()
         try:
             while True:
-                buf = proc.stdout.read(self.frame_len * 2)
+                buf = proc.stdout.read(байт)
                 живо[0] = time.monotonic()
-                if len(buf) < self.frame_len * 2:
+                if len(buf) < байт:
                     # Ругань arecord тащим в текст ошибки: без неё «источник
                     # пропал» не отличить от «нет такой карты», и человек
                     # ищет обрыв связи там, где опечатка в имени устройства.
@@ -182,7 +202,11 @@ class LocalSource:
                     raise ConnectionError(
                         f"arecord замолчал ({self.device})"
                         + (f": {беда.splitlines()[-1]}" if беда else ""))
-                yield np.frombuffer(buf, dtype="<i2")
+                кадр = np.frombuffer(buf, dtype="<i2")
+                if self.канал is not None:
+                    # Кадры чередуются по каналам: L R L R… Берём свой.
+                    кадр = кадр.reshape(-1, self.каналов)[:, self.канал].copy()
+                yield кадр
         finally:
             proc.kill()
             try:
@@ -329,9 +353,10 @@ class BrowserSource:
 
 
 def make_source(audio_source: str, phone_url: str, sample_rate: int,
-                web_url: str = "http://127.0.0.1:8000", mic_device: str = ""):
+                web_url: str = "http://127.0.0.1:8000", mic_device: str = "",
+                mic_channel: str = ""):
     if audio_source == "local":
-        return LocalSource(sample_rate, mic_device)
+        return LocalSource(sample_rate, mic_device, mic_channel)
     if audio_source == "browser":
         return BrowserSource(web_url, sample_rate)
     return PhoneSource(phone_url, sample_rate)
@@ -770,6 +795,9 @@ class Listener:
 
         1. Словарь ровно из слов перебивания плюс «[unk]». Десяток слов вместо
            тысяч — и возможность честно сказать «это не из моего словаря».
+           Слов самой реплики в словаре нет — и почему, в
+           wake.Spotter.слух_для_перебивания: вместе с эхом они забирали и
+           «стоп» человека.
         2. Слово, которое робот СЕЙЧАС произносит, к перебиванию не годится.
            Без этой проверки рассказ про умения останавливал бы сам себя: в
            нём есть строка «могу остановиться по слову стоп». Проверено на
@@ -816,6 +844,13 @@ class Listener:
     def _слушать_перебивание(self) -> None:
         import json as _json
 
+        # Ухо собирается ОДИН раз на всю реплику, хотя реплика модели
+        # дописывается по предложению. Пересобирать его на каждом стыке
+        # пробовали: новый распознаватель начинает посреди чужого слова с
+        # чистого листа и сам сочиняет из обрывка «стоп» и «стоять» — на
+        # настоящей модели само-остановок так стало почти вдвое больше. Свои
+        # слова при этом всё равно видны: проверка ниже смотрит в «говорю»
+        # каждый раз.
         try:
             слух = self.spotter.слух_для_перебивания()
         except Exception:                       # noqa: BLE001
