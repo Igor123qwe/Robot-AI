@@ -452,12 +452,16 @@ with sync_playwright() as p:
     # взгляд и танец» в scripts/mutations.py) — с ним корпус качаться не будет.
     post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": True, "название": "x"}})
     page2.wait_for_timeout(300)
+    # Размах — по всем кадрам, а не по последнему: качание синусом, и один
+    # снимок на загруженной машине попадал в его ноль.
+    размах = 0.0
     for _ in range(15):
         page2.evaluate("window.__listeners.afterMotionUpdate()")
+        размах = max(размах, abs(парам2("PARAM_BODY_ANGLE_X")))
         page2.wait_for_timeout(50)
         post({"эмоция": "спокоен", "говорит": "", "музыка": {"играет": True, "название": "x"}})
     body_angle_x = парам2("PARAM_BODY_ANGLE_X")
-    check("старый формат: корпус качается в танце (PARAM_BODY_ANGLE_X)", abs(body_angle_x) > 0.5, True)
+    check("старый формат: корпус качается в танце (PARAM_BODY_ANGLE_X)", размах > 0.5, True)
     check("старый формат: псевдоним PARAM_BODY_X держит то же значение (Shizuku зовёт корпус так)",
           парам2("PARAM_BODY_X"), body_angle_x)
     check("старый формат: новых имён (ParamMouthOpenY) в ядро не ушло",
