@@ -747,6 +747,24 @@ def test_model_choice() -> None:
     имя, _ = выбрать_модель("qwen3:4b", ["qwen3:4b", "llama3.1:8b-instruct"])
     check("чужое семейство не берём", имя, "qwen3:4b")
 
+    # start.cmd просит instruct-сборку, а скачать её не вышло (нет сети). Без
+    # подмены ПК отвечал бы ошибкой на каждую фразу — робот молчал бы целиком,
+    # хотя рядом лежит тот же qwen3:4b: медленнее, но говорит.
+    from kuzya_pc import родня_на_диске
+    check("нужной нет — берём скачанную родню того же размера, а не молчим",
+          родня_на_диске("qwen3:4b-instruct-2507-q4_K_M", ["llama3.1:8b", "qwen3:4b"]),
+          "qwen3:4b")
+    check("из родни — нерассуждающую первой",
+          родня_на_диске("qwen3:4b-instruct-2507-q4_K_M",
+                         ["qwen3:4b", "qwen3:4b-instruct-q8_0"]), "qwen3:4b-instruct-q8_0")
+    check("чужое семейство и чужой размер — не родня",
+          родня_на_диске("qwen3:4b-instruct-2507-q4_K_M", ["qwen3:8b", "llama3.1:8b"]), "")
+    исходник = (Path(__file__).resolve().parent / "kuzya_pc.py").read_text(encoding="utf-8")
+    тело_main = исходник[исходник.index("def main() -> int:"):]
+    check("main: нужной модели нет на диске — берёт родню, а не молчит",
+          ("запасная = родня_на_диске(args.model, have)" in тело_main,
+           "args.model = cfg.model = запасная" in тело_main), (True, True))
+
 
 def test_tool_call() -> None:
     section("вызов инструмента через мост")
@@ -801,6 +819,9 @@ def test_broken() -> None:
     srv, url = serve(Broken([]))
     try:
         client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0)
+        # Заголовки потока уходят сразу, до Ollama (см. test_первое_слово_не_ждёт),
+        # поэтому кода 502 тут уже нет: ошибка приходит событием error, и
+        # клиент поднимает на нём тот же APIStatusError — робот молчит так же.
         try:
             with client.messages.stream(
                 model="неважно", max_tokens=16,
@@ -810,9 +831,11 @@ def test_broken() -> None:
                     pass
             check("должно было упасть", "не упало", "APIStatusError")
         except anthropic.APIStatusError as e:
-            check("код ошибки", e.status_code, 502)
+            check("Ollama молчит — ошибка ПК (APIStatusError), а не пустой ответ",
+                  "Ollama" in str(e), True)
         except anthropic.APIConnectionError:
-            check("код ошибки", "обрыв связи", 502)
+            check("Ollama молчит — ошибка ПК (APIStatusError), а не пустой ответ",
+                  "обрыв связи", "APIStatusError")
     finally:
         srv.shutdown()
         logging.getLogger("кузя-пк").removeHandler(ловец)
@@ -823,6 +846,582 @@ def test_broken() -> None:
           [r.exc_info for r in про_разговор], [None])
     check("и сказано, что делать",
           all("Ollama не отвечает" in r.getMessage() for r in про_разговор), True)
+
+
+# --------------------------------------------------------------------------
+class Неспешная(FakeOllama):
+    """Ollama, которая сначала молча читает промпт, а то и думает.
+
+    префилл — секунд тишины до первого куска: так Ollama читает семь тысяч
+    токенов промпта, не отдавая ни байта, даже заголовков. размышления —
+    секунд кусков в отдельном поле thinking, по куску в десятую секунды.
+    """
+
+    def __init__(self, chunks: list[str], префилл: float = 0.0,
+                 размышления: float = 0.0, calls: list[tuple] = (),
+                 обрезать: bool = False) -> None:
+        super().__init__(chunks, calls)
+        self.префилл = префилл
+        self.размышления = размышления
+        self.обрезать = обрезать
+        self.запросов = 0
+        self.виденные: list[list[dict]] = []
+
+    def chat(self, model, messages, tools, max_tokens):
+        import time
+        self.запросов += 1
+        self.виденные.append(messages)
+        time.sleep(self.префилл)
+        конец = time.monotonic() + self.размышления
+        while time.monotonic() < конец:
+            yield {"message": {"role": "assistant", "content": "", "thinking": "хм"},
+                   "done": False}
+            time.sleep(0.1)
+        for part in FakeOllama.chat(self, model, messages, tools, max_tokens):
+            if part.get("done") and self.обрезать:
+                part = dict(part, done_reason="length")
+            yield part
+
+
+def _сырой_поток(url: str, тело: dict, молчать_не_дольше: float) -> list[tuple[float, str]]:
+    """Сырые строки потока с мигом прихода — так их читает робот.
+
+    молчать_не_дольше — таймаут чтения сокета: сколько ПК может молчать между
+    байтами, прежде чем клиент бросит ответ (у робота — пять секунд). Бросил —
+    последней строкой «ОБРЫВ».
+    """
+    import json
+    import time
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        url + "/v1/messages",
+        data=json.dumps(dict(тело, stream=True), ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    начало = time.monotonic()
+    строки: list[tuple[float, str]] = []
+    try:
+        with urllib.request.urlopen(req, timeout=молчать_не_дольше) as resp:
+            строки.append((time.monotonic() - начало, f"HTTP {resp.status}"))
+            for сырая in resp:
+                строки.append((time.monotonic() - начало,
+                               сырая.decode("utf-8").rstrip("\n")))
+    except urllib.error.HTTPError as e:
+        строки.append((time.monotonic() - начало, f"HTTP {e.code}"))
+    except OSError as e:                    # таймаут сокета — тоже OSError
+        строки.append((time.monotonic() - начало, f"ОБРЫВ {e}"))
+    return строки
+
+
+def _паузы(строки: list[tuple[float, str]]) -> float:
+    """Самое долгое молчание ПК между приходами строк, с начала запроса."""
+    моменты = [0.0] + [t for t, _ in строки]
+    return max(б - а for а, б in zip(моменты, моменты[1:]))
+
+
+def test_первое_слово_не_ждёт() -> None:
+    """Пока Ollama читает промпт, ПК уже говорит роботу «я здесь».
+
+    Ollama не отдаёт ни байта, пока не прочитает промпт: семь тысяч токенов —
+    пять секунд с лишним на живом ПК. Робот рвёт чтение через пять
+    (brain.LOCAL_TIMEOUT_SECONDS). Мост слал заголовки только с первым словом,
+    а пинг — не раньше чем через 5.0 с, то есть всегда проигрывал гонку: ход
+    пропадал молча, и потом две минуты робот не отвечал даже «Да?». Теперь
+    заголовки — сразу, пинги — каждые PING_SECONDS, пока модель молчит.
+    """
+    section("первое слово не ждёт: заголовки и пинги до ответа модели")
+    import re
+
+    import anthropic
+
+    мозг = (Path(__file__).resolve().parent.parent / "voice" / "robot_voice"
+            / "brain.py").read_text(encoding="utf-8")
+    таймаут = float(re.search(r"^LOCAL_TIMEOUT_SECONDS = ([0-9.]+)", мозг, re.M).group(1))
+    check("пинг заметно чаще, чем робот рвёт чтение (PING_SECONDS × 2 < таймаута)",
+          kuzya_pc.PING_SECONDS * 2 < таймаут, True)
+    привет = {"model": "неважно", "max_tokens": 64,
+              "messages": [{"role": "user", "content": "расскажи про динозавров"}]}
+
+    # Настоящий клиент с таймаутом робота против семи секунд тишины Ollama.
+    srv, url = serve(Неспешная(["Динозавры ", "жили давно."], префилл=7.0))
+    try:
+        client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0,
+                                     timeout=таймаут)
+        try:
+            with client.messages.stream(**привет) as stream:
+                for _ in stream:
+                    pass
+                вышло = stream.get_final_message().content[0].text
+        except Exception as e:                  # noqa: BLE001
+            # До заголовков таймаут — APITimeoutError, после них — голый
+            # ReadTimeout той библиотеки, на которой стоит SDK. Для робота
+            # это одно: ход пропал.
+            вышло = f"обрыв по таймауту робота ({type(e).__name__})"
+        check("семь секунд чтения промпта — ответ доходит до клиента с таймаутом робота",
+              вышло, "Динозавры жили давно.")
+    finally:
+        srv.shutdown()
+
+    # Сырой поток: когда что пришло.
+    srv, url = serve(Неспешная(["Привет!"], префилл=3.5))
+    try:
+        строки = _сырой_поток(url, привет, молчать_не_дольше=таймаут)
+    finally:
+        srv.shutdown()
+    первые = [с for t, с in строки if t < 1.0]
+    check("заголовки и message_start — сразу, до первого слова модели",
+          (строки[0][1], "event: message_start" in первые), ("HTTP 200", True))
+    check("пока модель читает промпт — пинги, и ПК не молчит дольше PING_SECONDS",
+          (sum(1 for _, с in строки if с == "event: ping") >= 2,
+           _паузы(строки) <= kuzya_pc.PING_SECONDS + 0.7), (True, True))
+    check("и ответ дошёл целиком, а не оборвался",
+          (any("Привет!" in с for _, с in строки), "event: message_stop" in [с for _, с in строки]),
+          (True, True))
+
+    было = (kuzya_pc.PING_SECONDS, kuzya_pc.ПИНГИ_НЕ_ДОЛЬШЕ)
+    try:
+        # Висящая Ollama не держит робота вечно: пинги кончаются через
+        # ПИНГИ_НЕ_ДОЛЬШЕ, и робот через свои пять секунд сдаётся сам.
+        kuzya_pc.PING_SECONDS, kuzya_pc.ПИНГИ_НЕ_ДОЛЬШЕ = 0.2, 1.0
+        srv, url = serve(Неспешная(["Привет!"], префилл=2.5))
+        try:
+            строки = _сырой_поток(url, привет, молчать_не_дольше=таймаут)
+        finally:
+            srv.shutdown()
+        пинги = [t for t, с in строки if с == "event: ping"]
+        # Смотрим на тишину Ollama (до 2.5 с): после ПИНГИ_НЕ_ДОЛЬШЕ в ней
+        # не должно быть ни одного пинга. Пинг вместе с первым куском текста
+        # — уже не пингера: Ollama ожила.
+        check("пинги не дольше ПИНГИ_НЕ_ДОЛЬШЕ: висящая Ollama не держит робота",
+              (sum(1 for t in пинги if t < 1.2) >= 3, [t for t in пинги if 1.6 < t < 2.3]),
+              (True, []))
+
+        # Размышления отдельным полем — признак жизни сами по себе: Ollama
+        # работает, а не висит. Пингер тут выключен, держат только они.
+        kuzya_pc.PING_SECONDS, kuzya_pc.ПИНГИ_НЕ_ДОЛЬШЕ = 0.3, 0.0
+        srv, url = serve(Неспешная(["Ответ."], размышления=2.5))
+        try:
+            строки = _сырой_поток(url, привет, молчать_не_дольше=1.2)
+        finally:
+            srv.shutdown()
+        check("размышления (thinking) — тоже знак жизни: ответ дошёл без обрыва",
+              (строки[-1][1].startswith("ОБРЫВ"), any("Ответ." in с for _, с in строки)),
+              (False, True))
+
+        # После колёс — без пингов. Повис ПК во втором круге «проедь вперёд» —
+        # робот обязан сдаться за свои пять секунд и встать (app._respond), а
+        # не ехать под пинги. Стоп не должен срабатывать реже, чем раньше.
+        kuzya_pc.PING_SECONDS, kuzya_pc.ПИНГИ_НЕ_ДОЛЬШЕ = 0.2, 15.0
+
+        def второй_круг(инструмент: str) -> list[tuple[float, str]]:
+            сервер, адрес = serve(Неспешная(["Готово."], префилл=0.8))
+            try:
+                return _сырой_поток(адрес, {
+                    "model": "неважно", "max_tokens": 64, "messages": [
+                        {"role": "user", "content": "давай"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t1", "name": инструмент, "input": {}}]},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "t1", "content": "Есть."}]},
+                    ]}, молчать_не_дольше=таймаут)
+            finally:
+                сервер.shutdown()
+        после_колёс = [второй_круг(и) for и in ("drive", "follow_me")]
+        check("круг после колёс (drive, follow_me) — без единого пинга",
+              [any(с == "event: ping" for _, с in строки) for строки in после_колёс],
+              [False, False])
+        check("…и заголовки там только с первым словом, как было: повис ПК — "
+              "робот сдаётся привычным таймаутом",
+              [строки[0][0] >= 0.6 for строки in после_колёс], [True, True])
+        check("…а после погоды пинги идут как обычно",
+              any(с == "event: ping" for _, с in второй_круг("weather")), True)
+    finally:
+        kuzya_pc.PING_SECONDS, kuzya_pc.ПИНГИ_НЕ_ДОЛЬШЕ = было
+
+    # Ошибка после заголовков — событием error: клиент поднимает
+    # APIStatusError, робот молчит так же, как на 502.
+    srv, url = serve(Broken([]))
+    try:
+        строки = _сырой_поток(url, привет, молчать_не_дольше=таймаут)
+    finally:
+        srv.shutdown()
+    тексты = [с for _, с in строки]
+    check("Ollama упала после заголовков — событие error с api_error, а не немой обрыв",
+          ("event: error" in тексты,
+           any(с.startswith("data:") and "api_error" in с for с in тексты)), (True, True))
+
+
+def test_кэш_ollama_не_портят_зря() -> None:
+    """Кэш у Ollama один, и после ответа в него не лезет никто чужой.
+
+    Мост после КАЖДОГО ответа спрашивал ту же модель «каким настроением
+    звучит реплика» — без промпта и схем. Начало запроса робота вылетало из
+    кэша, и следующая фраза перечитывала семь тысяч токенов: 3.8 с вместо 0.1,
+    а на медленной карте — обрыв. Вопрос влезал даже между двумя кругами
+    одного хода. Шару хватает настроения по словам.
+
+    И журнал: на каждый запрос — сколько Ollama прочитала и за сколько, а беда
+    посреди потока ({"error": …}) — строкой, а не молчанием.
+    """
+    section("кэш Ollama: после ответа никаких чужих вопросов, а в журнале — цифры")
+    import logging
+    import time
+
+    import anthropic
+
+    исходник = (Path(__file__).resolve().parent / "kuzya_pc.py").read_text(encoding="utf-8")
+    тело_main = исходник[исходник.index("def main() -> int:"):]
+    check("main не подключает модельный вопрос о настроении",
+          "avatar.спросить_настроение" in тело_main, False)
+    check("и у аватара его нет по умолчанию — настроение по словам",
+          Аватар().спросить_настроение, None)
+
+    записи: list[logging.LogRecord] = []
+
+    class Ловец(logging.Handler):
+        def emit(self, record):
+            записи.append(record)
+
+    ловец = Ловец()
+    журнал = logging.getLogger("кузя-пк")
+    уровень_был = журнал.level
+    журнал.setLevel(logging.INFO)            # строка о токенах — INFO
+    журнал.addHandler(ловец)
+    модель = Неспешная(["Отлично, ", "сделано!"])
+    srv, url = serve(модель)
+    try:
+        client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0)
+        with client.messages.stream(
+            model="неважно", max_tokens=64,
+            messages=[{"role": "user", "content": "поставь таймер"}],
+        ) as stream:
+            for _ in stream:
+                pass
+        time.sleep(0.3)                     # фоновому вопросу — время прийти
+        check("после ответа к модели не ходит больше никто: запрос ровно один",
+              модель.запросов, 1)
+        check("а шар всё равно знает настроение — по словам",
+              srv.avatar._настроение, "рад")
+    finally:
+        srv.shutdown()
+
+    class Сбойная(FakeOllama):
+        def chat(self, model, messages, tools, max_tokens):
+            yield {"message": {"role": "assistant", "content": "Сейчас"}, "done": False}
+            yield {"error": "model runner has unexpectedly stopped"}
+            yield {"done": True, "done_reason": "stop", "prompt_eval_count": 7412,
+                   "prompt_eval_duration": 3_700_000_000, "eval_count": 3,
+                   "eval_duration": 50_000_000}
+
+    srv, url = serve(Сбойная([]))
+    try:
+        client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0)
+        with client.messages.stream(
+            model="неважно", max_tokens=64,
+            messages=[{"role": "user", "content": "привет"}],
+        ) as stream:
+            for _ in stream:
+                pass
+    finally:
+        srv.shutdown()
+        журнал.removeHandler(ловец)
+        журнал.setLevel(уровень_был)
+    строки = [r.getMessage() for r in записи]
+    check("в журнале — сколько прочитано и за сколько: видно, попала ли фраза в кэш",
+          any("прочитала 7412 ток. за 3.70 с" in с and "сказала 3 ток." in с for с in строки),
+          True)
+    check("беда Ollama посреди потока — в журнале, а не молчанием",
+          any("model runner has unexpectedly stopped" in с for с in строки), True)
+
+
+def test_справка_и_время_в_хвосте() -> None:
+    """Справка о собеседнике и часы — в последней реплике, а не перед схемами.
+
+    Робот шлёт справку («Сейчас с тобой говорит Игорь») вторым system. Ollama
+    склеивает все system в один, а шаблон Qwen печатает его ДО схем
+    инструментов: каждая смена говорящего стоила перечитывания шести тысяч
+    токенов. Теперь system один, а справка — в начале последней реплики.
+    Туда же — дата и время по часам ПК: своих часов у модели нет. Внутри хода
+    (круги с инструментами) хвост одинаков побайтно, даже если сменилась
+    минута: иначе Ollama перечитывала бы его в каждом круге.
+    """
+    section("справка и время — в хвосте запроса, начало не меняется")
+    import time
+
+    from kuzya_pc import приписать_время, сейчас_словами
+
+    история = [
+        {"role": "user", "content": "привет"},
+        {"role": "assistant", "content": "Привет!"},
+        {"role": "user", "content": "как дела?"},
+    ]
+    out = to_ollama_messages("ты робот", [{"role": "system", "content": "Сейчас с тобой говорит Игорь."}]
+                             + история)
+    check("system один — промпт; справка не встаёт перед схемами",
+          [m["role"] for m in out], ["system", "user", "assistant", "user"])
+    check("справка — в начале последней реплики человека",
+          out[-1]["content"], "[Справка: Сейчас с тобой говорит Игорь.]\nкак дела?")
+    check("прошлые реплики не тронуты: история совпадает от хода к ходу",
+          out[1]["content"], "привет")
+    без_справки = to_ollama_messages("ты робот", история)
+    check("без справки начало запроса то же самое — разница только в хвосте",
+          out[:-1], без_справки[:-1])
+    check("реплики человека нет — справку не теряем, она остаётся системной",
+          [m["role"] for m in to_ollama_messages("ты робот", [{"role": "system", "content": "х"}])],
+          ["system", "system"])
+
+    среда = time.struct_time((2026, 10, 22, 14, 5, 0, 2, 295, 0))
+    check("время словами: день недели, число месяц год, ЧЧ:ММ",
+          сейчас_словами(среда), "Сейчас: среда, 22 октября 2026, 14:05")
+    часы = [100.0]
+    календарь = [среда]
+    первый = приписать_время(out, часы=lambda: часы[0], календарь=lambda: календарь[0])
+    check("«[Сейчас: …]» — в начале последней реплики, перед справкой",
+          первый[-1]["content"].split("\n")[:2],
+          ["[Сейчас: среда, 22 октября 2026, 14:05]", "[Справка: Сейчас с тобой говорит Игорь.]"])
+    # Второй круг того же хода: модель позвала инструмент, робот принёс итог.
+    # Минута успела смениться — хвост всё равно тот же, байт в байт.
+    часы[0] += 20.0
+    календарь[0] = time.struct_time((2026, 10, 22, 14, 6, 0, 2, 295, 0))
+    второй = приписать_время(out + [{"role": "assistant", "content": "", "tool_calls": [
+        {"function": {"name": "weather", "arguments": {}}}]},
+        {"role": "tool", "tool_name": "weather", "content": "+12"}],
+        часы=lambda: часы[0], календарь=lambda: календарь[0])
+    check("второй круг хода: реплика с хвостом та же побайтно, хоть минута и сменилась",
+          второй[len(out) - 1]["content"], первый[-1]["content"])
+    часы[0] += kuzya_pc.ВРЕМЯ_ХОДА_ДЕРЖАТЬ + 1.0
+    check("та же фраза позже срока — время свежее",
+          приписать_время(out, часы=lambda: часы[0],
+                          календарь=lambda: календарь[0])[-1]["content"].split("\n")[0],
+          "[Сейчас: среда, 22 октября 2026, 14:06]")
+
+    # Через мост целиком — что видит Ollama в двух кругах одного хода.
+    модель = Неспешная(["сейчас гляну"], calls=[("weather", {})])
+    srv, url = serve(модель)
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0)
+        переписка = [{"role": "system", "content": "Сейчас с тобой говорит Рома."},
+                     {"role": "user", "content": "какая погода?"}]
+        with client.messages.stream(model="неважно", max_tokens=64, system="ты робот",
+                                    messages=переписка) as stream:
+            for _ in stream:
+                pass
+            вызов = stream.get_final_message().content[-1]
+        переписка += [
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "сейчас гляну"},
+                {"type": "tool_use", "id": вызов.id, "name": "weather", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": вызов.id, "content": "+12, дождь"}]},
+        ]
+        модель.calls = []
+        with client.messages.stream(model="неважно", max_tokens=64, system="ты робот",
+                                    messages=переписка) as stream:
+            for _ in stream:
+                pass
+    finally:
+        srv.shutdown()
+    круг1, круг2 = модель.виденные
+    check("в Ollama один system в обоих кругах",
+          ([m["role"] for m in круг1].count("system"), [m["role"] for m in круг2].count("system")),
+          (1, 1))
+    реплика1 = [m for m in круг1 if m["role"] == "user"][-1]["content"]
+    check("в последней реплике — время, справка и сама фраза",
+          (реплика1.startswith("[Сейчас: "), "[Справка: Сейчас с тобой говорит Рома.]" in реплика1,
+           реплика1.endswith("\nкакая погода?")), (True, True, True))
+    check("во втором круге начало запроса и реплика с хвостом — те же байты",
+          круг2[:len(круг1)], круг1)
+
+
+def test_прогрев_настоящим_началом() -> None:
+    """Модель греется промптом и схемами робота — и при старте, и после чужих.
+
+    «привет» без промпта загонял в память модель, но не её кэш: первая фраза
+    после старта перечитывала семь тысяч токенов. Теперь мост запоминает
+    начало запроса робота (в файл — переживает перезапуск) и греет им: при
+    старте, после режиссёра и зрения, и по «Кузя» (POST /warm), если в кэше
+    чужое. /warm отвечает сразу — робот не ждёт. Зрение выгружается сразу
+    после ответа (keep_alive 0) и ждётся не меньше, чем его ждёт робот.
+    """
+    section("прогрев настоящим началом запроса, /warm и /see")
+    import json
+    import re
+    import time
+    import urllib.request
+
+    from kuzya_pc import Ollama
+
+    class Ответ:
+        def __init__(self, тело: dict) -> None:
+            self.тело = json.dumps(тело).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return self.тело
+
+    class Записывающая(Ollama):
+        """Настоящий мост к Ollama, только запросы ложатся в список."""
+
+        def __init__(self, задержка: float = 0.0, **kw) -> None:
+            super().__init__("http://нет", **kw)
+            self.ушло: list[tuple[str, dict, dict]] = []
+            self.задержка = задержка
+            self.ready = True
+
+        def _post(self, путь, payload, **kw):
+            time.sleep(self.задержка)
+            self.ушло.append((путь, payload, kw))
+            return Ответ({"message": {"content": "кот на диване"}})
+
+        def chat(self, model, messages, tools, max_tokens):
+            yield {"message": {"role": "assistant", "content": "Привет!"}, "done": False}
+            yield {"done": True, "done_reason": "stop", "prompt_eval_count": 50, "eval_count": 2}
+
+    def дождаться(условие, сколько=3.0):
+        крайний = time.monotonic() + сколько
+        while time.monotonic() < крайний:
+            if условие():
+                return True
+            time.sleep(0.02)
+        return условие()
+
+    схемы = to_ollama_tools([{"name": "drive", "description": "ехать",
+                              "input_schema": {"type": "object", "properties": {}}}])
+    with tempfile.TemporaryDirectory() as папка:
+        файл = Path(папка) / "кузя" / "префикс.json"
+        мост = Записывающая()
+        мост.префикс_файл = файл
+        мост.warm("м")
+        check("начала ещё не видели — хотя бы загоняем модель «приветом»",
+              [m["role"] for m in мост.ушло[-1][1]["messages"]], ["user"])
+        мост.запомнить_префикс({"role": "system", "content": "ты робот"}, схемы)
+        check("начало запроса робота легло в файл", файл.is_file(), True)
+        мост.warm("м")
+        прогрев = мост.ушло[-1][1]
+        check("прогрев шлёт промпт и схемы робота, один токен, то же окно и think, что в бою",
+              (прогрев["messages"][0], прогрев.get("tools"), прогрев["options"],
+               прогрев.get("think"), прогрев.get("chat_template_kwargs")),
+              ({"role": "system", "content": "ты робот"}, схемы,
+               {"num_predict": 1, "num_ctx": мост.ctx}, мост._payload("м", [], [], 1).get("think"),
+               мост._payload("м", [], [], 1).get("chat_template_kwargs")))
+        после_старта = Записывающая()
+        после_старта.префикс_файл = файл
+        после_старта.прочитать_префикс()
+        check("после перезапуска ПК начало берётся из файла — греем им сразу",
+              после_старта.префикс, {"system": "ты робот", "tools": схемы})
+
+    # /warm: ответ сразу, прогрев — в фоне и только когда в кэше чужое.
+    медленный = Записывающая(задержка=1.0)
+    srv, url = serve(медленный)
+    try:
+        def тёплый() -> tuple[int, float]:
+            req = urllib.request.Request(url + "/warm", data=b"", method="POST")
+            начало = time.monotonic()
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, time.monotonic() - начало
+
+        import anthropic
+        client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0)
+        with client.messages.stream(model="неважно", max_tokens=64, system="ты робот",
+                                    tools=[{"name": "drive", "description": "ехать",
+                                            "input_schema": {"type": "object", "properties": {}}}],
+                                    messages=[{"role": "user", "content": "привет"}]) as stream:
+            for _ in stream:
+                pass
+        check("мост запомнил начало запроса робота", (медленный.префикс or {}).get("system"),
+              "ты робот")
+        код, сколько = тёплый()
+        check("/warm отвечает сразу (204), прогрев робота не ждёт",
+              (код, сколько < 0.5), (204, True))
+        time.sleep(медленный.задержка + 0.3)     # начатый прогрев успел бы дойти
+        check("после разговора кэш свой — /warm ничего не греет", len(медленный.ушло), 0)
+        медленный.грязный = True                 # как после режиссёра или зрения
+        код, сколько = тёплый()
+        check("в кэше чужое — /warm всё равно отвечает сразу",
+              (код, сколько < 0.5), (204, True))
+        check("…а прогрев идёт в фоне — промптом робота",
+              (дождаться(lambda: len(медленный.ушло) == 1),
+               медленный.ушло and медленный.ушло[0][1]["messages"][0]["content"]),
+              (True, "ты робот"))
+        медленный.грязный = True
+        тёплый()
+        time.sleep(0.3)
+        check("не чаще раза в ПРОГРЕВ_НЕ_ЧАЩЕ: второе «Кузя» подряд не греет снова",
+              len(медленный.ушло), 1)
+    finally:
+        srv.shutdown()
+
+    # /see: зрение выгружается сразу и ждётся не меньше робота; разговорная
+    # модель после него греется обратно.
+    камера = (Path(__file__).resolve().parent.parent / "voice" / "robot_voice"
+              / "camera.py").read_text(encoding="utf-8")
+    робот_ждёт = float(re.search(r"^ОТВЕТ_ЖДЁМ = ([0-9.]+)", камера, re.M).group(1))
+    глаз = Записывающая()
+    глаз.запомнить_префикс({"role": "system", "content": "ты робот"}, схемы)
+    глаз.грязный = False
+    srv, url = serve(глаз)
+    try:
+        req = urllib.request.Request(
+            url + "/see", data=json.dumps({"кадр": "aGk=", "вопрос": "что там?"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            ответ = json.loads(resp.read().decode("utf-8"))
+        check("зрение ответило", ответ.get("текст"), "кот на диване")
+        путь, зрячий, как = глаз.ушло[0]
+        check("зрячая модель выгружается сразу после ответа (keep_alive 0)",
+              зрячий.get("keep_alive"), 0)
+        check("и ждём её не меньше, чем робот ждёт ответа (camera.ОТВЕТ_ЖДЁМ)",
+              (как.get("timeout") or 0) >= робот_ждёт, True)
+        check("после зрения разговорная модель греется обратно — промптом робота",
+              (дождаться(lambda: len(глаз.ушло) >= 2),
+               глаз.ушло[-1][1].get("model"), глаз.ушло[-1][1]["messages"][0]["content"]),
+              (True, "тест", "ты робот"))
+    finally:
+        srv.shutdown()
+
+    # Нерассуждающая сборка вслух не думает — это известно заранее. Иначе
+    # первый ответ после каждого запуска придерживался целиком.
+    исходник = (Path(__file__).resolve().parent / "kuzya_pc.py").read_text(encoding="utf-8")
+    тело_main = исходник[исходник.index("def main() -> int:"):]
+    check("main: instruct-модели привычку «не думает» знает заранее",
+          "if not рассуждает(args.model) and not args.think:\n" in тело_main
+          and "ollama.habit[args.model] = False" in тело_main, True)
+    check("main: режиссёр после ответа греет начало запроса робота",
+          "ollama.прогреть_в_фоне(cfg.model)" in тело_main, True)
+    check("main: начало запроса робота лежит рядом со слепками голосов",
+          'ollama.префикс_файл = рядом / "префикс.json"' in тело_main, True)
+
+    # Предел длины кончился посреди размышлений — вслух их не пускаем.
+    srv, url = serve(Неспешная(["Пользователь спрашивает, почему небо голубое. ",
+                                "Надо объяснить про рассеяние"], обрезать=True))
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key="local", base_url=url, max_retries=0)
+        with client.messages.stream(model="неважно", max_tokens=64,
+                                    messages=[{"role": "user", "content": "почему небо голубое"}]
+                                    ) as stream:
+            for _ in stream:
+                pass
+            итог = stream.get_final_message()
+        check("обрыв по пределу посреди размышлений — ни слова из них вслух",
+              ([б.type for б in итог.content], итог.stop_reason), ([], "max_tokens"))
+    finally:
+        srv.shutdown()
+
+    pc = Path(__file__).resolve().parent
+    старт = (pc / "start.cmd").read_text(encoding="utf-8")
+    check("start.cmd: нерассуждающая модель по умолчанию и скачивание, если её нет",
+          ("set MODEL=qwen3:4b-instruct-2507-q4_K_M" in старт, "ollama pull %MODEL%" in старт),
+          (True, True))
+    check("start.cmd: подсказка setx для быстрого внимания, сжатого кэша и одного разговора",
+          [п for п in ("setx OLLAMA_FLASH_ATTENTION 1", "setx OLLAMA_KV_CACHE_TYPE q8_0",
+                       "setx OLLAMA_NUM_PARALLEL 1") if п not in старт], [])
 
 
 def test_context_window() -> None:
@@ -847,11 +1446,47 @@ def test_context_window() -> None:
     check("и он больше умолчания самой Ollama", DEFAULT_CTX > 4096, True)
     # Прогрев обязан просить то же окно: Ollama держит модель вместе с
     # KV-кэшем нужного размера, и запрос с другим num_ctx перезагружает всё
-    # заново — то есть греет не то и не экономит ничего.
+    # заново — то есть греет не то и не экономит ничего. Проверяем делом:
+    # что прогрев на самом деле отправил бы в Ollama.
     исходник = (Path(__file__).resolve().parent / "kuzya_pc.py").read_text(encoding="utf-8")
-    кусок = исходник[исходник.index("def warm(self, model"):]
-    check("прогрев просит то же окно", "self._options(" in кусок[:1200], True)
+    греющий = Ollama("http://нет", ctx=12288)
+    ушло: list[dict] = []
+
+    class _Ответ:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    греющий._post = lambda путь, payload, **kw: (ушло.append(payload), _Ответ())[1]
+    греющий.warm("м")
+    check("прогрев просит то же окно",
+          [п["options"].get("num_ctx") for п in ушло], [12288])
     check("совсем маленькое окно не примем", Ollama("http://нет", ctx=128).ctx >= 2048, True)
+
+    # Окно по умолчанию: 8192, а 10240 — только когда кэш Ollama сжат (q8_0 с
+    # быстрым вниманием): так он занимает меньше, чем 8192 без сжатия. Без
+    # сжатия лишнее окно на шестигигабайтной карте выселило бы модель.
+    import os as _os
+    было_окружение = {к: _os.environ.get(к) for к in ("OLLAMA_KV_CACHE_TYPE",
+                                                       "OLLAMA_FLASH_ATTENTION")}
+    try:
+        окна = []
+        for кв, вспышка in (("", ""), ("q8_0", ""), ("q8_0", "1"), ("f16", "1")):
+            _os.environ["OLLAMA_KV_CACHE_TYPE"] = кв
+            _os.environ["OLLAMA_FLASH_ATTENTION"] = вспышка
+            окна.append(kuzya_pc._окно_по_умолчанию())
+        check("окно: 8192 без сжатого кэша, 10240 — только с q8_0 и быстрым вниманием",
+              окна, [8192, 8192, 10240, 8192])
+    finally:
+        for к, з in было_окружение.items():
+            if з is None:
+                _os.environ.pop(к, None)
+            else:
+                _os.environ[к] = з
+    check("справка --ctx больше не врёт про «четыре тысячи»",
+          "четыре тысячи" in исходник or "четырёх тысяч" in исходник, False)
 
     # Настоящий выключатель размышлений — chat_template_kwargs, а не think:
     # think у Ollama означает «разбирать ли размышления отдельным полем», и
@@ -2923,7 +3558,7 @@ def test_director() -> None:
     ав.состояние()
     for i in range(1, 200):
         чч[0] = 1000.0 + i / 10
-        ав.принять(dict(рядом))
+        ав.принять(dict(покой))
         ав.состояние()
 
     def дождаться(условие, сколько=3.0):
@@ -2933,25 +3568,40 @@ def test_director() -> None:
                 return True
             time.sleep(0.02)
         return условие()
+
+    def прожить(с_по: tuple[int, int], обстановка: dict) -> None:
+        """Десятые доли секунды по часам аватара — с одной обстановкой."""
+        for i in range(*с_по):
+            чч[0] = 1000.0 + i / 10
+            ав.принять(dict(обстановка))
+            ав.состояние()
     check("аватар спросил модель (в потоке) и положил план сценаристу",
           (дождаться(lambda: bool(ав.сценарист.план) or вопросы and not ав._режиссёр_думает),
            len(вопросы) >= 1, "стучит по стеклу" in ав.сценарист.план or ав.режиссёр.планов >= 1),
           (True, True, True))
     check("вопрос — настоящий: с обстановкой и списком", "Обстановка" in вопросы[0] and "Сценки:" in вопросы[0], True)
-    # Во время разговора — молчит: очередь к модели одна.
+    # Человек в кадре — сейчас скажут «Кузя, …». Появление человека было
+    # любимым поводом режиссёра, и его вопрос вставал в очередь к модели
+    # ровно перед первой фразой, вытесняя из кэша начало запроса робота.
+    дождаться(lambda: not ав._режиссёр_думает)
     было = len(вопросы)
     ав.сценарист.задать_план([], "")
+    прожить((200, 600), рядом)                   # 40 с с человеком: и перелом, и срок
+    check("человек в кадре — режиссёр модель не зовёт, сценки идут жребием",
+          len(вопросы), было)
+    # Во время разговора — молчит: очередь к модели одна. Даже в пустой
+    # комнате и даже если ответ идёт дольше ПОСЛЕ_РАЗГОВОРА.
+    ав.сценарист.задать_план([], "")
     ав.разговор_начался()
-    for i in range(200, 600):
-        чч[0] = 1000.0 + i / 10
-        ав.принять(dict(рядом))
-        ав.состояние()
+    прожить((600, 600 + int(ав.ПОСЛЕ_РАЗГОВОРА * 10) + 300), покой)
     check("идёт разговор — режиссёр модель не дёргает", len(вопросы), было)
     ав.разговор_кончился()
-    for i in range(600, 700):
-        чч[0] = 1000.0 + i / 10
-        ав.принять(dict(рядом))
-        ав.состояние()
+    конец = 600 + int(ав.ПОСЛЕ_РАЗГОВОРА * 10) + 300
+    прожить((конец, конец + int(ав.ПОСЛЕ_РАЗГОВОРА * 10) - 100), покой)
+    check("после разговора ПОСЛЕ_РАЗГОВОРА режиссёр молчит: кэш модели нужнее разговору",
+          (len(вопросы), ав.ПОСЛЕ_РАЗГОВОРА >= 60.0), (было, True))
+    прожить((конец + int(ав.ПОСЛЕ_РАЗГОВОРА * 10) - 100,
+             конец + int(ав.ПОСЛЕ_РАЗГОВОРА * 10) + 100), покой)
     check("разговор кончился — спросил снова", дождаться(lambda: len(вопросы) > было), True)
     check("разговор_кончился без начала — не уходит в минус",
           (Аватар().разговор_кончился(), Аватар()._разговоров), (None, 0))
