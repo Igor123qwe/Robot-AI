@@ -83,13 +83,20 @@ def _найти(text: str) -> tuple[int, int, re.Match] | None:
 
     Место нужно напоминанию: время из его текста вырезают, и вырезать надо
     ровно то, что здесь прочитано, а не первое похожее на время.
+
+    Берём то время, что сказано РАНЬШЕ. Шаблоны проверялись по очереди, и
+    «половина» выигрывала у «в 8» где бы ни стояла: «напомни в 8, что в
+    половине девятого собрание» ставилось на 8:30, а «напомни в 10, что Рома
+    в половине второго придёт» — на половину второго ночи. Время напоминания
+    говорят в голове фразы, а то, что дальше, — уже его содержание.
     """
+    найдено: list[tuple[int, int, re.Match]] = []
     special = _NOON.search(text)
     if special:
-        return (12 if special.group(1) == "полдень" else 0), 0, special
+        найдено.append(((12 if special.group(1) == "полдень" else 0), 0, special))
     special = _ONE.search(text)
     if special:
-        return (13 if special.group(1) == "дня" else 1), 0, special
+        найдено.append(((13 if special.group(1) == "дня" else 1), 0, special))
 
     m = _HALF.search(text)
     if m:
@@ -97,22 +104,22 @@ def _найти(text: str) -> tuple[int, int, re.Match] | None:
         следующий = _ПОРЯДКОВЫЕ.get(словом) or int(m.group(2) or 0)
         if 1 <= следующий <= 12:
             # «Половина первого» — 12:30: час до первого — двенадцатый.
-            return _по_части(следующий - 1 or 12, m.group(5)), 30, m
+            найдено.append((_по_части(следующий - 1 or 12, m.group(5)), 30, m))
 
     m = _BEZ.search(text)
     if m:
         без, следующий = int(m.group(1)), int(m.group(2))
         if 1 <= без <= 30 and 1 <= следующий <= 12:
-            return _по_части(следующий - 1 or 12, m.group(3)), 60 - без, m
+            найдено.append((_по_части(следующий - 1 or 12, m.group(3)), 60 - без, m))
 
     m = _CLOCK.search(text)
-    if not m:
-        return None
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        if hour <= 23 and minute <= 59:
+            найдено.append((_по_части(hour, m.group(3)), minute, m))
 
-    hour, minute = int(m.group(1)), int(m.group(2) or 0)
-    if hour > 23 or minute > 59:
-        return None
-    return _по_части(hour, m.group(3)), minute, m
+    # При равном начале — прежний порядок: min отдаёт первое из равных.
+    return min(найдено, key=lambda н: н[2].start(), default=None)
 
 
 def at_time(text: str, now: datetime | None = None) -> datetime | None:
@@ -125,8 +132,8 @@ def at_time(text: str, now: datetime | None = None) -> datetime | None:
     найдено = _найти(text)
     if найдено is None:
         return None
-    hour, minute, _ = найдено
-    return _next(now, hour, minute, text)
+    hour, minute, m = найдено
+    return _next(now, hour, minute, text, m.span())
 
 
 def отрезок(text: str) -> tuple[int, int] | None:
@@ -135,9 +142,30 @@ def отрезок(text: str) -> tuple[int, int] | None:
     return найдено[2].span() if найдено else None
 
 
-def _next(now: datetime, hour: int, minute: int, text: str) -> datetime:
+def _про_завтра(text: str, место: tuple[int, int] | None) -> bool:
+    """Сказано ли «завтра» про само время, а не внутри напоминания.
+
+    «Напомни в девять вечера, что завтра контрольная» — напомнить надо
+    СЕГОДНЯ в девять: «завтра» тут про контрольную. Хватало одного слова где
+    угодно во фразе, и напоминание вставало на завтрашний вечер — уже после
+    контрольной. Теперь «завтра» считается в голове фразы, до «что» и
+    «чтобы», или вплотную ко времени («напомни, что завтра в девять
+    контрольная») — по той же границе, по которой _reminder_text решает,
+    вырезать ли его вместе со временем.
+    """
+    if место is not None:
+        начало, конец = место
+        if (re.search(r"\bзавтра\s*$", text[:начало])
+                or re.match(r"\s*завтра\b", text[конец:])):
+            return True
+    голова = re.split(r"\b(?:что|чтобы|чтоб)\b", text, maxsplit=1)[0]
+    return bool(re.search(r"\bзавтра\b", голова))
+
+
+def _next(now: datetime, hour: int, minute: int, text: str,
+          место: tuple[int, int] | None = None) -> datetime:
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if re.search(r"\bзавтра\b", text):
+    if _про_завтра(text, место):
         target += timedelta(days=1)
     elif target <= now:
         target += timedelta(days=1)
