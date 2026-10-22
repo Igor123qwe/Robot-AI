@@ -156,11 +156,25 @@ def пк_недоступен(ошибка: Exception) -> bool:
     """
     if isinstance(ошибка, (OSError, anthropic.APIConnectionError, anthropic.APIStatusError)):
         return True
+    # Обрыв ПОСЛЕ заголовков (ПК уже ответил 200 и пингует, а слова так и
+    # не пришли) SDK не заворачивает в свои ошибки: наружу выходит голый
+    # таймаут чтения — и того httpx, которым пользуется сам SDK (у 1.x это
+    # форк httpx2, см. _httpx_сдк). Иначе такой обрыв читался бы поломкой
+    # робота: трассировка в журнал и без двух минут ии_молчит.
+    for пакет in (_httpx_сдк(), _httpx_обычный()):
+        класс = getattr(пакет, "HTTPError", None)
+        if isinstance(класс, type) and isinstance(ошибка, класс):
+            return True
+    return False
+
+
+def _httpx_обычный():
+    """Обычный httpx, если он есть (его тянет и huggingface-hub)."""
     try:
         import httpx
     except ImportError:                     # pragma: no cover — httpx идёт с anthropic
-        return False
-    return isinstance(ошибка, httpx.HTTPError)
+        return None
+    return httpx
 
 
 def наша_вина(ошибка: Exception) -> bool:
