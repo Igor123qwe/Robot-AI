@@ -4075,26 +4075,6 @@ def _respond(command: str, brain: Brain, voice: Voice,
         # которого нет.
         первая_фраза = [False]
 
-        # «Стоп» в хвосте на ходу разбирается на первой фразе (start_speaking).
-        # Придержанная фраза — та, на которой робот заговорил бы, а держат её
-        # до конца хода, со всеми кругами инструментов: на «Ставлю таймер…»
-        # колёса вставали бы только после них. Поэтому на ходу хвост
-        # разбираем на первой же придержанной фразе — один раз, копией: в
-        # start_speaking и в finally его разберут снова, с тем, что накопится.
-        хвост_разобран = [False]
-
-        def хвост_пока_держим() -> None:
-            if (хвост_разобран[0] or speaking or recognizer is None
-                    or ros is None or not getattr(ros, "moving", False)):
-                return
-            хвост_разобран[0] = True
-            try:
-                if _caught_stop(voice.listener.unheard(), recognizer, ros):
-                    стоп_пойман[0] = len(getattr(brain, "позвал", ()) or ())
-                    voice.status("остановился по «стоп»")
-            except Exception:
-                log.exception("сбой при разборе хвоста")
-
         def on_text(chunk: str) -> None:
             # Время до первого токена — вот что определяет, «тормозит» робот
             # или нет. Общее время ответа человек не замечает вовсе: как
@@ -4121,7 +4101,6 @@ def _respond(command: str, brain: Brain, voice: Voice,
                     if not придержанное:
                         стоп_в_придержанном()
                     придержанное.append(sentence)
-                    хвост_пока_держим()
                 else:
                     произнести(sentence)
             # Сказано всё, что положено, а модель всё пишет: генерация идёт,
