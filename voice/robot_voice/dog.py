@@ -57,6 +57,7 @@ import time
 from typing import NamedTuple
 
 from . import dogsight, planner, progress, ride, rig, search
+from .ros import сказать_итог
 
 log = logging.getLogger(__name__)
 
@@ -511,6 +512,8 @@ class Спутник(ride.Переезд):
             # а робот продолжит ездить по квартире, потому что ищет.
             self._искать_хватит("спутник закончил")
             self._встать()
+            # Лицу — чем кончилось, ДО доклада: тот звучит секундами.
+            сказать_итог(self.ros, self.почему_кончилось)
             self._доложить()
 
     # --- поиск как часть спутника ----------------------------------------

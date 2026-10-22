@@ -63,6 +63,7 @@ import time
 from pathlib import Path
 
 from . import landmarks, planner, ride, things, vocabulary
+from .ros import сказать_итог
 
 log = logging.getLogger(__name__)
 
@@ -422,6 +423,8 @@ class Поиск(ride.Переезд):
             self.почему_кончилось = "что-то пошло не так"
         finally:
             self._встать()
+            # Лицу — чем кончилось, ДО доклада: тот звучит секундами.
+            сказать_итог(self.ros, self.почему_кончилось)
             self._доложить()
 
     def _осмотреться(self) -> bool:
