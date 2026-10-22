@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -112,7 +114,39 @@ def find_city(name: str) -> tuple[str, float, float] | None:
             float(город["latitude"]), float(город["longitude"]))
 
 
+# Сколько держим прогноз. Лицо и так тянет погоду раз в десять минут
+# (face.ПОГОДА_РАЗ_В), и вопрос «какая погода?» раньше шёл в интернет заново:
+# новое HTTPS-соединение на цикле слуха, полсекунды, а при плохой сети — до
+# восьми, и всё это время робот не слышит «стоп». Погода за десять минут не
+# меняется настолько, чтобы это стоило глухоты.
+СВЕЖЕСТЬ = 600.0
+
+# Общий для лица и инструмента: ключ — место с точностью до километра.
+_кэш: dict[tuple[float, float], tuple[float, dict]] = {}
+_кэш_замок = threading.Lock()
+
+
 def fetch(lat: float, lon: float) -> dict | None:
+    """Прогноз из кэша, если он свежий, иначе из open-meteo.
+
+    Неудачу не кэшируем: интернет вернулся — следующий же вопрос его увидит.
+    Ходим в сеть БЕЗ замка: лицо и разговор могут спросить разом, и второму
+    лучше сходить самому, чем ждать чужие восемь секунд таймаута.
+    """
+    ключ = (round(float(lat), 2), round(float(lon), 2))
+    сейчас = time.monotonic()
+    with _кэш_замок:
+        было = _кэш.get(ключ)
+    if было is not None and сейчас - было[0] < СВЕЖЕСТЬ:
+        return было[1]
+    data = _сходить(lat, lon)
+    if data is not None:
+        with _кэш_замок:
+            _кэш[ключ] = (time.monotonic(), data)
+    return data
+
+
+def _сходить(lat: float, lon: float) -> dict | None:
     """Ходит в open-meteo. None — не дозвонились, и это нормально."""
     query = urllib.parse.urlencode({
         "latitude": f"{lat:.4f}",
