@@ -708,6 +708,7 @@ cd ~/Robot-AI/voice && set -a && . ~/.robot-ai.env && set +a && .venv/bin/python
 | `ROBOT_MAX_SPEECH_MS` | запасной режим: через сколько резать без паузы |
 | `ROBOT_VAD_LEVEL` | жёсткость детектора речи, 0–3 |
 | `ROBOT_MIC_DEVICE` | какую карту слушать: имя ALSA, например `plughw:0,0` |
+| `ROBOT_MIC_CHANNEL` | какой канал карты слушать, `0` или `1`; пусто — все вместе (см. «Какой канал слушать») |
 | `ROBOT_SPK_DEVICE` | в какую карту говорить: имя ALSA, например `plughw:0,0` |
 | `ROBOT_MUSIC_DEVICE` | карта для музыки, если голосовая её не тянет |
 | `ROBOT_WAKE_WORDS` | имя и его варианты через запятую |
