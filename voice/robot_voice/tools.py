@@ -29,6 +29,9 @@ log = logging.getLogger(__name__)
 # Как зовётся таймер, которому названия не дали.
 NO_NAME = "без названия"
 ALARM = "будильник"
+# Как человек называет его в ответ: робот сам зачитывает его «безымянным».
+БЕЗЫМЯННЫЙ = frozenset({"безымянный", "безымянного", "безымянный таймер",
+                        "без названия", "без имени", "без названия таймер"})
 
 # Сколько раз повторять объявление, если его никто не слышал, и с каким шагом.
 RING_TRIES = 3
@@ -140,6 +143,9 @@ CUTOFF_VOLT = rig.БАТАРЕЯ_ПУСТА
 # Сколько маршрут может ехать. Всё это время робот занят и слышит только
 # «стоп»: полторы минуты — уже долго, а дальше человек начинает беспокоиться.
 МАРШРУТ_СЕКУНД = 90.0
+# Сколько проеханный маршрут годится в навык без перечисления шагов
+# (remember_skill без steps): «запомни это» — про только что сделанное.
+МАРШРУТ_ДЛЯ_НАВЫКА = 300.0
 # Повторять полную формулу отказа на каждую фразу — то самое занудство, из-за
 # которого разговор с роботом выглядит тупым: за полминуты он дважды объяснил
 # человеку, как его звать. Второй раз за это время — коротко.
@@ -642,6 +648,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     # всегда свежая; на роботе это первая минута после включения питания,
     # то есть ровно тот момент, когда человек проверяет, ожил ли он.
     отказано = [float("-inf")]
+    # Последний принятый маршрут и когда он начат (см. remember_skill).
+    последний_маршрут: list = [None, float("-inf")]
     # Когда последний раз сказали, что низа не видим. Ноль — ещё ни разу, и
     # тогда говорим сразу, не дожидаясь четверти часа.
     _про_низ = [0.0]
@@ -1016,6 +1024,10 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         log.info("маршрут %r: %d шагов, %.0f с", name or "без названия",
                  len(программа), секунд)
         ros.run_route(программа)
+        # Для remember_skill: шаги берём отсюда, а не просим модель
+        # переписать JSON заново — на двенадцати шагах это ещё 470 токенов,
+        # и в предел ответа вызов не влезал.
+        последний_маршрут[:] = [{"steps": steps, "name": name}, time.monotonic()]
 
         сколько = ru.count(len(программа), "шаг", "шага", "шагов")
         имя = _short(str(name or "").strip(), 24)
@@ -1194,11 +1206,27 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         робот спрашивал одно и то же на каждый ответ.
 
         Если таймер всего один — гадать вообще не о чем.
+
+        И ещё два живых зацикливания. Робот сам зачитывает безымянный таймер
+        словом «безымянный», а хранит его как NO_NAME — ответ «Безымянный»
+        не совпадал ни с чем, и вопрос шёл по кругу. А «Пиццу» не совпадало с
+        «пицца»: человек отвечает в том падеже, в каком просит («сними
+        пиццу»). Поэтому сравниваем и по основе — первым четырём буквам, —
+        если по ней подходит ровно один таймер.
         """
         key = _key(label)
+        if key in БЕЗЫМЯННЫЙ:
+            key = _key(NO_NAME)
+        if key in ("первый", "первого") and pool:
+            # Первый из тех, что робот только что перечислил (_which).
+            return next(iter(pool))
         for name in pool:
             if _key(name) == key:
                 return name
+        if len(key) >= 4:
+            по_основе = [name for name in pool if _key(name)[:4] == key[:4]]
+            if len(по_основе) == 1:
+                return по_основе[0]
         return next(iter(pool)) if len(pool) == 1 else None
 
     def set_timer(minutes: float, label: str = NO_NAME) -> str:
@@ -1513,6 +1541,12 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             return "Список и так пуст."
         return f"Стёр весь список, {ru.count(count, 'пункт', 'пункта', 'пунктов')}."
 
+    # Описания схем — коротко, и это не небрежность. Схемы едут в КАЖДОМ
+    # запросе: в октябре 2026 сорок три видимые схемы весили 16,7 тысячи
+    # знаков (route один — 1250), около шести тысяч токенов, и каждый промах
+    # кэша на ПК стоил 3,7–5,3 секунды молчания. Цель — не больше десяти
+    # тысяч знаков на все видимые. Довод «почему так» живёт здесь, в
+    # комментариях, а модели — одна-две строки.
     tools = [
         Tool(
             name="drive",
@@ -1523,7 +1557,6 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                     "direction": {
                         "type": "string",
                         "enum": ["вперёд", "назад", "влево", "вправо"],
-                        "description": "Куда ехать.",
                     },
                     "distance": {
                         "type": "number",
@@ -1543,7 +1576,6 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                     "direction": {
                         "type": "string",
                         "enum": ["влево", "вправо"],
-                        "description": "Влево — против часовой, вправо — по часовой.",
                     },
                     "degrees": {
                         "type": "number",
@@ -1557,52 +1589,28 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         Tool(
             name="route",
             description=(
-                "Своя фигура из нескольких шагов подряд: круг, зигзаг, "
-                "квадрат, восьмёрка, обход комнаты, «туда-сюда». Готовых "
-                "фигур у тебя нет — придумай шаги сам, как считаешь нужным. "
-                "В одном шаге можно ехать, поворачивать или делать то и "
-                "другое сразу: вместе получается дуга, из дуг — круг. "
-                "Ехать в маршруте можно ТОЛЬКО ВПЕРЁД — назад и боком робот "
-                "едет вслепую; в сторону попадают поворотом и движением "
-                "вперёд. Один шаг — это drive или turn, маршрут нужен от двух."),
+                "Фигура из шагов: круг, зигзаг, квадрат, восьмёрка. Шаг — "
+                "ехать вперёд, повернуть или то и другое (дуга). Ехать только "
+                "вперёд: назад и боком робот слеп. Один шаг — это drive или turn."),
             input_schema={
                 "type": "object",
                 "properties": {
                     "steps": {
                         "type": "array",
-                        "description": "Шаги по порядку, не больше двенадцати.",
+                        "description": "Не больше двенадцати.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "move": {
-                                    "type": "string",
-                                    "enum": ["вперёд"],
-                                    "description": "Ехать на этом шаге. "
-                                                   "Только вперёд: назад и "
-                                                   "боком робот едет вслепую. "
-                                                   "Чтобы попасть в сторону — "
-                                                   "поверни и езжай вперёд.",
-                                },
-                                "distance": {
-                                    "type": "number",
-                                    "description": "Метров на этом шаге, 0.05–3.0.",
-                                },
-                                "turn": {
-                                    "type": "string",
-                                    "enum": ["влево", "вправо"],
-                                    "description": "В какую сторону поворачивать на этом шаге.",
-                                },
-                                "degrees": {
-                                    "type": "number",
-                                    "description": "Градусов на этом шаге, 5–360.",
-                                },
+                                "move": {"type": "string", "enum": ["вперёд"]},
+                                "distance": {"type": "number",
+                                             "description": "Метров, 0.05–3.0."},
+                                "turn": {"type": "string", "enum": ["влево", "вправо"]},
+                                "degrees": {"type": "number",
+                                            "description": "Градусов, 5–360."},
                             },
                         },
                     },
-                    "name": {
-                        "type": "string",
-                        "description": "Как назвать вслух: «зигзаг», «круг», «квадрат».",
-                    },
+                    "name": {"type": "string", "description": "Как назвать вслух."},
                 },
                 "required": ["steps"],
             },
@@ -1610,23 +1618,15 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="follow_me",
-            description=(
-                "Идти за человеком по квартире, держась в шаге позади. "
-                "Зови на «иди за мной», «следуй за мной», «пошли со мной». "
-                "Робот сам находит того, кто перед ним, и держит метр. "
-                "Прекращается словом «стоп»."),
+            description="Идти за человеком в шаге позади: «иди за мной». "
+                        "Прекращается словом «стоп».",
             input_schema=EMPTY_SCHEMA,
             run=follow_me,
         ),
         Tool(
             name="survey_flat",
-            description=(
-                "Обойти квартиру самому и составить опись: что где стоит. "
-                "Зови на «обследуй квартиру», «обойди квартиру», «осмотри "
-                "дом», «составь карту квартиры». Робот сам ездит по комнатам, "
-                "на каждой остановке осматривается кругом и запоминает мебель "
-                "на карте. Занимает несколько минут, прекращается словом "
-                "«стоп». В конце сам рассказывает, что нашёл."),
+            description="Обойти квартиру самому и составить опись мебели. "
+                        "Несколько минут, прекращается словом «стоп».",
             input_schema=EMPTY_SCHEMA,
             run=survey_flat,
         ),
@@ -1677,11 +1677,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="what_is_where",
-            description=(
-                "Рассказать по памяти, что где стоит в квартире, никуда не "
-                "выезжая. Зови на «что где стоит», «что ты знаешь про "
-                "квартиру», «покажи опись». Отвечает по тому, что робот "
-                "видел раньше."),
+            description="Что где стоит в квартире — по памяти, никуда не выезжая.",
             input_schema=EMPTY_SCHEMA,
             run=what_is_where,
         ),
@@ -1699,18 +1695,15 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="set_timer",
-            description="Таймер на N минут. Сработает — робот скажет вслух.",
+            description="Таймер на N минут.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "minutes": {
                         "type": "number",
-                        "description": "Через сколько минут, 0.1–600.",
+                        "description": "0.1–600.",
                     },
-                    "label": {
-                        "type": "string",
-                        "description": "Короткое название, чтобы отличать таймеры.",
-                    },
+                    "label": {"type": "string"},
                 },
                 "required": ["minutes"],
             },
@@ -1718,26 +1711,24 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="time_now",
-            description="Текущее время — здесь или в другом городе. Часов у "
-                        "тебя нет, а смещение часового пояса по памяти ты "
-                        "выдумаешь: не отвечай сам.",
+            description="Который час здесь или в другом городе. Сам не отвечай.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "город": {
                         "type": "string",
-                        "description": "Где смотреть время. Пусто — здесь, "
-                                       "дома.",
+                        "description": "Пусто — здесь.",
                     },
                 },
             },
             run=time_now,
         ),
+        # Перевод мер, секундомер и жребий разбирают правила (intents) —
+        # модели эти схемы не возим.
         Tool(
             name="convert_units",
-            description="Перевести меры: длину, вес, объём, время. Зови "
-                        "всегда, когда просят перевести одно в другое — в "
-                        "уме ты промахнёшься в делении.",
+            hidden=True,
+            description="Перевести меры: длину, вес, объём, время.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1753,7 +1744,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="date_now",
-            description="Сегодняшняя дата и день недели. Календаря у тебя нет.",
+            description="Сегодняшняя дата и день недели.",
             input_schema=EMPTY_SCHEMA,
             run=date_now,
         ),
@@ -1769,10 +1760,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             input_schema={
                 "type": "object",
                 "properties": {
-                    "label": {
-                        "type": "string",
-                        "description": "Название таймера, если их несколько.",
-                    },
+                    "label": {"type": "string"},
                 },
             },
             run=cancel_timer,
@@ -1785,12 +1773,9 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                 "properties": {
                     "at": {
                         "type": "string",
-                        "description": "«7:30», «семь утра», «восемь вечера».",
+                        "description": "«7:30», «семь утра».",
                     },
-                    "label": {
-                        "type": "string",
-                        "description": "Название, если будильников несколько.",
-                    },
+                    "label": {"type": "string"},
                 },
                 "required": ["at"],
             },
@@ -1798,23 +1783,16 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="set_reminder",
-            description="Напоминание: робот произнесёт текст в назначенное время. "
-                        "Нужно указать at или minutes.",
+            description="Напоминание: в срок произнесу текст. Нужно at или minutes.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "О чём напомнить: «выключить плиту».",
-                    },
+                    "text": {"type": "string"},
                     "at": {
                         "type": "string",
-                        "description": "Время суток: «8:00», «восемь вечера».",
+                        "description": "Время суток: «8:00».",
                     },
-                    "minutes": {
-                        "type": "number",
-                        "description": "Через сколько минут, если время не названо.",
-                    },
+                    "minutes": {"type": "number"},
                 },
                 "required": ["text"],
             },
@@ -1870,15 +1848,17 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="weather",
-            description="Погода там, где стоит робот. По памяти не отвечай. "
-                        "Города не знаешь — сначала set_home, потом это.",
+            # Без «сначала set_home»: на «какая погода в Москве» модель
+            # переписывала дом навсегда, и потом «какая погода» отвечало
+            # про Москву.
+            description="Погода дома, сейчас или завтра. По памяти не "
+                        "отвечай. Другие города не умею.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "day": {
                         "type": "string",
                         "enum": ["сейчас", "завтра"],
-                        "description": "На когда нужна погода.",
                     },
                 },
             },
@@ -1901,11 +1881,12 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             },
             run=small_talk,
         ),
+        # Видим модели: «а что ты вообще умеешь делать» правила не ловят, и
+        # модель, видя один list_skills, отвечала «сам я пока ничему не
+        # научился» — хотя умений два десятка.
         Tool(
             name="abilities",
-            hidden=True,
-            description="Рассказать, что робот умеет. Отвечай этим, а не своими "
-                        "словами: список умений тут точный.",
+            description="Что ты умеешь вообще — точный список.",
             input_schema=EMPTY_SCHEMA,
             run=abilities,
         ),
@@ -1913,17 +1894,17 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
     if speaker is not None:
         tools += [
+            # Видим: «ты слишком громко говоришь» правила не ловят, а модель
+            # без него звала music_volume.
             Tool(
                 name="volume",
-                hidden=True,
-                description="Сделать голос тише или громче.",
+                description="Твой голос тише или громче (не музыку).",
                 input_schema={
                     "type": "object",
                     "properties": {
                         "change": {
                             "type": "string",
                             "enum": ["тише", "громче", "обычная"],
-                            "description": "Куда менять громкость.",
                         },
                     },
                     "required": ["change"],
@@ -2141,9 +2122,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     # новостям», хотя доступ есть, просто инструмент был от неё спрятан.
     tools.append(Tool(
         name="news",
-        description="Свежие заголовки новостей. Зови, когда спрашивают, что "
-                    "нового, что в мире, какие новости. По памяти не отвечай: "
-                    "твои новости старые.",
+        description="Свежие новости. По памяти не отвечай — она старая.",
         input_schema=EMPTY_SCHEMA,
         run=news,
     ))
@@ -2185,10 +2164,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="path_check",
-            description="Свободен ли путь прямо перед роботом. Отвечает "
-                        "дальномером мгновенно, в темноте тоже. Зови на "
-                        "«можно ли проехать», «что впереди», «свободна ли "
-                        "дорога» — и обязательно перед тем, как ехать далеко.",
+            description="Свободен ли путь впереди — дальномером, мгновенно. "
+                        "Перед дальней ездой — обязательно.",
             input_schema=EMPTY_SCHEMA,
             run=path_check,
         ))
@@ -2219,19 +2196,14 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="look_around",
-            description="Посмотреть камерой и сказать, что перед роботом. "
-                        "Зови всегда, когда спрашивают про видимое: «что ты "
-                        "видишь», «кто здесь», «посмотри», «что у меня в "
-                        "руке», «какого цвета». По памяти на такое не "
-                        "отвечай — камера показывает, что сейчас, а не что "
-                        "было.",
+            description="Посмотреть камерой: «что ты видишь», «что у меня в "
+                        "руке». Про видимое по памяти не отвечай.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "question": {
                         "type": "string",
-                        "description": "Что именно разглядеть. Пусто — "
-                                       "общее описание того, что видно.",
+                        "description": "Что разглядеть. Пусто — общий вид.",
                     },
                 },
             },
@@ -2240,16 +2212,14 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     if set_place is not None:
         tools.append(Tool(
             name="set_home",
-            description="Запомнить город, где стоит робот. Зови, когда человек "
-                        "сказал, где он живёт или где вы находитесь, — после "
-                        "этого заработает погода.",
+            description="Запомнить город дома — только когда человек говорит, "
+                        "где вы живёте.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "город": {
                         "type": "string",
-                        "description": "Название города так, как его назвал "
-                                       "человек. Падеж не важен.",
+                        "description": "Как назвал человек.",
                     },
                 },
                 "required": ["город"],
@@ -2260,15 +2230,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     tools += [
         Tool(
             name="look_up",
-            description="Посмотреть справку в интернете: кто это, что это, "
-                        "когда было. Зови вместо ответа по памяти — твоя "
-                        "память устарела, а справка свежая.",
+            description="Справка из интернета: кто это, что это, когда было. "
+                        "Твоя память устарела — не отвечай по ней.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "вопрос": {"type": "string",
-                               "description": "О чём справка: «Калининград», "
-                                              "«Юрий Гагарин», «меканум-колесо»."},
+                               "description": "«Юрий Гагарин»."},
                 },
                 "required": ["вопрос"],
             },
@@ -2276,26 +2244,20 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="rates",
-            description="Курс доллара и евро по Центробанку. Зови всегда, "
-                        "когда спрашивают про курс: по памяти ты назовёшь "
-                        "прошлогодний.",
+            description="Курс доллара и евро по ЦБ. По памяти не отвечай.",
             input_schema=EMPTY_SCHEMA,
             run=rates,
         ),
         Tool(
             name="calculate",
-            description="Посчитать. Зови всегда, когда просят что-то "
-                        "сосчитать: проценты и деление в уме ты путаешь, а "
-                        "ошибка звучит так же уверенно, как верный ответ. "
-                        "Переведи услышанное в выражение: «пятнадцать "
-                        "процентов от двух тысяч» — это 15/100*2000.",
+            description="Посчитать: в уме ты путаешь проценты и деление. "
+                        "«15 процентов от 2000» — это 15/100*2000.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "выражение": {
                         "type": "string",
-                        "description": "Только числа и знаки + - * / % ** и "
-                                       "скобки. Слова не понимаю.",
+                        "description": "Числа, + - * / % ** и скобки.",
                     },
                 },
                 "required": ["выражение"],
@@ -2304,9 +2266,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="stopwatch",
-            description="Секундомер: пуск, стоп, сброс, «сколько прошло». "
-                        "Зови обязательно — сколько времени прошло между "
-                        "репликами, ты не знаешь, часов у тебя нет.",
+            hidden=True,
+            description="Секундомер: пуск, стоп, сброс, «сколько прошло».",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -2322,10 +2283,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ),
         Tool(
             name="random_pick",
-            description="Жребий: монетка, кубик, случайное число, выбор из "
-                        "нескольких. Зови обязательно — сам ты случайное "
-                        "число не выдумаешь, у тебя выйдет одно и то же, а "
-                        "человек ждёт настоящего броска.",
+            hidden=True,
+            description="Жребий: монетка, кубик, случайное число, выбор.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -2354,26 +2313,18 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         tools += [
             Tool(
                 name="play_music",
-                description="Включить музыку: конкретного исполнителя или "
-                            "песню, жанр, радиостанцию. Без уточнения — "
-                            "любимую волну. Зови всегда, когда просят "
-                            "что-нибудь включить или поставить из музыки. "
-                            "Передавай ровно то, что попросил человек. Если "
-                            "не нашлось — так и скажи; не зови этот "
-                            "инструмент второй раз с другим исполнителем или "
-                            "жанром, поставить не то хуже, чем не поставить.",
+                description="Включить музыку: исполнитель, песня, жанр, "
+                            "станция; пусто — любимая волна. Не нашлось — "
+                            "скажи, другое взамен не подбирай.",
                 input_schema={
                     "type": "object",
                     "properties": {
                         "что": {"type": "string",
-                                "description": "Исполнитель, песня, жанр или "
-                                               "станция: «Кино», «Группа крови», "
-                                               "«джаз», «Рекорд». Пусто — на твой вкус."},
+                                "description": "Ровно как сказал человек: «Кино», «джаз»."},
                         "источник": {
                             "type": "string",
                             "enum": ["любой", "радио"],
-                            "description": "«радио» — если человек прямо "
-                                           "попросил радио или радиостанцию.",
+                            "description": "«радио» — если просили радио.",
                         },
                     },
                 },
@@ -2387,15 +2338,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="music_next",
-                description="Следующая песня. Зови, когда просят переключить, "
-                            "поставить другое, пропустить эту.",
+                description="Следующая песня: переключить, пропустить эту.",
                 input_schema=EMPTY_SCHEMA,
                 run=music_next,
             ),
             Tool(
                 name="what_is_playing",
-                description="Что сейчас играет: исполнитель и название. "
-                            "По памяти не отвечай — ты этого не знаешь.",
+                description="Что сейчас играет. По памяти не отвечай.",
                 input_schema=EMPTY_SCHEMA,
                 run=what_is_playing,
             ),
@@ -2407,38 +2356,26 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
     if player is not None or видео is not None:
         tools.append(Tool(
             name="music_volume",
-            description="Сделать музыку (или мультик/видео, если играет он) "
-                        "тише или громче. Зови и когда просят убавить звук — "
-                        "если что-то играет, речь почти всегда про него. "
-                        "Назвали число — передай его в «уровень»; сам "
-                        "громкость не меняй и не сообщай о смене, не вызвав "
-                        "этот инструмент.",
+            description="Звук тише или громче: музыка, мультик, а если ничего "
+                        "не играет — твой голос.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "изменение": {
                         "type": "string",
                         "enum": ["тише", "громче", "обычная"],
-                        "description": "Куда менять громкость.",
                     },
                     "уровень": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 10,
-                        "description": "Громкость по десятибалльной: 1 "
-                                       "еле слышно, 10 во всю. Ставь, "
-                                       "когда назвали число («сделай на "
-                                       "семь», «убавь до двух»). Для "
-                                       "видео игнорируется — у него своя "
-                                       "шкала, только тише/громче.",
+                        "description": "Назвали число: «сделай на семь», «до двух».",
                     },
                     "шаг": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 9,
-                        "description": "На сколько ступеней подвинуть — "
-                                       "для «убавь на два». «До двух» "
-                                       "это не сюда, а в «уровень».",
+                        "description": "«Убавь на два».",
                     },
                 },
                 "required": ["изменение"],
@@ -2465,20 +2402,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         tools += [
             Tool(
                 name="play_video",
-                description="Включить мультик, видео или клип на экране "
-                            "(с Rutube). Зови на «включи мультики», «покажи "
-                            "мультфильм про Смешариков», «включи клип "
-                            "Розовая пантера». Без уточнения — просто "
-                            "«мультики». Передавай ровно то, что попросил "
-                            "человек, не выдумывай название.",
+                description="Мультик, видео или клип на экране (Rutube). "
+                            "Название не выдумывай.",
                 input_schema={
                     "type": "object",
                     "properties": {
                         "что": {"type": "string",
-                                "description": "Что искать: название "
-                                               "мультфильма, персонажа, "
-                                               "жанр или клип. Пусто — на "
-                                               "твой вкус («мультики»)."},
+                                "description": "Как сказал человек; пусто — «мультики»."},
                     },
                 },
                 run=play_video,
@@ -2548,19 +2478,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         tools += [
             Tool(
                 name="remember_person",
-                description=(
-                    "Записать в память факт о том, кто сейчас говорит: что "
-                    "любит, чем занят, что у него происходит. Зови сам, без "
-                    "просьбы, как только услышал о человеке что-то новое, что "
-                    "пригодится в следующем разговоре. Вслух об этом не "
-                    "объявляй и разрешения не спрашивай — просто запиши и "
-                    "продолжай разговор."),
+                description="Молча записать новый факт о говорящем: что любит, "
+                            "чем занят.",
                 input_schema={
                     "type": "object",
                     "properties": {
                         "факт": {"type": "string",
-                                 "description": "Коротко, одной фразой: "
-                                                "«любит крепкий чай», «работает по ночам»."},
+                                 "description": "Одной фразой: «любит крепкий чай»."},
                     },
                     "required": ["факт"],
                 },
@@ -2582,20 +2506,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         tools += [
             Tool(
                 name="remember_birthday",
-                description=(
-                    "Записать день рождения того, кто сейчас говорит. Зови "
-                    "сам, как только услышал дату («у меня день рождения "
-                    "пятого декабря», «родился 12 июня») — не переспрашивая "
-                    "и не объявляя вслух, что записал. В этот день ты сам "
-                    "увидишь в справке о собеседнике, что сегодня у него "
-                    "праздник, и сможешь поздравить."),
+                description="Молча записать день рождения говорящего, как "
+                            "только услышал дату.",
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "день": {"type": "integer", "minimum": 1, "maximum": 31,
-                                 "description": "Число месяца."},
-                        "месяц": {"type": "integer", "minimum": 1, "maximum": 12,
-                                  "description": "Месяц, 1 — январь, 12 — декабрь."},
+                        "день": {"type": "integer"},
+                        "месяц": {"type": "integer"},
                     },
                     "required": ["день", "месяц"],
                 },
@@ -2604,16 +2521,17 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
         ]
 
     if notes is not None:
+        # Добавить и прочитать — видимы: «запиши купить хлеб», «что нам надо
+        # купить» правила не ловят, и модель, не видя списка, говорила
+        # «записал», ничего не записав.
         tools += [
             Tool(
                 name="notes_add",
-                hidden=True,
                 description="Добавить пункт в список покупок и дел.",
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "item": {"type": "string",
-                                 "description": "Что записать: «молоко», «оплатить садик»."},
+                        "item": {"type": "string", "description": "«молоко»."},
                     },
                     "required": ["item"],
                 },
@@ -2621,8 +2539,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
             ),
             Tool(
                 name="notes_list",
-                hidden=True,
-                description="Прочитать вслух список покупок и дел.",
+                description="Прочитать список покупок и дел.",
                 input_schema=EMPTY_SCHEMA,
                 run=notes_list,
             ),
@@ -2650,13 +2567,23 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
     # --- навыки: то, чему робот учится сам ------------------------------
     if навыки is not None:
-        def remember_skill(name: str, phrases: Any, steps: Any) -> str:
+        def remember_skill(name: str, phrases: Any, steps: Any = None) -> str:
             """Запомнить придуманное сочетание действий под именем.
 
             Отвечаем ПРИЧИНОЙ отказа, а не просто «нельзя»: её услышит
             модель и сможет поправиться, а не будет вслепую повторять то же
             самое следующей фразой.
+
+            Шаги необязательны: не назвала — берём только что проеханный
+            маршрут. Промпт велит запоминать сразу после того, как сделал,
+            так что пяти минут с запасом; старше — это уже не «то, что
+            сейчас сработало».
             """
+            if not (isinstance(steps, list) and steps):
+                маршрут, когда = последний_маршрут
+                steps = ([{"инструмент": "route", "аргументы": маршрут}]
+                         if маршрут and time.monotonic() - когда < МАРШРУТ_ДЛЯ_НАВЫКА
+                         else [])
             беда = навыки.запомнить(
                 name,
                 phrases if isinstance(phrases, list) else [phrases],
@@ -2671,26 +2598,18 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="remember_skill",
-            description=(
-                "Запомнить то, что ты только что придумал, как новое умение. "
-                "Зови, когда выполнил просьбу, для которой у тебя не было "
-                "готового действия и пришлось собирать его из нескольких — "
-                "чтобы в следующий раз сделать это сразу, не выдумывая "
-                "заново. Шаги перечисли те же, что сейчас выполнил."),
+            description="Запомнить собранное и сработавшее как умение. Без "
+                        "steps возьму только что проеханный маршрут.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string",
-                             "description": "Короткое имя умения, 2-3 слова"},
+                    "name": {"type": "string", "description": "2–3 слова."},
                     "phrases": {
                         "type": "array", "items": {"type": "string"},
-                        "description": "Как его будут просить. Не одно слово: "
-                                       "по одному слову умение перехватит "
-                                       "чужие команды",
+                        "description": "Как будут просить, не одним словом.",
                     },
                     "steps": {
                         "type": "array",
-                        "description": "Шаги: инструмент и его доводы",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -2701,7 +2620,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                         },
                     },
                 },
-                "required": ["name", "phrases", "steps"],
+                "required": ["name", "phrases"],
             },
             run=remember_skill,
         ))
@@ -2720,10 +2639,12 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                             if плохие else "")
             return f"Умею: {имена}.{хвост}{беспокойство}"
 
+        # Не «что ты умеешь»: на свежем роботе выученных умений нет, и ответ
+        # «сам я пока ничему не научился» звучал на вопрос обо всём, что
+        # робот умеет. Обо всём — это abilities.
         tools.append(Tool(
             name="list_skills",
-            description="Чему робот научился сам. Зови на «что ты умеешь», "
-                        "«какие у тебя навыки», «чему научился».",
+            description="Чему ты научился сам — выученные умения.",
             input_schema=EMPTY_SCHEMA,
             run=list_skills,
         ))
@@ -2735,8 +2656,7 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="forget_skill",
-            description="Забыть выученное умение. Зови на «забудь навык», "
-                        "«больше так не делай», «убери это умение».",
+            description="Забыть выученное умение.",
             input_schema={
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -2794,16 +2714,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="find_thing",
-            description=(
-                "Найти вещь: «где моя кружка», «ты не видел мой телефон», "
-                "«где книга». Робот смотрит камерой прямо сейчас и вдобавок "
-                "помнит, где видел эту вещь раньше. Узнаёт восемьдесят "
-                "обычных предметов — посуду, мебель, технику, животных."),
+            description="Найти вещь камерой и по памяти: «где моя кружка». "
+                        "Знает посуду, мебель, технику, животных.",
             input_schema={
                 "type": "object",
                 "properties": {"name": {
                     "type": "string",
-                    "description": "Что искать, одним словом: кружка, телефон"}},
+                    "description": "Одним словом: кружка."}},
                 "required": ["name"],
             },
             run=find_thing,
@@ -2825,12 +2742,11 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="list_things",
-            description=(
-                "Перечислить вещи в кадре: «что ты видишь», «что там перед "
-                "тобой». Считает на плате и мгновенно — в отличие от "
-                "look_around, который шлёт картинку на ПК. Зови этот "
-                "инструмент первым, а look_around — когда нужно описание, "
-                "а не список."),
+            # Без «что ты видишь» и «зови первым»: это обещали сразу три
+            # инструмента, и на «посмотри, что у меня в руке» модель брала
+            # список предметов или карту вместо взгляда.
+            description="Список знакомых вещей в кадре, быстро. Описать "
+                        "увиденное — look_around.",
             input_schema=EMPTY_SCHEMA,
             run=list_things,
         ))
@@ -2870,11 +2786,8 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="what_is_around",
-            description=(
-                "Что стоит вокруг робота по его карте: мебель, которую он "
-                "запомнил, и места, где он застревает. Зови на «что вокруг», "
-                "«что ты видишь», «где стол», «что рядом». Отдаёт стороны и "
-                "метры от робота — перескажи как есть, не выдумывая."),
+            description="Что вокруг по твоей карте: мебель и места, где "
+                        "застреваешь, — стороны и метры.",
             input_schema={"type": "object", "properties": {}},
             run=what_is_around,
         ))
@@ -2914,16 +2827,13 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="how_was_the_day",
-            description=(
-                "Что робот делал за последнее время и на чём спотыкался. "
-                "Зови на «как прошёл день», «что было сегодня», «часто ли ты "
-                "срываешься», «на что жалуешься». Считает по своему дневнику, "
-                "бесплатно и без обращения к сети."),
+            # Видим: «как прошёл день» правила не ловят — скрыть значило бы
+            # потерять умение молча.
+            description="Что ты делал за последние часы и на чём срывался: "
+                        "«как прошёл день».",
             input_schema={
                 "type": "object",
-                "properties": {"hours": {
-                    "type": "number",
-                    "description": "За сколько часов смотреть, по умолчанию 24"}},
+                "properties": {"hours": {"type": "number"}},
             },
             run=how_was_the_day,
         ))
@@ -2975,14 +2885,11 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
 
         tools.append(Tool(
             name="what_i_learned",
-            description=(
-                "Что робот понял про эту квартиру и про хозяина, прожив тут "
-                "несколько дней: где застревает, из-за чего срывается "
-                "следование, что человек просит регулярно. Зови на «чему ты "
-                "научился», «что ты понял», «что ты про меня знаешь», «где "
-                "тебе трудно». Отдаёт ПОСЧИТАННЫЕ числа — перескажи их "
-                "человеку своими словами, коротко, и ничего не добавляй от "
-                "себя."),
+            # Без «что ты про меня знаешь» (это рассказ о человеке, его ведут
+            # правила) и без «чему научился» (это list_skills). А «что я
+            # обычно прошу» — сюда: повторы здесь посчитаны.
+            description="Что ты понял про квартиру за несколько дней: где "
+                        "застреваешь, что просят регулярно. Числа перескажи как есть.",
             input_schema={"type": "object", "properties": {}},
             run=what_i_learned,
         ))
@@ -2997,12 +2904,12 @@ def build_tools(ros, timers: Timers, *, speaker=None, notes=None,
                       for п in повторы[:3]]
             return "Замечаю: " + "; ".join(строки) + "."
 
+        # Скрыт: те же повторы, посчитанные тем же дневником, отдаёт
+        # what_i_learned, и две схемы на один вопрос модели ни к чему.
         tools.append(Tool(
             name="what_do_i_repeat",
-            description=(
-                "Что человек просит снова и снова и в какое время. Зови на "
-                "«что я обычно прошу», «замечаешь за мной что-нибудь», «есть "
-                "привычки». Это ответ по наблюдению робота, а не по догадке."),
+            hidden=True,
+            description="Что человек просит снова и снова и в какое время.",
             input_schema=EMPTY_SCHEMA,
             run=what_do_i_repeat,
         ))
