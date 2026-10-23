@@ -14,13 +14,21 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from . import ru
+from .repeat_log import Беда
 
 log = logging.getLogger(__name__)
+
+# Погода без интернета не отвечала часами, и журнал получал строку в минуту
+# (лицо переспрашивает её само). Сказать один раз, напоминать редко, отметить
+# возвращение — см. repeat_log.
+_беда = Беда(log)
 
 URL = "https://api.open-meteo.com/v1/forecast"
 TIMEOUT = 8
@@ -86,7 +94,65 @@ def describe_tomorrow(data: dict) -> str:
     return phrase + "."
 
 
+GEO = "https://geocoding-api.open-meteo.com/v1/search"
+
+
+def find_city(name: str) -> tuple[str, float, float] | None:
+    """Координаты города по названию. None — не нашли.
+
+    Нужно, чтобы широту и долготу не приходилось прописывать руками в файле
+    настроек: человек говорит «я живу в Калининграде», и этого достаточно.
+    На живом роботе иначе выходило глупо — он вызывал погоду и отвечал «я не
+    знаю, где мы находимся», хотя город ему только что назвали вслух.
+    """
+    query = urllib.parse.urlencode({"name": name, "count": 1,
+                                    "language": "ru", "format": "json"})
+    try:
+        with urllib.request.urlopen(f"{GEO}?{query}", timeout=TIMEOUT) as resp:
+            найдено = (json.loads(resp.read()) or {}).get("results") or []
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log.warning("поиск города не ответил: %s", e)
+        return None
+    if not найдено:
+        return None
+    город = найдено[0]
+    return (город.get("name") or name,
+            float(город["latitude"]), float(город["longitude"]))
+
+
+# Сколько держим прогноз. Лицо и так тянет погоду раз в десять минут
+# (face.ПОГОДА_РАЗ_В), и вопрос «какая погода?» раньше шёл в интернет заново:
+# новое HTTPS-соединение на цикле слуха, полсекунды, а при плохой сети — до
+# восьми, и всё это время робот не слышит «стоп». Погода за десять минут не
+# меняется настолько, чтобы это стоило глухоты.
+СВЕЖЕСТЬ = 600.0
+
+# Общий для лица и инструмента: ключ — место с точностью до километра.
+_кэш: dict[tuple[float, float], tuple[float, dict]] = {}
+_кэш_замок = threading.Lock()
+
+
 def fetch(lat: float, lon: float) -> dict | None:
+    """Прогноз из кэша, если он свежий, иначе из open-meteo.
+
+    Неудачу не кэшируем: интернет вернулся — следующий же вопрос его увидит.
+    Ходим в сеть БЕЗ замка: лицо и разговор могут спросить разом, и второму
+    лучше сходить самому, чем ждать чужие восемь секунд таймаута.
+    """
+    ключ = (round(float(lat), 2), round(float(lon), 2))
+    сейчас = time.monotonic()
+    with _кэш_замок:
+        было = _кэш.get(ключ)
+    if было is not None and сейчас - было[0] < СВЕЖЕСТЬ:
+        return было[1]
+    data = _сходить(lat, lon)
+    if data is not None:
+        with _кэш_замок:
+            _кэш[ключ] = (time.monotonic(), data)
+    return data
+
+
+def _сходить(lat: float, lon: float) -> dict | None:
     """Ходит в open-meteo. None — не дозвонились, и это нормально."""
     query = urllib.parse.urlencode({
         "latitude": f"{lat:.4f}",
@@ -98,7 +164,9 @@ def fetch(lat: float, lon: float) -> dict | None:
     })
     try:
         with urllib.request.urlopen(f"{URL}?{query}", timeout=TIMEOUT) as resp:
-            return json.loads(resp.read())
+            data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, ValueError) as e:
-        log.warning("погода не ответила: %s", e)
+        _беда.случилась(f"погода не ответила: {e}")
         return None
+    _беда.прошла("погода снова отвечает")
+    return data

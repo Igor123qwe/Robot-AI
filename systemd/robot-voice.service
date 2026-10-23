@@ -1,6 +1,9 @@
 [Unit]
 Description=Robot-AI: голосовой ассистент
 After=network.target robot-bridge.service
+# Голос командует колёсами и говорит «стою». Перезапускаем всегда, а не пять
+# раз за десять секунд: без сброса лимита он исчезал бы молча.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
